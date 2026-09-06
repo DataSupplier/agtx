@@ -251,6 +251,9 @@ struct TaskCard {
     updated_at: String,
     deps_satisfied: bool,
     allowed_actions: Vec<String>,
+    /// Declarative workflow state. Present only for tasks admitted through a
+    /// state-machine plugin; legacy tasks continue to use `status`.
+    workflow_state: Option<String>,
     /// The TUI's published phase status, or `None` when nothing has been
     /// observed for this task. A client must weigh it against `phase_age_secs`
     /// rather than treating it as live — with no TUI running, nothing refreshes
@@ -272,10 +275,16 @@ fn card(
     conflict: Option<ConflictState>,
 ) -> TaskCard {
     let deps_ok = db.deps_satisfied(&t);
+    let workflow_state = db
+        .get_workflow_task_state(&t.id)
+        .ok()
+        .flatten()
+        .map(|state| state.state);
     TaskCard {
         conflicted: conflict.as_ref().map(|c| c.conflicted),
         conflicting_files: conflict.map(|c| c.files).unwrap_or_default(),
         allowed_actions: allowed_actions(&t, deps_ok, CallerKind::Human),
+        workflow_state,
         deps_satisfied: deps_ok,
         phase_status: runtime.map(|r| r.phase_status.as_str().to_string()),
         phase_age_secs: runtime.map(|r| (chrono::Utc::now() - r.updated_at).num_seconds()),

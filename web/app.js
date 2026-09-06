@@ -740,7 +740,7 @@ async function screenTask(pid, tid) {
     return;
   }
 
-  const head = header(task.title, `${task.status} · ${task.agent}`, () =>
+  const head = header(task.title, `${task.workflow_state || task.status} · ${task.agent}`, () =>
     go(`#/p/${encodeURIComponent(pid)}`),
   );
   const tabs = ["details", "diff", "terminal"];
@@ -802,7 +802,8 @@ function detailsBody(pid, task) {
   }
 
   const rows = [
-    ["Status", task.status],
+    ["Status", task.workflow_state || task.status],
+    ...(task.workflow_state ? [["Board status", task.status]] : []),
     ["Phase", task.phase_status ? phaseText(task) : "not observed"],
     ["Agent", task.agent],
     ["Agent state", task.blocked_reason || task.agent_state || "—"],
