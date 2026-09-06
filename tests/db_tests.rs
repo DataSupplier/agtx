@@ -1,6 +1,6 @@
 use agtx::db::{
     Database, Notification, NotificationKind, PhaseStatus, Project, Task, TaskRuntime, TaskStatus,
-    TransitionRequest,
+    TransitionRequest, WorkflowTaskState, WorkflowTransitionRecord,
 };
 
 // === TaskStatus Tests ===
@@ -865,4 +865,59 @@ fn notification_kind_spellings_match_serde() {
         assert_eq!(json, format!("\"{}\"", kind.as_str()));
         assert_eq!(NotificationKind::from_str(kind.as_str()), Some(kind));
     }
+}
+
+#[test]
+#[cfg(feature = "test-mocks")]
+fn workflow_state_and_transition_history_are_durable() {
+    let db = Database::open_in_memory_project().unwrap();
+    let task = Task::new("F3.3", "claude", "heaves");
+    db.create_task(&task).unwrap();
+
+    let mut state = WorkflowTaskState::new(&task.id, "admission", "feature/poc");
+    state.base_sha = Some("abc123".into());
+    db.upsert_workflow_task_state(&state).unwrap();
+
+    let mut transition = WorkflowTransitionRecord::new(
+        &task.id,
+        "admission_complete",
+        "admission",
+        "ready_for_planning",
+    );
+    transition.actor_role = Some("engineering_reviewer".into());
+    transition.actor_agent = Some("codex".into());
+    db.record_workflow_transition(&transition).unwrap();
+
+    let stored = db.get_workflow_task_state(&task.id).unwrap().unwrap();
+    assert_eq!(stored.target_branch, "feature/poc");
+    assert_eq!(stored.base_sha.as_deref(), Some("abc123"));
+    let history = db.workflow_transition_history(&task.id).unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].action, "admission_complete");
+    assert_eq!(history[0].actor_agent.as_deref(), Some("codex"));
+}
+
+#[test]
+#[cfg(feature = "test-mocks")]
+fn deleting_a_task_removes_its_workflow_evidence() {
+    let db = Database::open_in_memory_project().unwrap();
+    let task = Task::new("F3.3", "claude", "heaves");
+    db.create_task(&task).unwrap();
+    db.upsert_workflow_task_state(&WorkflowTaskState::new(
+        &task.id,
+        "backlog",
+        "feature/poc",
+    ))
+    .unwrap();
+    db.record_workflow_transition(&WorkflowTransitionRecord::new(
+        &task.id,
+        "admit",
+        "backlog",
+        "admission",
+    ))
+    .unwrap();
+
+    db.delete_task(&task.id).unwrap();
+    assert!(db.get_workflow_task_state(&task.id).unwrap().is_none());
+    assert!(db.workflow_transition_history(&task.id).unwrap().is_empty());
 }

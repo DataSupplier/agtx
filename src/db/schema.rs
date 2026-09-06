@@ -4,7 +4,7 @@ use std::path::Path;
 
 use super::models::{
     MobileDevice, Notification, NotificationKind, PhaseStatus, Project, Task, TaskRuntime,
-    TaskStatus, TransitionRequest,
+    TaskStatus, TransitionRequest, WorkflowTaskState, WorkflowTransitionRecord,
 };
 
 /// Database wrapper for SQLite operations
@@ -177,6 +177,34 @@ impl Database {
 
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
             CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
+
+            CREATE TABLE IF NOT EXISTS workflow_task_states (
+                task_id TEXT PRIMARY KEY,
+                state TEXT NOT NULL,
+                target_branch TEXT NOT NULL,
+                base_sha TEXT,
+                plan_revision INTEGER NOT NULL DEFAULT 0,
+                plan_hash TEXT,
+                approved_plan_revision INTEGER,
+                approved_plan_hash TEXT,
+                validation_passed_at TEXT,
+                integration_sha TEXT,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS workflow_transition_history (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                from_state TEXT NOT NULL,
+                to_state TEXT NOT NULL,
+                actor_role TEXT,
+                actor_agent TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_workflow_history_task
+                ON workflow_transition_history(task_id, created_at);
             "#,
         )?;
 
@@ -450,9 +478,137 @@ impl Database {
     }
 
     pub fn delete_task(&self, task_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM workflow_transition_history WHERE task_id = ?1",
+            params![task_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM workflow_task_states WHERE task_id = ?1",
+            params![task_id],
+        )?;
         self.conn
             .execute("DELETE FROM tasks WHERE id = ?1", params![task_id])?;
         Ok(())
+    }
+
+    // === Declarative workflow operations ===
+
+    pub fn upsert_workflow_task_state(&self, state: &WorkflowTaskState) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO workflow_task_states (
+                task_id, state, target_branch, base_sha, plan_revision, plan_hash,
+                approved_plan_revision, approved_plan_hash, validation_passed_at,
+                integration_sha, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ON CONFLICT(task_id) DO UPDATE SET
+                state = excluded.state,
+                target_branch = excluded.target_branch,
+                base_sha = excluded.base_sha,
+                plan_revision = excluded.plan_revision,
+                plan_hash = excluded.plan_hash,
+                approved_plan_revision = excluded.approved_plan_revision,
+                approved_plan_hash = excluded.approved_plan_hash,
+                validation_passed_at = excluded.validation_passed_at,
+                integration_sha = excluded.integration_sha,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                state.task_id,
+                state.state,
+                state.target_branch,
+                state.base_sha,
+                state.plan_revision,
+                state.plan_hash,
+                state.approved_plan_revision,
+                state.approved_plan_hash,
+                state.validation_passed_at.map(|value| value.to_rfc3339()),
+                state.integration_sha,
+                state.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn workflow_task_state_from_row(row: &rusqlite::Row) -> rusqlite::Result<WorkflowTaskState> {
+        let timestamp = |name: &str| -> Option<chrono::DateTime<chrono::Utc>> {
+            row.get::<_, Option<String>>(name)
+                .ok()
+                .flatten()
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
+                .map(|value| value.with_timezone(&chrono::Utc))
+        };
+        Ok(WorkflowTaskState {
+            task_id: row.get("task_id")?,
+            state: row.get("state")?,
+            target_branch: row.get("target_branch")?,
+            base_sha: row.get("base_sha")?,
+            plan_revision: row.get("plan_revision")?,
+            plan_hash: row.get("plan_hash")?,
+            approved_plan_revision: row.get("approved_plan_revision")?,
+            approved_plan_hash: row.get("approved_plan_hash")?,
+            validation_passed_at: timestamp("validation_passed_at"),
+            integration_sha: row.get("integration_sha")?,
+            updated_at: timestamp("updated_at").unwrap_or_else(chrono::Utc::now),
+        })
+    }
+
+    pub fn get_workflow_task_state(&self, task_id: &str) -> Result<Option<WorkflowTaskState>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM workflow_task_states WHERE task_id = ?1")?;
+        Ok(stmt
+            .query_row(params![task_id], Self::workflow_task_state_from_row)
+            .ok())
+    }
+
+    pub fn record_workflow_transition(&self, record: &WorkflowTransitionRecord) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO workflow_transition_history (
+                id, task_id, action, from_state, to_state, actor_role, actor_agent,
+                reason, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+            params![
+                record.id,
+                record.task_id,
+                record.action,
+                record.from_state,
+                record.to_state,
+                record.actor_role,
+                record.actor_agent,
+                record.reason,
+                record.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn workflow_transition_history(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<WorkflowTransitionRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM workflow_transition_history WHERE task_id = ?1 ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map(params![task_id], |row| {
+            let created_at = chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>("created_at")?)
+                .map(|value| value.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now());
+            Ok(WorkflowTransitionRecord {
+                id: row.get("id")?,
+                task_id: row.get("task_id")?,
+                action: row.get("action")?,
+                from_state: row.get("from_state")?,
+                to_state: row.get("to_state")?,
+                actor_role: row.get("actor_role")?,
+                actor_agent: row.get("actor_agent")?,
+                reason: row.get("reason")?,
+                created_at,
+            })
+        })?;
+        Ok(rows.filter_map(|row| row.ok()).collect())
     }
 
     fn task_from_row(row: &rusqlite::Row) -> rusqlite::Result<Task> {
