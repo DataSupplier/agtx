@@ -132,6 +132,78 @@ impl Task {
     }
 }
 
+/// Durable evidence for a task that uses a declarative workflow.
+///
+/// Kept separate from `tasks` so existing boards retain their schema and a
+/// plugin can be removed without making a legacy task unreadable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowTaskState {
+    pub task_id: String,
+    pub state: String,
+    pub target_branch: String,
+    pub base_sha: Option<String>,
+    pub plan_revision: i32,
+    pub plan_hash: Option<String>,
+    pub approved_plan_revision: Option<i32>,
+    pub approved_plan_hash: Option<String>,
+    pub validation_passed_at: Option<DateTime<Utc>>,
+    pub integration_sha: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl WorkflowTaskState {
+    pub fn new(task_id: impl Into<String>, state: impl Into<String>, target_branch: impl Into<String>) -> Self {
+        Self {
+            task_id: task_id.into(),
+            state: state.into(),
+            target_branch: target_branch.into(),
+            base_sha: None,
+            plan_revision: 0,
+            plan_hash: None,
+            approved_plan_revision: None,
+            approved_plan_hash: None,
+            validation_passed_at: None,
+            integration_sha: None,
+            updated_at: Utc::now(),
+        }
+    }
+}
+
+/// An append-only record of a workflow transition and its actor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowTransitionRecord {
+    pub id: String,
+    pub task_id: String,
+    pub action: String,
+    pub from_state: String,
+    pub to_state: String,
+    pub actor_role: Option<String>,
+    pub actor_agent: Option<String>,
+    pub reason: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl WorkflowTransitionRecord {
+    pub fn new(
+        task_id: impl Into<String>,
+        action: impl Into<String>,
+        from_state: impl Into<String>,
+        to_state: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            task_id: task_id.into(),
+            action: action.into(),
+            from_state: from_state.into(),
+            to_state: to_state.into(),
+            actor_role: None,
+            actor_agent: None,
+            reason: None,
+            created_at: Utc::now(),
+        }
+    }
+}
+
 /// A project tracked by agtx
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {

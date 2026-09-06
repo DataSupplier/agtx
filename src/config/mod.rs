@@ -708,6 +708,10 @@ pub struct WorkflowPlugin {
     pub name: String,
     pub description: Option<String>,
     pub init_script: Option<String>,
+    /// Optional declarative state graph. When absent, the built-in legacy
+    /// Backlog → Planning → Running → Review → Done lifecycle remains active.
+    #[serde(default)]
+    pub state_machine: Option<crate::workflow::WorkflowDefinition>,
     /// List of supported agent names (e.g. ["claude", "codex", "gemini", "opencode"]).
     /// If empty or omitted, all agents are assumed supported.
     #[serde(default)]
@@ -886,7 +890,7 @@ impl WorkflowPlugin {
             let local_path = Self::project_plugins_dir(pp).join(name).join("plugin.toml");
             if local_path.exists() {
                 let content = std::fs::read_to_string(&local_path)?;
-                return toml::from_str(&content).context("Failed to parse plugin.toml");
+                return Self::parse(&content);
             }
         }
         // 2. Check global
@@ -896,9 +900,17 @@ impl WorkflowPlugin {
             .join("plugin.toml");
         if global_path.exists() {
             let content = std::fs::read_to_string(&global_path)?;
-            return toml::from_str(&content).context("Failed to parse plugin.toml");
+            return Self::parse(&content);
         }
         anyhow::bail!("Plugin '{}' not found", name)
+    }
+
+    fn parse(content: &str) -> Result<Self> {
+        let plugin: Self = toml::from_str(content).context("Failed to parse plugin.toml")?;
+        if let Some(workflow) = &plugin.state_machine {
+            workflow.validate().context("Invalid workflow state machine")?;
+        }
+        Ok(plugin)
     }
 
     /// Get the plugin directory path (for reading skill files)

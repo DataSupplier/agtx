@@ -6,6 +6,7 @@ pub mod git;
 pub mod mcp;
 pub mod skills;
 pub mod tmux;
+pub mod workflow;
 pub mod tui;
 pub mod update;
 
