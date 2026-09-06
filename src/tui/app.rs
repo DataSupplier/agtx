@@ -26,8 +26,8 @@ use crate::db::{Database, PhaseStatus, Task, TaskStatus, TransitionRequest};
 use crate::git::{
     self, GitOperations, GitProviderOperations, PullRequestState, RealGitHubOps, RealGitOps,
 };
-use crate::workflow::WorkflowProjectConfig;
-use crate::workflow_executor::prepare_admission;
+use crate::workflow::{GuardContext, WorkflowProjectConfig};
+use crate::workflow_executor::{prepare_admission, prepare_transition};
 use crate::skills;
 use crate::tmux::{
     self, InputConfig, InputError, PaneInput, PaneInputSink, RealTmuxOps, TmuxOperations,
@@ -71,7 +71,7 @@ fn build_footer_text(
                     "  [C-f] fullscreen"
                 };
                 match selected_column {
-                    0 => "[o] new  [Enter] edit  [d] diff  ·  [A] admit  [m] plan  [M] run  ·  [?] help  [q] quit".to_string(),
+                    0 => "[o] new  [Enter] edit  [d] diff  ·  [A] admit  [S] start planning  ·  [?] help  [q] quit".to_string(),
                     1 => format!("[o] new  [Enter] open{fullscreen}  [d] diff  ·  [m] run  ·  [?] help  [q] quit"),
                     2 => format!("[o] new  [Enter] open{fullscreen}  [d] diff  ·  [r] back  [m] move  ·  [?] help  [q] quit"),
                     3 if has_cyclic_plugin => format!(
@@ -4713,6 +4713,7 @@ impl App {
             }
             KeyCode::Char('m') => self.move_task_right()?,
             KeyCode::Char('A') => self.admit_selected_task()?,
+            KeyCode::Char('S') => self.start_selected_workflow_planning()?,
             KeyCode::Char('M') => self.move_backlog_to_running()?,
             KeyCode::Char('R') => {
                 if let Some(task) = self.state.board.selected_task() {
@@ -5976,6 +5977,73 @@ impl App {
             format!("Admitted at {} — ready for planning", &base_sha[..base_sha.len().min(12)]),
             Instant::now(),
         ));
+        self.refresh_tasks()?;
+        Ok(())
+    }
+
+    /// Start the configured planner from an admitted task worktree.
+    fn start_selected_workflow_planning(&mut self) -> Result<()> {
+        let (mut task, project_path) = match (
+            self.state.board.selected_task().cloned(),
+            self.state.project_path.clone(),
+        ) {
+            (Some(task), Some(project_path)) => (task, project_path),
+            _ => return Ok(()),
+        };
+        let Some(plugin) = self.load_task_plugin(&task) else { return Ok(()); };
+        let Some(workflow) = plugin.state_machine.as_ref() else {
+            self.state.warning_message = Some(("Task uses the legacy workflow".into(), Instant::now()));
+            return Ok(());
+        };
+        let Some(project_workflow) = WorkflowProjectConfig::load(&project_path)? else {
+            self.state.warning_message = Some(("Missing .agtx/workflow.toml".into(), Instant::now()));
+            return Ok(());
+        };
+        let Some(worktree) = task.worktree_path.clone() else {
+            self.state.warning_message = Some(("Admit the task before starting planning".into(), Instant::now()));
+            return Ok(());
+        };
+        let Some(current) = self.state.db.as_ref().and_then(|db| db.get_workflow_task_state(&task.id).ok().flatten()) else {
+            self.state.warning_message = Some(("Task has no admission evidence".into(), Instant::now()));
+            return Ok(());
+        };
+
+        let ready = match prepare_transition(
+            workflow, &project_workflow, &current, "admission_complete",
+            GuardContext { admission_recorded: true, ..GuardContext::default() },
+        ) {
+            Ok(value) => value,
+            Err(error) => { self.state.warning_message = Some((format!("Cannot start planning: {error}"), Instant::now())); return Ok(()); }
+        };
+        let planning = match prepare_transition(workflow, &project_workflow, &ready.state, "start_planning", GuardContext::default()) {
+            Ok(value) => value,
+            Err(error) => { self.state.warning_message = Some((format!("Cannot start planning: {error}"), Instant::now())); return Ok(()); }
+        };
+        let Some(planner) = planning.destination_agent.clone() else {
+            self.state.warning_message = Some(("Planning state has no bound agent".into(), Instant::now()));
+            return Ok(());
+        };
+        let agent_ops = self.state.agent_registry.get(&planner);
+        let prompt = resolve_prompt(&Some(plugin.clone()), "planning", &task.content_text(), &task.id, task.cycle);
+        let slug = generate_task_slug(&task.id, &task.title);
+        let window_name = format!("task-{slug}");
+        let target = format!("{}:{window_name}", self.state.tmux_project_name);
+        ensure_project_tmux_session(&self.state.tmux_project_name, &project_path, self.state.tmux_ops.as_ref());
+        self.state.tmux_ops.create_window(
+            &self.state.tmux_project_name, &window_name, &worktree,
+            Some(agent_ops.build_interactive_command(&prompt)), true,
+            &agtx_task_env(&task.id, &worktree),
+        )?;
+
+        let db = self.state.db.as_mut().ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
+        db.advance_workflow_state(&ready.state, &ready.transition)?;
+        db.advance_workflow_state(&planning.state, &planning.transition)?;
+        task.status = TaskStatus::Planning;
+        task.agent = planner;
+        task.session_name = Some(target);
+        task.updated_at = chrono::Utc::now();
+        db.update_task(&task)?;
+        self.state.warning_message = Some(("Planning started in admitted worktree".into(), Instant::now()));
         self.refresh_tasks()?;
         Ok(())
     }
