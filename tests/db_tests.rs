@@ -899,6 +899,51 @@ fn workflow_state_and_transition_history_are_durable() {
 
 #[test]
 #[cfg(feature = "test-mocks")]
+fn admission_persists_task_and_evidence_together() {
+    let mut db = Database::open_in_memory_project().unwrap();
+    let mut task = Task::new("F3.3", "claude", "heaves");
+    db.create_task(&task).unwrap();
+    task.worktree_path = Some(".agtx/worktrees/f3-3".into());
+    task.branch_name = Some("task/f3-3".into());
+    task.base_branch = Some("feature/poc".into());
+
+    let mut state = WorkflowTaskState::new(&task.id, "admission", "feature/poc");
+    state.base_sha = Some("abc123".into());
+    let transition = WorkflowTransitionRecord::new(&task.id, "admit", "backlog", "admission");
+    db.record_workflow_admission(&task, &state, &transition).unwrap();
+
+    let stored_task = db.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(stored_task.worktree_path, task.worktree_path);
+    assert_eq!(stored_task.branch_name, task.branch_name);
+    assert_eq!(db.get_workflow_task_state(&task.id).unwrap().unwrap().base_sha, state.base_sha);
+    assert_eq!(db.workflow_transition_history(&task.id).unwrap().len(), 1);
+}
+
+#[test]
+#[cfg(feature = "test-mocks")]
+fn transition_advancement_updates_state_and_history_together() {
+    let mut db = Database::open_in_memory_project().unwrap();
+    let task = Task::new("F3.3", "claude", "heaves");
+    db.create_task(&task).unwrap();
+    let state = WorkflowTaskState::new(&task.id, "admission", "feature/poc");
+    db.upsert_workflow_task_state(&state).unwrap();
+
+    let mut next = state.clone();
+    next.state = "ready_for_planning".into();
+    let transition = WorkflowTransitionRecord::new(
+        &task.id,
+        "admission_complete",
+        "admission",
+        "ready_for_planning",
+    );
+    db.advance_workflow_state(&next, &transition).unwrap();
+
+    assert_eq!(db.get_workflow_task_state(&task.id).unwrap().unwrap().state, "ready_for_planning");
+    assert_eq!(db.workflow_transition_history(&task.id).unwrap()[0].action, "admission_complete");
+}
+
+#[test]
+#[cfg(feature = "test-mocks")]
 fn deleting_a_task_removes_its_workflow_evidence() {
     let db = Database::open_in_memory_project().unwrap();
     let task = Task::new("F3.3", "claude", "heaves");

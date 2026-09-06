@@ -19,6 +19,69 @@ pub struct Admission {
     pub transition: WorkflowTransitionRecord,
 }
 
+/// The durable result of any already-admitted workflow transition.
+#[derive(Debug, Clone)]
+pub struct PreparedTransition {
+    pub state: WorkflowTaskState,
+    pub transition: WorkflowTransitionRecord,
+    /// The agent bound to the role that owns the destination state, if any.
+    pub destination_agent: Option<String>,
+}
+
+/// Validate and prepare a transition for a task with existing workflow state.
+///
+/// No agent name or phase name is hard-coded here: the destination state's
+/// stable role is resolved through the project's bindings. Callers can use the
+/// returned agent to launch or switch an interactive session after persistence.
+pub fn prepare_transition(
+    workflow: &WorkflowDefinition,
+    project: &WorkflowProjectConfig,
+    current: &WorkflowTaskState,
+    action: &str,
+    guards: GuardContext,
+) -> Result<PreparedTransition> {
+    if current.target_branch != project.target_branch {
+        bail!(
+            "task '{}' was admitted to '{}', not configured target '{}'",
+            current.task_id,
+            current.target_branch,
+            project.target_branch
+        );
+    }
+    let edge = workflow.validate_transition(&current.state, action, guards)?;
+    let destination = workflow
+        .state(&edge.to)
+        .ok_or_else(|| anyhow::anyhow!("workflow transition '{}' has no destination state", edge.action))?;
+    let destination_agent = match &destination.role {
+        Some(role) => Some(
+            project
+                .role_bindings
+                .get(role)
+                .ok_or_else(|| anyhow::anyhow!("workflow role '{role}' has no agent binding"))?
+                .clone(),
+        ),
+        None => None,
+    };
+
+    let mut state = current.clone();
+    state.state = edge.to.clone();
+    state.updated_at = chrono::Utc::now();
+    let mut transition = WorkflowTransitionRecord::new(
+        &current.task_id,
+        &edge.action,
+        &edge.from,
+        &edge.to,
+    );
+    transition.actor_role = destination.role.clone();
+    transition.actor_agent = destination_agent.clone();
+
+    Ok(PreparedTransition {
+        state,
+        transition,
+        destination_agent,
+    })
+}
+
 /// Validate and prepare the `admit` transition.
 ///
 /// `base_sha` must already have been resolved with git from the configured
@@ -113,5 +176,29 @@ mod tests {
 
         task.worktree_path = Some(".agtx/worktrees/example".into());
         assert!(prepare_admission(&workflow(), &project(), &task, true, "a1b2c3").is_err());
+    }
+
+    #[test]
+    fn transition_uses_project_role_binding_not_a_hard_coded_agent() {
+        let mut graph = workflow();
+        graph.states[1].role = Some("planner".into());
+        graph.transitions[0].action = "start_planning".into();
+        let mut current = WorkflowTaskState::new("task", "backlog", "feature/poc");
+        current.base_sha = Some("a1b2c3".into());
+        let mut project = project();
+        project.role_bindings.insert("planner".into(), "claude".into());
+
+        let transition = prepare_transition(
+            &graph,
+            &project,
+            &current,
+            "start_planning",
+            GuardContext { dependencies_resolved: true, ..GuardContext::default() },
+        )
+        .unwrap();
+
+        assert_eq!(transition.state.state, "admission");
+        assert_eq!(transition.destination_agent.as_deref(), Some("claude"));
+        assert_eq!(transition.transition.actor_role.as_deref(), Some("planner"));
     }
 }

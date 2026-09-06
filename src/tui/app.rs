@@ -26,6 +26,8 @@ use crate::db::{Database, PhaseStatus, Task, TaskStatus, TransitionRequest};
 use crate::git::{
     self, GitOperations, GitProviderOperations, PullRequestState, RealGitHubOps, RealGitOps,
 };
+use crate::workflow::WorkflowProjectConfig;
+use crate::workflow_executor::prepare_admission;
 use crate::skills;
 use crate::tmux::{
     self, InputConfig, InputError, PaneInput, PaneInputSink, RealTmuxOps, TmuxOperations,
@@ -69,7 +71,7 @@ fn build_footer_text(
                     "  [C-f] fullscreen"
                 };
                 match selected_column {
-                    0 => "[o] new  [Enter] edit  [d] diff  ·  [m] plan  [M] run  [R] research  ·  [?] help  [q] quit".to_string(),
+                    0 => "[o] new  [Enter] edit  [d] diff  ·  [A] admit  [m] plan  [M] run  ·  [?] help  [q] quit".to_string(),
                     1 => format!("[o] new  [Enter] open{fullscreen}  [d] diff  ·  [m] run  ·  [?] help  [q] quit"),
                     2 => format!("[o] new  [Enter] open{fullscreen}  [d] diff  ·  [r] back  [m] move  ·  [?] help  [q] quit"),
                     3 if has_cyclic_plugin => format!(
@@ -4710,6 +4712,7 @@ impl App {
                 self.state.mobile_popup = Some(crate::tui::serve_control::MobilePopup::new());
             }
             KeyCode::Char('m') => self.move_task_right()?,
+            KeyCode::Char('A') => self.admit_selected_task()?,
             KeyCode::Char('M') => self.move_backlog_to_running()?,
             KeyCode::Char('R') => {
                 if let Some(task) = self.state.board.selected_task() {
@@ -5824,6 +5827,155 @@ impl App {
                 self.state.phase_status_cache.remove(&task.id);
             }
         }
+        self.refresh_tasks()?;
+        Ok(())
+    }
+
+    /// Admit a declarative-workflow task without starting an agent.
+    ///
+    /// Admission freezes the configured integration target at one commit and
+    /// cuts the task branch from that commit. Planning is deliberately a
+    /// separate later transition owned by the workflow's planner role.
+    fn admit_selected_task(&mut self) -> Result<()> {
+        let (mut task, project_path) = match (
+            self.state.board.selected_task().cloned(),
+            self.state.project_path.clone(),
+        ) {
+            (Some(task), Some(project_path)) => (task, project_path),
+            _ => return Ok(()),
+        };
+        if task.status != TaskStatus::Backlog {
+            self.state.warning_message = Some((
+                "Only Backlog tasks can be admitted".to_string(),
+                Instant::now(),
+            ));
+            return Ok(());
+        }
+        if self.state.config.skip_worktree {
+            self.state.warning_message = Some((
+                "Declarative workflow admission requires task worktrees".to_string(),
+                Instant::now(),
+            ));
+            return Ok(());
+        }
+
+        let Some(plugin) = self.load_task_plugin(&task) else {
+            self.state.warning_message = Some(("Task has no workflow plugin".to_string(), Instant::now()));
+            return Ok(());
+        };
+        let Some(workflow) = plugin.state_machine.as_ref() else {
+            self.state.warning_message = Some((
+                "Task plugin uses the legacy board workflow; select a declarative plugin first".to_string(),
+                Instant::now(),
+            ));
+            return Ok(());
+        };
+        let Some(project_workflow) = WorkflowProjectConfig::load(&project_path)? else {
+            self.state.warning_message = Some((
+                "Missing .agtx/workflow.toml for declarative workflow admission".to_string(),
+                Instant::now(),
+            ));
+            return Ok(());
+        };
+        let dependencies_resolved = self
+            .state
+            .db
+            .as_ref()
+            .map(|db| db.deps_satisfied(&task))
+            .unwrap_or(false);
+        let base_sha = match git::resolve_commit(&project_path, &project_workflow.target_branch) {
+            Ok(sha) => sha,
+            Err(error) => {
+                self.state.warning_message = Some((
+                    format!("Cannot admit task: {error}"),
+                    Instant::now(),
+                ));
+                return Ok(());
+            }
+        };
+        let admission = match prepare_admission(
+            workflow,
+            &project_workflow,
+            &task,
+            dependencies_resolved,
+            base_sha.clone(),
+        ) {
+            Ok(admission) => admission,
+            Err(error) => {
+                self.state.warning_message = Some((
+                    format!("Cannot admit task: {error}"),
+                    Instant::now(),
+                ));
+                return Ok(());
+            }
+        };
+
+        let slug = generate_task_slug(&task.id, &task.title);
+        let worktree_path = match self.state.git_ops.create_worktree(
+            &project_path,
+            &slug,
+            &base_sha,
+            &self.state.config.worktree_dir,
+            &self.state.config.branch_prefix,
+        ) {
+            Ok(path) => path,
+            Err(error) => {
+                self.state.warning_message = Some((
+                    format!("Cannot create admission worktree: {error}"),
+                    Instant::now(),
+                ));
+                return Ok(());
+            }
+        };
+
+        let copy_files = match (&self.state.config.copy_files, plugin.copy_files.is_empty()) {
+            (Some(project_files), false) if !project_files.trim().is_empty() => {
+                Some(format!("{project_files},{}", plugin.copy_files.join(",")))
+            }
+            (Some(project_files), _) if !project_files.trim().is_empty() => Some(project_files.clone()),
+            (_, false) => Some(plugin.copy_files.join(",")),
+            _ => None,
+        };
+        let init_script = if self.state.flags.no_init_scripts {
+            None
+        } else {
+            self.state.config.init_script.clone()
+        };
+        let _warnings = self.state.git_ops.initialize_worktree(
+            &project_path,
+            Path::new(&worktree_path),
+            copy_files,
+            init_script,
+            plugin.copy_dirs.clone(),
+        );
+
+        task.worktree_path = Some(worktree_path.clone());
+        task.branch_name = Some(format!("{}/{}", self.state.config.branch_prefix, slug));
+        task.base_branch = Some(project_workflow.target_branch.clone());
+        task.updated_at = chrono::Utc::now();
+
+        let persist_result = self
+            .state
+            .db
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?
+            .record_workflow_admission(&task, &admission.state, &admission.transition);
+        if let Err(error) = persist_result {
+            let _ = self.state.git_ops.remove_worktree(&project_path, &worktree_path);
+            if let Some(branch) = &task.branch_name {
+                let _ = self.state.git_ops.delete_branch(&project_path, branch);
+            }
+            self.state.warning_message = Some((
+                format!("Admission was rolled back: {error}"),
+                Instant::now(),
+            ));
+            return Ok(());
+        }
+
+        self.state.warning_message = Some((
+            format!("Admitted at {} — ready for planning", &base_sha[..base_sha.len().min(12)]),
+            Instant::now(),
+        ));
         self.refresh_tasks()?;
         Ok(())
     }
