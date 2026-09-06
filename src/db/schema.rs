@@ -585,6 +585,64 @@ impl Database {
         Ok(())
     }
 
+    /// Persist the worktree created during admission together with its frozen
+    /// base commit and audit record.  A task must never point at a worktree
+    /// while lacking the evidence that explains what it was based on.
+    pub fn record_workflow_admission(
+        &mut self,
+        task: &Task,
+        state: &WorkflowTaskState,
+        record: &WorkflowTransitionRecord,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE tasks SET worktree_path = ?2, branch_name = ?3, base_branch = ?4, updated_at = ?5 WHERE id = ?1",
+            params![
+                task.id,
+                task.worktree_path,
+                task.branch_name,
+                task.base_branch,
+                task.updated_at.to_rfc3339(),
+            ],
+        )?;
+        tx.execute(
+            r#"
+            INSERT INTO workflow_task_states (
+                task_id, state, target_branch, base_sha, plan_revision, plan_hash,
+                approved_plan_revision, approved_plan_hash, validation_passed_at,
+                integration_sha, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ON CONFLICT(task_id) DO UPDATE SET
+                state = excluded.state, target_branch = excluded.target_branch,
+                base_sha = excluded.base_sha, plan_revision = excluded.plan_revision,
+                plan_hash = excluded.plan_hash, approved_plan_revision = excluded.approved_plan_revision,
+                approved_plan_hash = excluded.approved_plan_hash,
+                validation_passed_at = excluded.validation_passed_at,
+                integration_sha = excluded.integration_sha, updated_at = excluded.updated_at
+            "#,
+            params![
+                state.task_id, state.state, state.target_branch, state.base_sha,
+                state.plan_revision, state.plan_hash, state.approved_plan_revision,
+                state.approved_plan_hash,
+                state.validation_passed_at.map(|value| value.to_rfc3339()),
+                state.integration_sha, state.updated_at.to_rfc3339(),
+            ],
+        )?;
+        tx.execute(
+            r#"INSERT INTO workflow_transition_history (
+                id, task_id, action, from_state, to_state, actor_role, actor_agent,
+                reason, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+            params![
+                record.id, record.task_id, record.action, record.from_state, record.to_state,
+                record.actor_role, record.actor_agent, record.reason,
+                record.created_at.to_rfc3339(),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn workflow_transition_history(
         &self,
         task_id: &str,
