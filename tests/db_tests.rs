@@ -921,6 +921,29 @@ fn admission_persists_task_and_evidence_together() {
 
 #[test]
 #[cfg(feature = "test-mocks")]
+fn transition_advancement_updates_state_and_history_together() {
+    let mut db = Database::open_in_memory_project().unwrap();
+    let task = Task::new("F3.3", "claude", "heaves");
+    db.create_task(&task).unwrap();
+    let state = WorkflowTaskState::new(&task.id, "admission", "feature/poc");
+    db.upsert_workflow_task_state(&state).unwrap();
+
+    let mut next = state.clone();
+    next.state = "ready_for_planning".into();
+    let transition = WorkflowTransitionRecord::new(
+        &task.id,
+        "admission_complete",
+        "admission",
+        "ready_for_planning",
+    );
+    db.advance_workflow_state(&next, &transition).unwrap();
+
+    assert_eq!(db.get_workflow_task_state(&task.id).unwrap().unwrap().state, "ready_for_planning");
+    assert_eq!(db.workflow_transition_history(&task.id).unwrap()[0].action, "admission_complete");
+}
+
+#[test]
+#[cfg(feature = "test-mocks")]
 fn deleting_a_task_removes_its_workflow_evidence() {
     let db = Database::open_in_memory_project().unwrap();
     let task = Task::new("F3.3", "claude", "heaves");

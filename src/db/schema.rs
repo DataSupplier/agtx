@@ -643,6 +643,49 @@ impl Database {
         Ok(())
     }
 
+    /// Atomically advance durable workflow state and append its audit record.
+    ///
+    /// Callers prepare and guard the transition before calling this method; the
+    /// transaction guarantees observers cannot see the new state without its
+    /// corresponding history entry.
+    pub fn advance_workflow_state(
+        &mut self,
+        state: &WorkflowTaskState,
+        record: &WorkflowTransitionRecord,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            r#"
+            UPDATE workflow_task_states SET
+                state = ?2, target_branch = ?3, base_sha = ?4,
+                plan_revision = ?5, plan_hash = ?6,
+                approved_plan_revision = ?7, approved_plan_hash = ?8,
+                validation_passed_at = ?9, integration_sha = ?10, updated_at = ?11
+            WHERE task_id = ?1
+            "#,
+            params![
+                state.task_id, state.state, state.target_branch, state.base_sha,
+                state.plan_revision, state.plan_hash, state.approved_plan_revision,
+                state.approved_plan_hash,
+                state.validation_passed_at.map(|value| value.to_rfc3339()),
+                state.integration_sha, state.updated_at.to_rfc3339(),
+            ],
+        )?;
+        tx.execute(
+            r#"INSERT INTO workflow_transition_history (
+                id, task_id, action, from_state, to_state, actor_role, actor_agent,
+                reason, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+            params![
+                record.id, record.task_id, record.action, record.from_state, record.to_state,
+                record.actor_role, record.actor_agent, record.reason,
+                record.created_at.to_rfc3339(),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn workflow_transition_history(
         &self,
         task_id: &str,
