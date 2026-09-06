@@ -70,6 +70,26 @@ pub fn ref_exists(path: &Path, rev: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Resolve a ref to the immutable commit it names.
+///
+/// Admission records this value before creating a task worktree, rather than
+/// retaining a moving branch name and later claiming a task was reviewed
+/// against whatever that branch happens to contain.
+pub fn resolve_commit(path: &Path, rev: &str) -> Result<String> {
+    let output = Command::new("git")
+        .current_dir(path)
+        .args(["rev-parse", "--verify", &format!("{rev}^{{commit}}")])
+        .output()
+        .with_context(|| format!("Failed to resolve git ref '{rev}'"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Git ref '{rev}' does not resolve to a commit: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// Get the diff between two branches (stat format)
 pub fn diff_stat(path: &Path, base: &str, target: &str) -> Result<String> {
     let output = Command::new("git")
