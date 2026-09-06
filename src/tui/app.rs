@@ -5,6 +5,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{prelude::*, widgets::*};
+use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Stdout};
@@ -26,12 +27,12 @@ use crate::db::{Database, PhaseStatus, Task, TaskStatus, TransitionRequest};
 use crate::git::{
     self, GitOperations, GitProviderOperations, PullRequestState, RealGitHubOps, RealGitOps,
 };
-use crate::workflow::{GuardContext, WorkflowProjectConfig};
-use crate::workflow_executor::{prepare_admission, prepare_transition};
 use crate::skills;
 use crate::tmux::{
     self, InputConfig, InputError, PaneInput, PaneInputSink, RealTmuxOps, TmuxOperations,
 };
+use crate::workflow::{GuardContext, WorkflowProjectConfig};
+use crate::workflow_executor::{prepare_admission, prepare_transition};
 use crate::AppMode;
 
 use super::board::BoardState;
@@ -4714,6 +4715,9 @@ impl App {
             KeyCode::Char('m') => self.move_task_right()?,
             KeyCode::Char('A') => self.admit_selected_task()?,
             KeyCode::Char('S') => self.start_selected_workflow_planning()?,
+            KeyCode::Char('V') => self.submit_selected_workflow_plan()?,
+            KeyCode::Char('Y') => self.decide_selected_workflow_plan(true)?,
+            KeyCode::Char('N') => self.decide_selected_workflow_plan(false)?,
             KeyCode::Char('M') => self.move_backlog_to_running()?,
             KeyCode::Char('R') => {
                 if let Some(task) = self.state.board.selected_task() {
@@ -5861,12 +5865,14 @@ impl App {
         }
 
         let Some(plugin) = self.load_task_plugin(&task) else {
-            self.state.warning_message = Some(("Task has no workflow plugin".to_string(), Instant::now()));
+            self.state.warning_message =
+                Some(("Task has no workflow plugin".to_string(), Instant::now()));
             return Ok(());
         };
         let Some(workflow) = plugin.state_machine.as_ref() else {
             self.state.warning_message = Some((
-                "Task plugin uses the legacy board workflow; select a declarative plugin first".to_string(),
+                "Task plugin uses the legacy board workflow; select a declarative plugin first"
+                    .to_string(),
                 Instant::now(),
             ));
             return Ok(());
@@ -5887,10 +5893,8 @@ impl App {
         let base_sha = match git::resolve_commit(&project_path, &project_workflow.target_branch) {
             Ok(sha) => sha,
             Err(error) => {
-                self.state.warning_message = Some((
-                    format!("Cannot admit task: {error}"),
-                    Instant::now(),
-                ));
+                self.state.warning_message =
+                    Some((format!("Cannot admit task: {error}"), Instant::now()));
                 return Ok(());
             }
         };
@@ -5903,10 +5907,8 @@ impl App {
         ) {
             Ok(admission) => admission,
             Err(error) => {
-                self.state.warning_message = Some((
-                    format!("Cannot admit task: {error}"),
-                    Instant::now(),
-                ));
+                self.state.warning_message =
+                    Some((format!("Cannot admit task: {error}"), Instant::now()));
                 return Ok(());
             }
         };
@@ -5933,7 +5935,9 @@ impl App {
             (Some(project_files), false) if !project_files.trim().is_empty() => {
                 Some(format!("{project_files},{}", plugin.copy_files.join(",")))
             }
-            (Some(project_files), _) if !project_files.trim().is_empty() => Some(project_files.clone()),
+            (Some(project_files), _) if !project_files.trim().is_empty() => {
+                Some(project_files.clone())
+            }
             (_, false) => Some(plugin.copy_files.join(",")),
             _ => None,
         };
@@ -5962,7 +5966,10 @@ impl App {
             .ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?
             .record_workflow_admission(&task, &admission.state, &admission.transition);
         if let Err(error) = persist_result {
-            let _ = self.state.git_ops.remove_worktree(&project_path, &worktree_path);
+            let _ = self
+                .state
+                .git_ops
+                .remove_worktree(&project_path, &worktree_path);
             if let Some(branch) = &task.branch_name {
                 let _ = self.state.git_ops.delete_branch(&project_path, branch);
             }
@@ -5974,7 +5981,10 @@ impl App {
         }
 
         self.state.warning_message = Some((
-            format!("Admitted at {} — ready for planning", &base_sha[..base_sha.len().min(12)]),
+            format!(
+                "Admitted at {} — ready for planning",
+                &base_sha[..base_sha.len().min(12)]
+            ),
             Instant::now(),
         ));
         self.refresh_tasks()?;
@@ -5990,52 +6000,121 @@ impl App {
             (Some(task), Some(project_path)) => (task, project_path),
             _ => return Ok(()),
         };
-        let Some(plugin) = self.load_task_plugin(&task) else { return Ok(()); };
+        let Some(plugin) = self.load_task_plugin(&task) else {
+            return Ok(());
+        };
         let Some(workflow) = plugin.state_machine.as_ref() else {
-            self.state.warning_message = Some(("Task uses the legacy workflow".into(), Instant::now()));
+            self.state.warning_message =
+                Some(("Task uses the legacy workflow".into(), Instant::now()));
             return Ok(());
         };
         let Some(project_workflow) = WorkflowProjectConfig::load(&project_path)? else {
-            self.state.warning_message = Some(("Missing .agtx/workflow.toml".into(), Instant::now()));
+            self.state.warning_message =
+                Some(("Missing .agtx/workflow.toml".into(), Instant::now()));
             return Ok(());
         };
         let Some(worktree) = task.worktree_path.clone() else {
-            self.state.warning_message = Some(("Admit the task before starting planning".into(), Instant::now()));
+            self.state.warning_message = Some((
+                "Admit the task before starting planning".into(),
+                Instant::now(),
+            ));
             return Ok(());
         };
-        let Some(current) = self.state.db.as_ref().and_then(|db| db.get_workflow_task_state(&task.id).ok().flatten()) else {
-            self.state.warning_message = Some(("Task has no admission evidence".into(), Instant::now()));
+        let Some(current) = self
+            .state
+            .db
+            .as_ref()
+            .and_then(|db| db.get_workflow_task_state(&task.id).ok().flatten())
+        else {
+            self.state.warning_message =
+                Some(("Task has no admission evidence".into(), Instant::now()));
             return Ok(());
         };
 
+        // A legacy board move must not change the declarative workflow.  Repair
+        // the presentation status when a task was accidentally moved from
+        // Planning to Running (as happened to F3.3) instead of attempting a
+        // second admission/planning transition.
+        if current.state == "planning" {
+            if task.status != TaskStatus::Planning {
+                task.status = TaskStatus::Planning;
+                task.updated_at = chrono::Utc::now();
+                self.state.db.as_mut().unwrap().update_task(&task)?;
+            }
+            self.state.warning_message = Some((
+                "Workflow and board aligned at Planning".into(),
+                Instant::now(),
+            ));
+            self.refresh_tasks()?;
+            return Ok(());
+        }
+
         let ready = match prepare_transition(
-            workflow, &project_workflow, &current, "admission_complete",
-            GuardContext { admission_recorded: true, ..GuardContext::default() },
+            workflow,
+            &project_workflow,
+            &current,
+            "admission_complete",
+            GuardContext {
+                admission_recorded: true,
+                ..GuardContext::default()
+            },
         ) {
             Ok(value) => value,
-            Err(error) => { self.state.warning_message = Some((format!("Cannot start planning: {error}"), Instant::now())); return Ok(()); }
+            Err(error) => {
+                self.state.warning_message =
+                    Some((format!("Cannot start planning: {error}"), Instant::now()));
+                return Ok(());
+            }
         };
-        let planning = match prepare_transition(workflow, &project_workflow, &ready.state, "start_planning", GuardContext::default()) {
+        let planning = match prepare_transition(
+            workflow,
+            &project_workflow,
+            &ready.state,
+            "start_planning",
+            GuardContext::default(),
+        ) {
             Ok(value) => value,
-            Err(error) => { self.state.warning_message = Some((format!("Cannot start planning: {error}"), Instant::now())); return Ok(()); }
+            Err(error) => {
+                self.state.warning_message =
+                    Some((format!("Cannot start planning: {error}"), Instant::now()));
+                return Ok(());
+            }
         };
         let Some(planner) = planning.destination_agent.clone() else {
-            self.state.warning_message = Some(("Planning state has no bound agent".into(), Instant::now()));
+            self.state.warning_message =
+                Some(("Planning state has no bound agent".into(), Instant::now()));
             return Ok(());
         };
         let agent_ops = self.state.agent_registry.get(&planner);
-        let prompt = resolve_prompt(&Some(plugin.clone()), "planning", &task.content_text(), &task.id, task.cycle);
+        let prompt = resolve_prompt(
+            &Some(plugin.clone()),
+            "planning",
+            &task.content_text(),
+            &task.id,
+            task.cycle,
+        );
         let slug = generate_task_slug(&task.id, &task.title);
         let window_name = format!("task-{slug}");
         let target = format!("{}:{window_name}", self.state.tmux_project_name);
-        ensure_project_tmux_session(&self.state.tmux_project_name, &project_path, self.state.tmux_ops.as_ref());
+        ensure_project_tmux_session(
+            &self.state.tmux_project_name,
+            &project_path,
+            self.state.tmux_ops.as_ref(),
+        );
         self.state.tmux_ops.create_window(
-            &self.state.tmux_project_name, &window_name, &worktree,
-            Some(agent_ops.build_interactive_command(&prompt)), true,
+            &self.state.tmux_project_name,
+            &window_name,
+            &worktree,
+            Some(agent_ops.build_interactive_command(&prompt)),
+            true,
             &agtx_task_env(&task.id, &worktree),
         )?;
 
-        let db = self.state.db.as_mut().ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
+        let db = self
+            .state
+            .db
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
         db.advance_workflow_state(&ready.state, &ready.transition)?;
         db.advance_workflow_state(&planning.state, &planning.transition)?;
         task.status = TaskStatus::Planning;
@@ -6043,7 +6122,225 @@ impl App {
         task.session_name = Some(target);
         task.updated_at = chrono::Utc::now();
         db.update_task(&task)?;
-        self.state.warning_message = Some(("Planning started in admitted worktree".into(), Instant::now()));
+        self.state.warning_message = Some((
+            "Planning started in admitted worktree".into(),
+            Instant::now(),
+        ));
+        self.refresh_tasks()?;
+        Ok(())
+    }
+
+    /// Hash the saved planning artifact, record it durably, and hand the exact
+    /// revision to the role bound to `plan_reviewer`.
+    fn submit_selected_workflow_plan(&mut self) -> Result<()> {
+        let (mut task, project_path) = match (
+            self.state.board.selected_task().cloned(),
+            self.state.project_path.clone(),
+        ) {
+            (Some(task), Some(project_path)) => (task, project_path),
+            _ => return Ok(()),
+        };
+        let Some(plugin) = self.load_task_plugin(&task) else {
+            return Ok(());
+        };
+        let Some(workflow) = plugin.state_machine.as_ref() else {
+            return Ok(());
+        };
+        let Some(project_workflow) = WorkflowProjectConfig::load(&project_path)? else {
+            return Ok(());
+        };
+        let Some(worktree) = task.worktree_path.clone() else {
+            self.state.warning_message = Some((
+                "Planning requires an admitted worktree".into(),
+                Instant::now(),
+            ));
+            return Ok(());
+        };
+        let Some(current) = self
+            .state
+            .db
+            .as_ref()
+            .and_then(|db| db.get_workflow_task_state(&task.id).ok().flatten())
+        else {
+            return Ok(());
+        };
+        if current.state != "planning" {
+            self.state.warning_message = Some((
+                "Submit plan is only available in Planning".into(),
+                Instant::now(),
+            ));
+            return Ok(());
+        }
+        let path = planning_artifact_path(&worktree, &plugin, &task.id)?;
+        let contents = std::fs::read(&path)
+            .map_err(|_| anyhow::anyhow!("Missing planning artifact: {}", path.display()))?;
+        let revision = plan_revision(&contents).ok_or_else(|| {
+            anyhow::anyhow!("Planning artifact must contain 'plan_revision: <positive integer>'")
+        })?;
+        if revision <= current.plan_revision {
+            anyhow::bail!(
+                "Plan revision {revision} is not newer than recorded revision {}",
+                current.plan_revision
+            );
+        }
+        let mut evidenced = current;
+        evidenced.plan_revision = revision;
+        evidenced.plan_hash = Some(format!("{:x}", Sha256::digest(&contents)));
+        let handoff = prepare_transition(
+            workflow,
+            &project_workflow,
+            &evidenced,
+            "submit_plan",
+            GuardContext::default(),
+        )?;
+        let reviewer = handoff
+            .destination_agent
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Plan review state has no bound agent"))?;
+        let prompt = format!(
+            "You are the plan reviewer for task {}. Review only {} (revision {}, SHA-256 {}). Do not implement code. Check it against the task, identify concrete changes if needed, then leave your decision for the operator: approve with Shift+Y or request changes with Shift+N.",
+            task.id, path.strip_prefix(&worktree).unwrap_or(&path).display(), revision, evidenced.plan_hash.as_deref().unwrap_or_default()
+        );
+        let target = task
+            .session_name
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Planning session is unavailable"))?;
+        let previous_agent = task.agent.clone();
+        spawn_send_to_agent(
+            Arc::clone(&self.state.tmux_ops),
+            Arc::clone(&self.state.agent_registry),
+            task.id.clone(),
+            self.state.config.agent_hooks,
+            self.state.config.auto_trust,
+            target,
+            previous_agent,
+            reviewer.clone(),
+            true,
+            None,
+            None,
+            prompt,
+            None,
+            task.content_text(),
+            Vec::new(),
+            task.worktree_path.clone(),
+            project_path,
+            Some(plugin.clone()),
+        );
+        task.status = TaskStatus::Review;
+        task.agent = reviewer;
+        task.updated_at = chrono::Utc::now();
+        let db = self
+            .state
+            .db
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
+        db.advance_workflow_state(&handoff.state, &handoff.transition)?;
+        db.update_task(&task)?;
+        self.state.warning_message = Some((
+            format!("Plan revision {revision} submitted for review"),
+            Instant::now(),
+        ));
+        self.refresh_tasks()?;
+        Ok(())
+    }
+
+    /// Persist the operator's reviewer decision.  Approval freezes the exact
+    /// recorded hash; request-changes returns ownership to the configured planner.
+    fn decide_selected_workflow_plan(&mut self, approve: bool) -> Result<()> {
+        let (mut task, project_path) = match (
+            self.state.board.selected_task().cloned(),
+            self.state.project_path.clone(),
+        ) {
+            (Some(task), Some(project_path)) => (task, project_path),
+            _ => return Ok(()),
+        };
+        let Some(plugin) = self.load_task_plugin(&task) else {
+            return Ok(());
+        };
+        let Some(workflow) = plugin.state_machine.as_ref() else {
+            return Ok(());
+        };
+        let Some(project_workflow) = WorkflowProjectConfig::load(&project_path)? else {
+            return Ok(());
+        };
+        let Some(mut current) = self
+            .state
+            .db
+            .as_ref()
+            .and_then(|db| db.get_workflow_task_state(&task.id).ok().flatten())
+        else {
+            return Ok(());
+        };
+        if current.state != "plan_review" {
+            return Ok(());
+        }
+        let action = if approve {
+            "approve_plan"
+        } else {
+            "plan_changes_requested"
+        };
+        if approve {
+            current.approved_plan_revision = Some(current.plan_revision);
+            current.approved_plan_hash = current.plan_hash.clone();
+        }
+        let decision = prepare_transition(
+            workflow,
+            &project_workflow,
+            &current,
+            action,
+            GuardContext {
+                approved_plan: approve && current.plan_hash.is_some(),
+                ..GuardContext::default()
+            },
+        )?;
+        let previous_agent = task.agent.clone();
+        task.status = TaskStatus::Planning;
+        task.agent = decision.destination_agent.clone().unwrap_or(task.agent);
+        task.updated_at = chrono::Utc::now();
+        let db = self
+            .state
+            .db
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
+        db.advance_workflow_state(&decision.state, &decision.transition)?;
+        db.update_task(&task)?;
+        if !approve {
+            if let Some(target) = task.session_name.clone() {
+                let prompt = format!(
+                    "Plan review requested changes for task {}. Revise .agtx/plans/{}.md, increment plan_revision above {}, and do not implement code. When complete, save the artifact for another Shift+V submission.",
+                    task.id, task.id, current.plan_revision
+                );
+                spawn_send_to_agent(
+                    Arc::clone(&self.state.tmux_ops),
+                    Arc::clone(&self.state.agent_registry),
+                    task.id.clone(),
+                    self.state.config.agent_hooks,
+                    self.state.config.auto_trust,
+                    target,
+                    previous_agent,
+                    task.agent.clone(),
+                    true,
+                    None,
+                    None,
+                    prompt,
+                    None,
+                    task.content_text(),
+                    Vec::new(),
+                    task.worktree_path.clone(),
+                    project_path,
+                    Some(plugin.clone()),
+                );
+            }
+        }
+        self.state.warning_message = Some((
+            (if approve {
+                "Plan approved"
+            } else {
+                "Plan changes requested; returned to Planning"
+            })
+            .into(),
+            Instant::now(),
+        ));
         self.refresh_tasks()?;
         Ok(())
     }
@@ -12054,6 +12351,36 @@ fn phase_artifact_exists(
         return false;
     };
     artifact_path_exists(worktree_path, rel_template, cycle)
+}
+
+/// Resolve the task-specific planning artifact declared by a workflow plugin.
+/// Unlike the legacy phase helper this deliberately supports `{task_id}` so a
+/// plan belongs to precisely one admitted worktree task.
+fn planning_artifact_path(
+    worktree_path: &str,
+    plugin: &WorkflowPlugin,
+    task_id: &str,
+) -> Result<PathBuf> {
+    let template =
+        plugin.artifacts.planning.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("Workflow plugin does not declare artifacts.planning")
+        })?;
+    if template.contains('*') || template.contains("{phase}") {
+        anyhow::bail!(
+            "Planning artifact must name one task-specific file, not a glob or phase template"
+        );
+    }
+    Ok(Path::new(worktree_path).join(template.replace("{task_id}", task_id)))
+}
+
+/// Read the explicit revision marker from a plan artifact.  It is intentionally
+/// format-light so teams can use Markdown with a YAML-style header or body.
+fn plan_revision(contents: &[u8]) -> Option<i32> {
+    let text = std::str::from_utf8(contents).ok()?;
+    text.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("plan_revision:")?.trim();
+        value.parse::<i32>().ok().filter(|revision| *revision > 0)
+    })
 }
 
 /// Check if the research artifact exists for a task.
