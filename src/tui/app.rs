@@ -12039,7 +12039,7 @@ fn build_policy_agent_command(
         tools.extend(policy.role_policy.allowed_commands.iter().map(|command| format!("Bash({command} *)")));
         tools.extend(policy.role_policy.write_paths.iter().flat_map(|path| [format!("Edit({path})"), format!("Write({path})")]));
         return format!(
-            "claude{model}{effort} --permission-mode dontAsk --allowed-tools '{}' '{}'",
+            "claude{model}{effort} --permission-mode dontAsk --allowed-tools '{}' -- '{}'",
             tools.join(","), quoted_prompt
         );
     }

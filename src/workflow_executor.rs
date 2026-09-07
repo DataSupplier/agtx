@@ -153,7 +153,11 @@ mod tests {
     }
 
     fn project() -> WorkflowProjectConfig {
-        WorkflowProjectConfig { target_branch: "feature/poc".into(), role_bindings: Default::default() }
+        WorkflowProjectConfig {
+            target_branch: "feature/poc".into(),
+            role_bindings: Default::default(),
+            ..Default::default()
+        }
     }
 
     #[test]

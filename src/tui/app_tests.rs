@@ -10,6 +10,30 @@ use crate::git::{MockGitOperations, MockGitProviderOperations};
 use crate::tmux::MockTmuxOperations;
 use crossterm::event::KeyModifiers;
 
+/// Claude's `--allowed-tools` option accepts multiple values. Without the `--`
+/// boundary, its parser consumes the workflow prompt as another tool pattern
+/// and opens an idle session after the workflow has already changed lanes.
+#[test]
+#[cfg(feature = "test-mocks")]
+fn claude_policy_command_separates_allowed_tools_from_prompt() {
+    let agent_ops = MockAgentOperations::new();
+    let policy = ResolvedWorkflowPolicy {
+        role_policy: crate::workflow::WorkflowRolePolicy {
+            allowed_commands: vec!["git status".to_string()],
+            write_paths: vec![".agtx/plans/**".to_string()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let command =
+        build_policy_agent_command(&agent_ops, "claude", "Review task F3.3", Some(&policy));
+
+    assert!(command.contains(
+        "--allowed-tools 'Read,Glob,Grep,Bash(git status *),Edit(.agtx/plans/**),Write(.agtx/plans/**)' -- 'Review task F3.3'"
+    ));
+}
+
 #[test]
 fn visible_columns_use_all_columns_on_wide_terminals() {
     assert_eq!(visible_column_range(0, 160), 0..5);
