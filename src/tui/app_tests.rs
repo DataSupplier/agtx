@@ -136,6 +136,22 @@ fn failed_validation_requires_linked_review_resolution() {
 }
 
 #[test]
+fn workflow_artifact_value_reads_folded_yaml_scalar() {
+    let temp = tempfile::tempdir().unwrap();
+    let artifact = temp.path().join("engineering-review.yaml");
+    std::fs::write(
+        &artifact,
+        "verdict: corrections_required\nvalidation_failure_resolution: >-\n  The targeted test fails because the expected tenant slug is incorrect.\n  Claude must correct the seed fixture and rerun it.\nfindings: []\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        workflow_artifact_value(&artifact, "validation_failure_resolution").unwrap(),
+        "The targeted test fails because the expected tenant slug is incorrect. Claude must correct the seed fixture and rerun it.",
+    );
+}
+
+#[test]
 fn visible_columns_use_all_columns_on_wide_terminals() {
     assert_eq!(visible_column_range(0, 160), 0..5);
     assert_eq!(visible_column_range(4, 140), 0..5);

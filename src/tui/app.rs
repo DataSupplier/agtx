@@ -12010,11 +12010,31 @@ fn workflow_artifact_value(path: &Path, field: &str) -> Result<String> {
     let content = std::fs::read_to_string(path)
         .map_err(|error| anyhow::anyhow!("failed to read workflow evidence {}: {error}", path.display()))?;
     let prefix = format!("{field}:");
-    content
-        .lines()
-        .find_map(|line| line.trim().strip_prefix(&prefix))
-        .map(|value| value.trim().trim_matches(['\'', '"']).to_string())
-        .filter(|value| !value.is_empty())
+    let lines: Vec<_> = content.lines().collect();
+    let Some((index, value)) = lines
+        .iter()
+        .enumerate()
+        .find_map(|(index, line)| line.trim().strip_prefix(&prefix).map(|value| (index, value.trim())))
+    else {
+        anyhow::bail!("workflow evidence {} needs a non-empty {field}: value", path.display());
+    };
+
+    // Agents naturally use YAML's folded/literal scalar notation for prose
+    // evidence. Read the indented continuation rather than mistaking `>-` or
+    // `|` for the value itself.
+    let value = if matches!(value, ">" | ">-" | ">+" | "|" | "|-" | "|+") {
+        lines[index + 1..]
+            .iter()
+            .take_while(|line| line.trim().is_empty() || line.starts_with(' ') || line.starts_with('\t'))
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        value.trim_matches(['\'', '"']).to_string()
+    };
+    (!value.is_empty())
+        .then_some(value)
         .ok_or_else(|| anyhow::anyhow!("workflow evidence {} needs a non-empty {field}: value", path.display()))
 }
 
