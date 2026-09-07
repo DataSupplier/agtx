@@ -4719,6 +4719,7 @@ impl App {
             KeyCode::Char('Y') => self.decide_selected_workflow_plan(true)?,
             KeyCode::Char('N') => self.decide_selected_workflow_plan(false)?,
             KeyCode::Char('I') => self.start_selected_workflow_implementation()?,
+            KeyCode::Char('E') => self.submit_selected_workflow_implementation()?,
             KeyCode::Char('M') => self.move_backlog_to_running()?,
             KeyCode::Char('R') => {
                 if let Some(task) = self.state.board.selected_task() {
@@ -6415,6 +6416,41 @@ impl App {
         task.updated_at = chrono::Utc::now();
         db.update_task(&task)?;
         self.state.warning_message = Some(("Implementation started from the approved plan".into(), Instant::now()));
+        self.refresh_tasks()?;
+        Ok(())
+    }
+
+    /// Validate the implementer's durable result before handing the worktree to
+    /// the configured engineering reviewer.
+    fn submit_selected_workflow_implementation(&mut self) -> Result<()> {
+        let (mut task, project_path) = match (self.state.board.selected_task().cloned(), self.state.project_path.clone()) {
+            (Some(task), Some(project_path)) => (task, project_path), _ => return Ok(()),
+        };
+        let Some(plugin) = self.load_task_plugin(&task) else { return Ok(()); };
+        let Some(workflow) = plugin.state_machine.as_ref() else { return Ok(()); };
+        let Some(project_workflow) = WorkflowProjectConfig::load(&project_path)? else { return Ok(()); };
+        let Some(worktree) = task.worktree_path.clone() else { return Ok(()); };
+        let Some(current) = self.state.db.as_ref().and_then(|db| db.get_workflow_task_state(&task.id).ok().flatten()) else { return Ok(()); };
+        let artifact = Path::new(&worktree).join(".agent-flow/implementation-result.yaml");
+        if !artifact.is_file() {
+            self.state.warning_message = Some((format!("Missing implementation evidence: {}", artifact.display()), Instant::now()));
+            return Ok(());
+        }
+        let implemented = prepare_transition(workflow, &project_workflow, &current, "implementation_complete", GuardContext { implementation_recorded: true, ..GuardContext::default() })?;
+        let review = prepare_transition(workflow, &project_workflow, &implemented.state, "start_engineering_review", GuardContext::default())?;
+        let reviewer = review.destination_agent.clone().ok_or_else(|| anyhow::anyhow!("Engineering review state has no bound agent"))?;
+        let prompt = resolve_prompt(&Some(plugin.clone()), "review", &task.content_text(), &task.id, task.cycle);
+        let target = task.session_name.clone().ok_or_else(|| anyhow::anyhow!("Task session is unavailable"))?;
+        let command = self.state.agent_registry.get(&reviewer).build_interactive_command(&prompt);
+        switch_agent_in_tmux(self.state.tmux_ops.as_ref(), &target, &task.agent, &command);
+        let db = self.state.db.as_mut().ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
+        db.advance_workflow_state(&implemented.state, &implemented.transition)?;
+        db.advance_workflow_state(&review.state, &review.transition)?;
+        task.status = TaskStatus::Review;
+        task.agent = reviewer;
+        task.updated_at = chrono::Utc::now();
+        db.update_task(&task)?;
+        self.state.warning_message = Some(("Implementation evidence accepted; engineering review started".into(), Instant::now()));
         self.refresh_tasks()?;
         Ok(())
     }
