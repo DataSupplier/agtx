@@ -4718,6 +4718,7 @@ impl App {
             KeyCode::Char('V') => self.submit_selected_workflow_plan()?,
             KeyCode::Char('Y') => self.decide_selected_workflow_plan(true)?,
             KeyCode::Char('N') => self.decide_selected_workflow_plan(false)?,
+            KeyCode::Char('I') => self.start_selected_workflow_implementation()?,
             KeyCode::Char('M') => self.move_backlog_to_running()?,
             KeyCode::Char('R') => {
                 if let Some(task) = self.state.board.selected_task() {
@@ -6362,6 +6363,58 @@ impl App {
             .into(),
             Instant::now(),
         ));
+        self.refresh_tasks()?;
+        Ok(())
+    }
+
+    /// Start the bound implementer only after an exact plan revision and hash
+    /// have been approved by the workflow evidence store.
+    fn start_selected_workflow_implementation(&mut self) -> Result<()> {
+        let (mut task, project_path) = match (
+            self.state.board.selected_task().cloned(),
+            self.state.project_path.clone(),
+        ) {
+            (Some(task), Some(project_path)) => (task, project_path),
+            _ => return Ok(()),
+        };
+        let Some(plugin) = self.load_task_plugin(&task) else { return Ok(()); };
+        let Some(workflow) = plugin.state_machine.as_ref() else { return Ok(()); };
+        let Some(project_workflow) = WorkflowProjectConfig::load(&project_path)? else { return Ok(()); };
+        let Some(worktree) = task.worktree_path.clone() else {
+            self.state.warning_message = Some(("Implementation requires an admitted worktree".into(), Instant::now()));
+            return Ok(());
+        };
+        let Some(current) = self.state.db.as_ref().and_then(|db| db.get_workflow_task_state(&task.id).ok().flatten()) else { return Ok(()); };
+        let implementation = prepare_transition(
+            workflow,
+            &project_workflow,
+            &current,
+            "start_implementation",
+            GuardContext {
+                approved_plan: current.approved_plan_revision == Some(current.plan_revision)
+                    && current.approved_plan_hash == current.plan_hash
+                    && current.plan_hash.is_some(),
+                ..GuardContext::default()
+            },
+        )?;
+        let implementer = implementation.destination_agent.clone().ok_or_else(|| anyhow::anyhow!("Implementation state has no bound agent"))?;
+        let approved_revision = current.approved_plan_revision.unwrap_or_default();
+        let prompt = format!(
+            "{}\n\nApproved plan revision: {}\nApproved plan SHA-256: {}",
+            resolve_prompt(&Some(plugin.clone()), "running", &task.content_text(), &task.id, task.cycle),
+            approved_revision,
+            current.approved_plan_hash.as_deref().unwrap_or_default(),
+        );
+        let target = task.session_name.clone().ok_or_else(|| anyhow::anyhow!("Task session is unavailable"))?;
+        let command = self.state.agent_registry.get(&implementer).build_interactive_command(&prompt);
+        switch_agent_in_tmux(self.state.tmux_ops.as_ref(), &target, &task.agent, &command);
+        let db = self.state.db.as_mut().ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
+        db.advance_workflow_state(&implementation.state, &implementation.transition)?;
+        task.status = TaskStatus::Running;
+        task.agent = implementer;
+        task.updated_at = chrono::Utc::now();
+        db.update_task(&task)?;
+        self.state.warning_message = Some(("Implementation started from the approved plan".into(), Instant::now()));
         self.refresh_tasks()?;
         Ok(())
     }
