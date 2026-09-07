@@ -236,6 +236,18 @@ pub type RoleBindings = BTreeMap<String, String>;
 /// Project-owned capabilities for one stable workflow role.  The state graph
 /// determines when the role is active; the launcher maps these capabilities to
 /// agent-specific sandbox and approval settings.
+///
+/// This struct, as declared in `.agtx/workflow.toml`, is the **only** source of
+/// permission for an unattended agent. It is deliberately the whole story: no
+/// ambient settings file contributes, and there is no bypass or one-off
+/// elevation path. A denied command or path stays denied, with no prompt and no
+/// fallback; widening a role means a reviewed edit to `allowed_commands` or
+/// `write_paths` here, then rerunning the state.
+///
+/// The property being protected is that the permissions an agent actually ran
+/// under can be reconstructed from one reviewed file in version control. Before
+/// adding a second source, see the invariant on `build_policy_agent_command`
+/// and `AGENT_CONFIG_SKIP_FILES`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowRolePolicy {
     #[serde(default)]
@@ -427,7 +439,28 @@ impl WorkflowProjectConfig {
         let mut resolved = ResolvedWorkflowPolicy {
             role: role.clone(),
             defaults: self.role_policies.defaults.clone(),
-            role_policy: self.role_policies.roles.get(role).cloned().unwrap_or_default(),
+            // Never default this. `WorkflowRolePolicy::default()` has empty
+            // `allowed_commands` and empty `write_paths`, which resolves to a
+            // policy granting nothing -- and because its `states` is empty too,
+            // the state guard below is skipped rather than tripped. The agent
+            // then launches under `--permission-mode dontAsk` with an allowlist
+            // of just `Read,Glob,Grep` and silently fails partway through the
+            // role, unable to run its checks or write its own workflow
+            // artifact. A missing role entry is a workflow misconfiguration;
+            // surface it here instead of degrading into an agent that looks
+            // launched but cannot do its job.
+            role_policy: self
+                .role_policies
+                .roles
+                .get(role)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "workflow role '{role}' (state '{state_id}') has no \
+                         [role_policies.{role}] entry; refusing to launch an \
+                         agent with an empty permission set"
+                    )
+                })?,
             merge_target: None,
         };
         if !resolved.role_policy.states.is_empty()

@@ -37,7 +37,7 @@ fn the_keys_advertised_nowhere_else_are_listed() {
         .iter()
         .flat_map(|s| s.entries.iter().map(|e| e.keys))
         .collect();
-    for key in ["C-n / C-p", "M", "D", "C-g", "C-q"] {
+    for key in ["C-n / C-p", "M", "R", "D", "C-g", "C-q"] {
         assert!(
             listed.iter().any(|k| *k == key),
             "`{key}` is bound but not in the help table: {listed:?}"

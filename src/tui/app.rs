@@ -12115,6 +12115,32 @@ fn archive_workflow_artifact(path: &Path, reason: &str) -> Result<Option<PathBuf
 /// role. Claude's `dontAsk` mode denies anything outside its tool allowlist;
 /// Codex uses its actual filesystem sandbox. Exact write-path auditing remains
 /// in the workflow executor because Codex has no path-level CLI allowlist.
+///
+/// # Invariant: `.agtx/workflow.toml` is the only source of agent permission
+///
+/// Everything an unattended agent may run or write is derived here, from the
+/// resolved role policy, and from nothing else. Keep it that way:
+///
+///   * **Do not read permissions from any other file.** In particular, a
+///     project's `.claude/settings.local.json` is a developer's machine-local
+///     "always allow" history -- untracked, unreviewed, and no part of the
+///     workflow. `initialize_worktree` deliberately excludes it from the
+///     worktree copy (see `AGENT_CONFIG_SKIP_FILES`) and the settings writer
+///     drops an inherited `permissions` key. Both halves exist so a second,
+///     invisible permission source cannot creep back in.
+///   * **Do not add a bypass or one-off elevation path.** A denied command or
+///     path stays denied, with no prompt and no fallback -- `dontAsk` and
+///     `--ask-for-approval never` are chosen precisely so an unattended agent
+///     cannot talk its way past the policy. When a role genuinely needs more
+///     access, the fix is a reviewed edit to `allowed_commands` or
+///     `write_paths` in `.agtx/workflow.toml`, then rerunning the state.
+///   * **Do not infer or widen grants here.** This function may narrow what the
+///     policy declares; it may never add to it.
+///
+/// The point of the invariant is that the permissions an agent actually ran
+/// under can always be reconstructed from one reviewed file in version control.
+/// Any second source -- ambient, inferred, or interactively granted -- destroys
+/// that property even when it happens to grant something reasonable.
 fn build_policy_agent_command(
     agent_ops: &dyn AgentOperations,
     agent: &str,
@@ -14392,11 +14418,19 @@ fn write_mcp_config(
                 Path::new(worktree_path).join(".mcp.json"),
                 serde_json::to_string_pretty(&cfg).unwrap_or_default(),
             );
-            // Merge into any existing settings rather than replacing them:
-            // `.claude` is in AGENT_CONFIG_DIRS, so a project that ships its own
-            // settings.local.json has it copied into every worktree, and a plain
-            // write would silently drop the user's permissions/env/hooks.
-            // Same merge-don't-overwrite rule the grok and antigravity writers follow.
+            // Merge into any existing settings rather than replacing them: a
+            // plain write would silently drop the worktree's env/hooks. Same
+            // merge-don't-overwrite rule the grok and antigravity writers follow.
+            //
+            // The one key deliberately NOT carried over is `permissions` -- see
+            // `AGENT_CONFIG_SKIP_FILES`. `initialize_worktree` already keeps the
+            // project root's personal settings.local.json out of the worktree,
+            // so normally there is no inherited allowlist to begin with; this is
+            // the second half of that boundary, covering a file that arrives by
+            // some other route (a project `copy_files`/`copy_dirs` entry, an
+            // init script, or a leftover from an earlier agtx version). An
+            // unattended agent's authority comes from the resolved role policy
+            // in `.agtx/workflow.toml`, never from ambient approval history.
             let claude_dir = Path::new(worktree_path).join(".claude");
             let _ = std::fs::create_dir_all(&claude_dir);
             let settings_path = claude_dir.join("settings.local.json");
@@ -14407,6 +14441,8 @@ fn write_mcp_config(
                 .unwrap_or_else(|| serde_json::json!({}));
 
             if let Some(obj) = settings.as_object_mut() {
+                // Drop any inherited allowlist; the role policy is the authority.
+                obj.remove("permissions");
                 // Pre-trust the agtx MCP server so Claude doesn't show an interactive
                 // trust dialog when the agent window opens for the first time.
                 obj.insert(
