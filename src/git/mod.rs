@@ -38,7 +38,9 @@ pub fn repo_root(path: &Path) -> Result<std::path::PathBuf> {
     Ok(std::path::PathBuf::from(root))
 }
 
-/// Get current branch name
+/// Get the checked-out branch name. Integration verifies this before it
+/// mutates a target checkout, so a task can never be merged into whichever
+/// branch happens to be active.
 pub fn current_branch(path: &Path) -> Result<String> {
     let output = Command::new("git")
         .current_dir(path)
@@ -46,7 +48,11 @@ pub fn current_branch(path: &Path) -> Result<String> {
         .output()
         .context("Failed to get current branch")?;
 
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if branch.is_empty() || branch == "HEAD" {
+        anyhow::bail!("Integration requires a checked-out branch, not a detached HEAD");
+    }
+    Ok(branch)
 }
 
 /// Whether `rev` resolves to a commit in the repository at `path`.

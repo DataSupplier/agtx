@@ -2747,6 +2747,8 @@ fn test_phase_artifact_exists_with_glob() {
             planning: Some("specs/*/plan.md".to_string()),
             running: None,
             review: None,
+            final_validation: None,
+            integration: None,
         },
         commands: PluginCommands::default(),
         prompts: PluginPrompts::default(),

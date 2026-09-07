@@ -38,6 +38,9 @@ pub const HELP: &[HelpSection] = &[
         title: "Moving tasks",
         entries: &[
             e("A", "Admit a declarative-workflow Backlog task"),
+            e("S / V / Y / N", "Plan: start / submit / approve / request changes"),
+            e("I / E", "Implementation: start / submit for engineering review"),
+            e("G / F / K", "Workflow: submit review / validation / integration"),
             e("m", "Move forward one column"),
             e("M", "Backlog straight to Running"),
             e("R", "Start research on a Backlog task, in place"),

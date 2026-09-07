@@ -768,6 +768,11 @@ pub struct PluginArtifacts {
     pub planning: Option<String>,
     pub running: Option<String>,
     pub review: Option<String>,
+    /// Evidence produced by the final validation owner before integration.
+    pub final_validation: Option<String>,
+    /// Explicit reviewer handoff that authorizes the workflow executor to
+    /// commit and integrate into the configured non-main target branch.
+    pub integration: Option<String>,
 }
 
 /// Slash commands to invoke per phase (sent via tmux send_keys as real interactive commands).
@@ -795,6 +800,8 @@ pub struct PluginPrompts {
     /// Prompt for Running after research or planning. Usually empty — prior phase provides context.
     pub running_with_research_or_planning: Option<String>,
     pub review: Option<String>,
+    pub final_validation: Option<String>,
+    pub integration: Option<String>,
 }
 
 /// Text patterns to wait for before sending the prompt for each phase.

@@ -4720,6 +4720,9 @@ impl App {
             KeyCode::Char('N') => self.decide_selected_workflow_plan(false)?,
             KeyCode::Char('I') => self.start_selected_workflow_implementation()?,
             KeyCode::Char('E') => self.submit_selected_workflow_implementation()?,
+            KeyCode::Char('G') => self.submit_selected_engineering_review()?,
+            KeyCode::Char('F') => self.submit_selected_final_validation()?,
+            KeyCode::Char('K') => self.complete_selected_feature_integration()?,
             KeyCode::Char('M') => self.move_backlog_to_running()?,
             KeyCode::Char('R') => {
                 if let Some(task) = self.state.board.selected_task() {
@@ -6451,6 +6454,162 @@ impl App {
         task.updated_at = chrono::Utc::now();
         db.update_task(&task)?;
         self.state.warning_message = Some(("Implementation evidence accepted; engineering review started".into(), Instant::now()));
+        self.refresh_tasks()?;
+        Ok(())
+    }
+
+    /// Consume the engineering reviewer's durable verdict and hand the task to
+    /// the role that owns the next declared workflow state.
+    fn submit_selected_engineering_review(&mut self) -> Result<()> {
+        let (mut task, project_path) = match (self.state.board.selected_task().cloned(), self.state.project_path.clone()) {
+            (Some(task), Some(project_path)) => (task, project_path), _ => return Ok(()),
+        };
+        let Some(plugin) = self.load_task_plugin(&task) else { return Ok(()); };
+        let Some(workflow) = plugin.state_machine.as_ref() else { return Ok(()); };
+        let Some(project_workflow) = WorkflowProjectConfig::load(&project_path)? else { return Ok(()); };
+        let Some(worktree) = task.worktree_path.clone() else { return Ok(()); };
+        let Some(current) = self.state.db.as_ref().and_then(|db| db.get_workflow_task_state(&task.id).ok().flatten()) else { return Ok(()); };
+        if current.state != "engineering_review" {
+            self.state.warning_message = Some(("Submit engineering review is only available in Engineering review".into(), Instant::now()));
+            return Ok(());
+        }
+        let artifact = workflow_artifact_path(&worktree, plugin.artifacts.review.as_deref(), &task.id, ".agent-flow/engineering-review.yaml");
+        let verdict = workflow_artifact_value(&artifact, "verdict")?;
+        let (action, phase, status) = match verdict.as_str() {
+            "corrections_required" => ("engineering_corrections_required", "running", TaskStatus::Running),
+            "plan_issue" => ("engineering_plan_issue", "planning", TaskStatus::Planning),
+            "approved_for_validation" => ("start_final_validation", "final_validation", TaskStatus::Review),
+            _ => anyhow::bail!("{} has unsupported engineering-review verdict '{verdict}'", artifact.display()),
+        };
+        let transition = prepare_transition(workflow, &project_workflow, &current, action, GuardContext::default())?;
+        let next_agent = transition.destination_agent.clone().ok_or_else(|| anyhow::anyhow!("Workflow state has no bound agent"))?;
+        let target = task.session_name.clone().ok_or_else(|| anyhow::anyhow!("Task session is unavailable"))?;
+        let prompt = format!(
+            "{}\n\nEngineering-review verdict: {verdict}. Evidence: {}. Follow the declared role policy; do not commit, push, create a PR, merge, or bypass controls.",
+            resolve_prompt(&Some(plugin.clone()), phase, &task.content_text(), &task.id, task.cycle),
+            artifact.strip_prefix(&worktree).unwrap_or(&artifact).display(),
+        );
+        let command = self.state.agent_registry.get(&next_agent).build_interactive_command(&prompt);
+        switch_agent_in_tmux(self.state.tmux_ops.as_ref(), &target, &task.agent, &command);
+        let db = self.state.db.as_mut().ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
+        db.advance_workflow_state(&transition.state, &transition.transition)?;
+        task.status = status;
+        task.agent = next_agent;
+        task.updated_at = chrono::Utc::now();
+        db.update_task(&task)?;
+        self.state.warning_message = Some((format!("Engineering review recorded: {verdict}"), Instant::now()));
+        self.refresh_tasks()?;
+        Ok(())
+    }
+
+    /// Record the final-validation artifact. A pass hands control to the
+    /// reviewer-owned integration state; a failure returns to engineering review.
+    fn submit_selected_final_validation(&mut self) -> Result<()> {
+        let (mut task, project_path) = match (self.state.board.selected_task().cloned(), self.state.project_path.clone()) {
+            (Some(task), Some(project_path)) => (task, project_path), _ => return Ok(()),
+        };
+        let Some(plugin) = self.load_task_plugin(&task) else { return Ok(()); };
+        let Some(workflow) = plugin.state_machine.as_ref() else { return Ok(()); };
+        let Some(project_workflow) = WorkflowProjectConfig::load(&project_path)? else { return Ok(()); };
+        let Some(worktree) = task.worktree_path.clone() else { return Ok(()); };
+        let Some(mut current) = self.state.db.as_ref().and_then(|db| db.get_workflow_task_state(&task.id).ok().flatten()) else { return Ok(()); };
+        if current.state != "final_validation" {
+            self.state.warning_message = Some(("Submit final validation is only available in Final validation".into(), Instant::now()));
+            return Ok(());
+        }
+        let artifact = workflow_artifact_path(&worktree, plugin.artifacts.final_validation.as_deref(), &task.id, ".agent-flow/final-validation.yaml");
+        let verdict = workflow_artifact_value(&artifact, "verdict")?;
+        let (action, phase, passed) = match verdict.as_str() {
+            "passed" => ("begin_feature_integration", "integration", true),
+            "failed" => ("validation_failed", "review", false),
+            _ => anyhow::bail!("{} has unsupported final-validation verdict '{verdict}'", artifact.display()),
+        };
+        if passed {
+            current.validation_passed_at = Some(chrono::Utc::now());
+        }
+        let transition = prepare_transition(
+            workflow,
+            &project_workflow,
+            &current,
+            action,
+            GuardContext { final_validation_passed: passed, clean_worktree: true, ..GuardContext::default() },
+        )?;
+        let next_agent = transition.destination_agent.clone().ok_or_else(|| anyhow::anyhow!("Workflow state has no bound agent"))?;
+        let target = task.session_name.clone().ok_or_else(|| anyhow::anyhow!("Task session is unavailable"))?;
+        let prompt = format!(
+            "{}\n\nFinal-validation verdict: {verdict}. Evidence: {}. Follow the declared role policy; do not merge feature/poc into main.",
+            resolve_prompt(&Some(plugin.clone()), phase, &task.content_text(), &task.id, task.cycle),
+            artifact.strip_prefix(&worktree).unwrap_or(&artifact).display(),
+        );
+        let command = self.state.agent_registry.get(&next_agent).build_interactive_command(&prompt);
+        switch_agent_in_tmux(self.state.tmux_ops.as_ref(), &target, &task.agent, &command);
+        let db = self.state.db.as_mut().ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
+        db.advance_workflow_state(&transition.state, &transition.transition)?;
+        task.status = TaskStatus::Review;
+        task.agent = next_agent;
+        task.updated_at = chrono::Utc::now();
+        db.update_task(&task)?;
+        self.state.warning_message = Some((format!("Final validation recorded: {verdict}"), Instant::now()));
+        self.refresh_tasks()?;
+        Ok(())
+    }
+
+    /// Execute the narrowly-scoped, reviewer-authorized task integration. The
+    /// configured target must be checked out and may never be `main`.
+    fn complete_selected_feature_integration(&mut self) -> Result<()> {
+        let (mut task, project_path) = match (self.state.board.selected_task().cloned(), self.state.project_path.clone()) {
+            (Some(task), Some(project_path)) => (task, project_path), _ => return Ok(()),
+        };
+        let Some(plugin) = self.load_task_plugin(&task) else { return Ok(()); };
+        let Some(workflow) = plugin.state_machine.as_ref() else { return Ok(()); };
+        let Some(project_workflow) = WorkflowProjectConfig::load(&project_path)? else { return Ok(()); };
+        let Some(worktree) = task.worktree_path.clone() else { return Ok(()); };
+        let Some(branch) = task.branch_name.clone() else { return Ok(()); };
+        let Some(current) = self.state.db.as_ref().and_then(|db| db.get_workflow_task_state(&task.id).ok().flatten()) else { return Ok(()); };
+        if current.state != "integrate_to_feature" {
+            self.state.warning_message = Some(("Complete integration is only available in Integrate to feature".into(), Instant::now()));
+            return Ok(());
+        }
+        let artifact = workflow_artifact_path(&worktree, plugin.artifacts.integration.as_deref(), &task.id, ".agent-flow/integration-ready.yaml");
+        if workflow_artifact_value(&artifact, "verdict")? != "ready_for_integration" {
+            anyhow::bail!("{} must declare verdict: ready_for_integration", artifact.display());
+        }
+        let policy = project_workflow.policy_for_state(workflow, &current.state)?
+            .ok_or_else(|| anyhow::anyhow!("Integration state has no role policy"))?;
+        let target_branch = policy.merge_target.clone().ok_or_else(|| anyhow::anyhow!("Integration state has no merge target"))?;
+        if target_branch != current.target_branch || target_branch == "main" {
+            anyhow::bail!("workflow integration may only target the admitted non-main branch");
+        }
+        if !(policy.role_policy.final_task_commit && policy.role_policy.push_task_branch && policy.role_policy.merge_task_into_target) {
+            anyhow::bail!("Integration state policy does not authorize commit, push, and target merge");
+        }
+        if self.state.git_ops.has_changes(&project_path) {
+            anyhow::bail!("configured target checkout has uncommitted changes; integration is refused");
+        }
+        if git::current_branch(&project_path)? != target_branch {
+            anyhow::bail!("configured target checkout is not on '{target_branch}'; integration is refused");
+        }
+        let (has_conflicts, files) = git::check_merge_conflicts(&project_path, &target_branch, &branch)?;
+        if has_conflicts {
+            anyhow::bail!("task branch conflicts with '{target_branch}': {}", files.join(", "));
+        }
+        if self.state.git_ops.has_changes(Path::new(&worktree)) {
+            self.state.git_ops.add_all(Path::new(&worktree))?;
+            self.state.git_ops.commit(Path::new(&worktree), &format!("workflow: complete task {}", task.id))?;
+        }
+        self.state.git_ops.push(Path::new(&worktree), &branch, true)?;
+        git::merge_branch(&project_path, &branch, &format!("workflow: integrate task {}", task.id))?;
+        self.state.git_ops.push(&project_path, &target_branch, false)?;
+        let integration_sha = git::resolve_commit(&project_path, &target_branch)?;
+        let completed = prepare_transition(workflow, &project_workflow, &current, "complete_feature_integration", GuardContext { integrated_into_target: true, ..GuardContext::default() })?;
+        let mut completed_state = completed.state;
+        completed_state.integration_sha = Some(integration_sha);
+        let db = self.state.db.as_mut().ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
+        db.advance_workflow_state(&completed_state, &completed.transition)?;
+        task.status = TaskStatus::Done;
+        task.updated_at = chrono::Utc::now();
+        db.update_task(&task)?;
+        self.state.warning_message = Some((format!("Task integrated into {target_branch}"), Instant::now()));
         self.refresh_tasks()?;
         Ok(())
     }
@@ -11789,6 +11948,14 @@ fn resolve_prompt(
             .as_ref()
             .and_then(|p| p.prompts.review.as_deref())
             .unwrap_or(""),
+        "final_validation" => plugin
+            .as_ref()
+            .and_then(|p| p.prompts.final_validation.as_deref())
+            .unwrap_or(""),
+        "integration" => plugin
+            .as_ref()
+            .and_then(|p| p.prompts.integration.as_deref())
+            .unwrap_or(""),
         _ => return task_content.to_string(),
     };
 
@@ -11800,6 +11967,28 @@ fn resolve_prompt(
         .replace("{task}", task_content)
         .replace("{task_id}", task_id)
         .replace("{phase}", &cycle.to_string())
+}
+
+/// Resolve one artifact path without allowing a task ID to escape its worktree.
+fn workflow_artifact_path(worktree: &str, template: Option<&str>, task_id: &str, fallback: &str) -> PathBuf {
+    let relative = template.unwrap_or(fallback).replace("{task_id}", task_id);
+    Path::new(worktree).join(relative)
+}
+
+/// Read the simple top-level `verdict: value` contract shared by workflow
+/// evidence files. The artifact remains human-readable YAML without pulling a
+/// parser into the agent launcher, while malformed/missing evidence blocks a
+/// transition rather than being treated as approval.
+fn workflow_artifact_value(path: &Path, field: &str) -> Result<String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|error| anyhow::anyhow!("failed to read workflow evidence {}: {error}", path.display()))?;
+    let prefix = format!("{field}:");
+    content
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(&prefix))
+        .map(|value| value.trim().trim_matches(['\'', '"']).to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("workflow evidence {} needs a non-empty {field}: value", path.display()))
 }
 
 /// Resolve the skill command to send via send_keys for a given phase.
