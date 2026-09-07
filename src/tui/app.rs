@@ -6206,26 +6206,47 @@ impl App {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Planning session is unavailable"))?;
         let previous_agent = task.agent.clone();
-        spawn_send_to_agent(
-            Arc::clone(&self.state.tmux_ops),
-            Arc::clone(&self.state.agent_registry),
-            task.id.clone(),
-            self.state.config.agent_hooks,
-            self.state.config.auto_trust,
-            target,
-            previous_agent,
-            reviewer.clone(),
-            true,
-            None,
-            None,
-            prompt,
-            None,
-            task.content_text(),
-            Vec::new(),
-            task.worktree_path.clone(),
-            project_path,
-            Some(plugin.clone()),
-        );
+        let policy = project_workflow
+            .policy_for_state(workflow, &handoff.state.state)?;
+        if reviewer == "codex" && policy.as_ref().is_some_and(|policy| {
+            !policy.role_policy.modify_source_and_tests
+                && !policy.role_policy.modify_plan_artifacts
+                && !policy.role_policy.modify_review_artifacts
+        }) {
+            // Codex receives no write capability for plan review.  This is a
+            // real CLI sandbox boundary, not a prompt-only convention.
+            let command = format!(
+                "codex --sandbox read-only --ask-for-approval never '{}'",
+                prompt.replace('\'', "'\"'\"'")
+            );
+            switch_agent_in_tmux(
+                self.state.tmux_ops.as_ref(),
+                &target,
+                &previous_agent,
+                &command,
+            );
+        } else {
+            spawn_send_to_agent(
+                Arc::clone(&self.state.tmux_ops),
+                Arc::clone(&self.state.agent_registry),
+                task.id.clone(),
+                self.state.config.agent_hooks,
+                self.state.config.auto_trust,
+                target,
+                previous_agent,
+                reviewer.clone(),
+                true,
+                None,
+                None,
+                prompt,
+                None,
+                task.content_text(),
+                Vec::new(),
+                task.worktree_path.clone(),
+                project_path,
+                Some(plugin.clone()),
+            );
+        }
         task.status = TaskStatus::Review;
         task.agent = reviewer;
         task.updated_at = chrono::Utc::now();
