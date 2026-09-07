@@ -31,7 +31,7 @@ use crate::skills;
 use crate::tmux::{
     self, InputConfig, InputError, PaneInput, PaneInputSink, RealTmuxOps, TmuxOperations,
 };
-use crate::workflow::{GuardContext, WorkflowProjectConfig};
+use crate::workflow::{GuardContext, ResolvedWorkflowPolicy, WorkflowProjectConfig};
 use crate::workflow_executor::{prepare_admission, prepare_transition};
 use crate::AppMode;
 
@@ -6106,11 +6106,14 @@ impl App {
             &project_path,
             self.state.tmux_ops.as_ref(),
         );
+        let policy = project_workflow
+            .policy_for_state(workflow, &planning.state.state)?;
+        let command = build_policy_agent_command(agent_ops.as_ref(), &planner, &prompt, policy.as_ref());
         self.state.tmux_ops.create_window(
             &self.state.tmux_project_name,
             &window_name,
             &worktree,
-            Some(agent_ops.build_interactive_command(&prompt)),
+            Some(command),
             true,
             &agtx_task_env(&task.id, &worktree),
         )?;
@@ -6213,16 +6216,12 @@ impl App {
         let previous_agent = task.agent.clone();
         let policy = project_workflow
             .policy_for_state(workflow, &handoff.state.state)?;
-        if reviewer == "codex" && policy.as_ref().is_some_and(|policy| {
-            !policy.role_policy.modify_source_and_tests
-                && !policy.role_policy.modify_plan_artifacts
-                && !policy.role_policy.modify_review_artifacts
-        }) {
-            // Codex receives no write capability for plan review.  This is a
-            // real CLI sandbox boundary, not a prompt-only convention.
-            let command = format!(
-                "codex --sandbox read-only --ask-for-approval never '{}'",
-                prompt.replace('\'', "'\"'\"'")
+        if let Some(policy) = policy.as_ref() {
+            let command = build_policy_agent_command(
+                self.state.agent_registry.get(&reviewer).as_ref(),
+                &reviewer,
+                &prompt,
+                Some(policy),
             );
             switch_agent_in_tmux(
                 self.state.tmux_ops.as_ref(),
@@ -6410,7 +6409,8 @@ impl App {
             current.approved_plan_hash.as_deref().unwrap_or_default(),
         );
         let target = task.session_name.clone().ok_or_else(|| anyhow::anyhow!("Task session is unavailable"))?;
-        let command = self.state.agent_registry.get(&implementer).build_interactive_command(&prompt);
+        let policy = project_workflow.policy_for_state(workflow, &implementation.state.state)?;
+        let command = build_policy_agent_command(self.state.agent_registry.get(&implementer).as_ref(), &implementer, &prompt, policy.as_ref());
         switch_agent_in_tmux(self.state.tmux_ops.as_ref(), &target, &task.agent, &command);
         let db = self.state.db.as_mut().ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
         db.advance_workflow_state(&implementation.state, &implementation.transition)?;
@@ -6444,7 +6444,8 @@ impl App {
         let reviewer = review.destination_agent.clone().ok_or_else(|| anyhow::anyhow!("Engineering review state has no bound agent"))?;
         let prompt = resolve_prompt(&Some(plugin.clone()), "review", &task.content_text(), &task.id, task.cycle);
         let target = task.session_name.clone().ok_or_else(|| anyhow::anyhow!("Task session is unavailable"))?;
-        let command = self.state.agent_registry.get(&reviewer).build_interactive_command(&prompt);
+        let policy = project_workflow.policy_for_state(workflow, &review.state.state)?;
+        let command = build_policy_agent_command(self.state.agent_registry.get(&reviewer).as_ref(), &reviewer, &prompt, policy.as_ref());
         switch_agent_in_tmux(self.state.tmux_ops.as_ref(), &target, &task.agent, &command);
         let db = self.state.db.as_mut().ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
         db.advance_workflow_state(&implemented.state, &implemented.transition)?;
@@ -6489,7 +6490,8 @@ impl App {
             resolve_prompt(&Some(plugin.clone()), phase, &task.content_text(), &task.id, task.cycle),
             artifact.strip_prefix(&worktree).unwrap_or(&artifact).display(),
         );
-        let command = self.state.agent_registry.get(&next_agent).build_interactive_command(&prompt);
+        let policy = project_workflow.policy_for_state(workflow, &transition.state.state)?;
+        let command = build_policy_agent_command(self.state.agent_registry.get(&next_agent).as_ref(), &next_agent, &prompt, policy.as_ref());
         switch_agent_in_tmux(self.state.tmux_ops.as_ref(), &target, &task.agent, &command);
         let db = self.state.db.as_mut().ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
         db.advance_workflow_state(&transition.state, &transition.transition)?;
@@ -6541,7 +6543,8 @@ impl App {
             resolve_prompt(&Some(plugin.clone()), phase, &task.content_text(), &task.id, task.cycle),
             artifact.strip_prefix(&worktree).unwrap_or(&artifact).display(),
         );
-        let command = self.state.agent_registry.get(&next_agent).build_interactive_command(&prompt);
+        let policy = project_workflow.policy_for_state(workflow, &transition.state.state)?;
+        let command = build_policy_agent_command(self.state.agent_registry.get(&next_agent).as_ref(), &next_agent, &prompt, policy.as_ref());
         switch_agent_in_tmux(self.state.tmux_ops.as_ref(), &target, &task.agent, &command);
         let db = self.state.db.as_mut().ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
         db.advance_workflow_state(&transition.state, &transition.transition)?;
@@ -11989,6 +11992,34 @@ fn workflow_artifact_value(path: &Path, field: &str) -> Result<String> {
         .map(|value| value.trim().trim_matches(['\'', '"']).to_string())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow::anyhow!("workflow evidence {} needs a non-empty {field}: value", path.display()))
+}
+
+/// Build the narrowest native agent command available for a resolved workflow
+/// role. Claude's `dontAsk` mode denies anything outside its tool allowlist;
+/// Codex uses its actual filesystem sandbox. Exact write-path auditing remains
+/// in the workflow executor because Codex has no path-level CLI allowlist.
+fn build_policy_agent_command(
+    agent_ops: &dyn AgentOperations,
+    agent: &str,
+    prompt: &str,
+    policy: Option<&ResolvedWorkflowPolicy>,
+) -> String {
+    let Some(policy) = policy else { return agent_ops.build_interactive_command(prompt); };
+    let quoted_prompt = prompt.replace('\'', "'\"'\"'");
+    if agent == "codex" {
+        let sandbox = if policy.role_policy.write_paths.is_empty() { "read-only" } else { "workspace-write" };
+        return format!("codex --sandbox {sandbox} --ask-for-approval never '{quoted_prompt}'");
+    }
+    if agent == "claude" {
+        let mut tools = vec!["Read".to_string(), "Glob".to_string(), "Grep".to_string()];
+        tools.extend(policy.role_policy.allowed_commands.iter().map(|command| format!("Bash({command} *)")));
+        tools.extend(policy.role_policy.write_paths.iter().flat_map(|path| [format!("Edit({path})"), format!("Write({path})")]));
+        return format!(
+            "claude --permission-mode dontAsk --allowed-tools '{}' '{}'",
+            tools.join(","), quoted_prompt
+        );
+    }
+    agent_ops.build_interactive_command(prompt)
 }
 
 /// Resolve the skill command to send via send_keys for a given phase.
