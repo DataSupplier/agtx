@@ -1901,11 +1901,16 @@ fn test_footer_text_sidebar_focused() {
     assert!(!text.contains("[o] new"));
 }
 
+/// The Backlog footer advertises the declarative-workflow entry points, since
+/// that is how a task now leaves Backlog. It is a curated single line, not the
+/// full binding list: `M` (straight to Running) and `R` (research) stay bound
+/// and stay advertised in the `?` overlay. See the module docs on
+/// `crate::tui::help`, which is the completeness authority.
 #[test]
 fn test_footer_text_backlog_column() {
     let text = build_footer_text(None, false, 0, false, false);
-    assert!(text.contains("[M] run"));
-    assert!(text.contains("[m] plan"));
+    assert!(text.contains("[A] admit"));
+    assert!(text.contains("[S] start planning"));
     assert!(!text.contains("[r] move left"));
 }
 
@@ -3088,12 +3093,6 @@ fn test_install_plugin_none_clears_config() {
 // =============================================================================
 // Tests for research session and session reuse
 // =============================================================================
-
-#[test]
-fn test_footer_text_backlog_includes_research() {
-    let text = build_footer_text(None, false, 0, false, false);
-    assert!(text.contains("[R] research"));
-}
 
 #[test]
 fn test_backlog_task_with_research_session_detected() {
@@ -14029,12 +14028,19 @@ fn test_dismiss_launch_dialog_tracks_dialogs_independently() {
     ));
 }
 
-/// A project may ship its own `.claude/settings.local.json`, and agtx copies
-/// `.claude/` into every worktree (AGENT_CONFIG_DIRS). The MCP/hook writer must
-/// merge into that file, not replace it.
+/// The MCP/hook writer must merge into an existing `.claude/settings.local.json`
+/// rather than replace it -- but `permissions` is the deliberate exception.
+///
+/// A personal allowlist must never become an unattended agent's authority: that
+/// comes from the resolved role policy in `.agtx/workflow.toml`, handed to the
+/// agent as `--allowed-tools`. `initialize_worktree` already keeps the project
+/// root's settings.local.json out of the worktree (AGENT_CONFIG_SKIP_FILES);
+/// this asserts the second half of that boundary, for a file that reached the
+/// worktree by another route. Everything the worktree legitimately owns --
+/// env, hooks -- still survives the merge.
 #[test]
 #[cfg(feature = "test-mocks")]
-fn test_write_skills_preserves_existing_claude_settings() {
+fn test_write_skills_drops_personal_permissions_but_keeps_env_and_hooks() {
     let dir = tempfile::tempdir().unwrap();
     let claude = dir.path().join(".claude");
     std::fs::create_dir_all(&claude).unwrap();
@@ -14055,9 +14061,12 @@ fn test_write_skills_preserves_existing_claude_settings() {
     let raw = std::fs::read_to_string(claude.join("settings.local.json")).unwrap();
     let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
 
-    assert_eq!(
-        v["permissions"]["allow"][0], "Bash(cargo test:*)",
-        "permissions lost"
+    assert!(
+        v.get("permissions").is_none(),
+        "personal permissions.allow entries must not propagate into a \
+         worktree: an unattended agent's authority comes from the \
+         .agtx/workflow.toml role policy, and an inherited allowlist can \
+         expand or contradict it"
     );
     assert_eq!(v["env"]["MY_VAR"], "1", "env lost");
     assert_eq!(v["enableAllProjectMcpServers"], serde_json::json!(true));

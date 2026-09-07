@@ -498,6 +498,41 @@ fn test_initialize_worktree_no_config() {
     assert!(warnings.is_empty());
 }
 
+/// A developer's personal Claude approval history must not become an
+/// unattended agent's authority. `.claude/` is copied into every worktree, but
+/// `settings.local.json` is excluded by AGENT_CONFIG_SKIP_FILES: it is
+/// untracked, unreviewed, machine-local state, and a `permissions.allow` entry
+/// in it would sit alongside the `.agtx/workflow.toml` role policy and be able
+/// to expand or contradict it. Everything else in `.claude/` still copies.
+#[test]
+fn test_initialize_worktree_excludes_personal_claude_settings() {
+    let temp_dir = setup_git_repo();
+    let claude = temp_dir.path().join(".claude");
+    std::fs::create_dir_all(claude.join("commands")).unwrap();
+    std::fs::write(
+        claude.join("settings.local.json"),
+        r#"{"permissions": {"allow": ["Bash(git push *)"]}}"#,
+    )
+    .unwrap();
+    std::fs::write(claude.join("commands").join("plan.md"), "# plan").unwrap();
+
+    let worktree_path = git::create_worktree(temp_dir.path(), "init-skip").unwrap();
+    let warnings = git::initialize_worktree(temp_dir.path(), &worktree_path, None, None, &[]);
+    assert!(warnings.is_empty());
+
+    assert!(
+        !worktree_path.join(".claude/settings.local.json").exists(),
+        "personal settings.local.json must not be copied into a task \
+         worktree: its permissions.allow can expand or contradict the \
+         workflow role policy"
+    );
+    assert_eq!(
+        std::fs::read_to_string(worktree_path.join(".claude/commands/plan.md")).unwrap(),
+        "# plan",
+        "the rest of .claude/ must still be copied"
+    );
+}
+
 #[test]
 fn test_initialize_worktree_copy_files() {
     let temp_dir = setup_git_repo();

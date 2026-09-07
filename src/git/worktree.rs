@@ -102,6 +102,43 @@ pub const AGENT_CONFIG_DIRS: &[&str] = &[
     ".config/opencode",
 ];
 
+/// File names deliberately **not** copied out of [`AGENT_CONFIG_DIRS`] into a
+/// task worktree, matched by file name at any depth.
+///
+/// This is a permission-boundary decision, not an accidental omission. Please
+/// do not "restore" these to the copy for convenience.
+///
+/// `settings.local.json` is Claude Code's machine-local settings file. It
+/// accumulates a developer's interactive "always allow" approvals and is
+/// normally untracked and gitignored: it is personal approval history for a
+/// human working in the project root, with no review and no provenance.
+///
+/// A task worktree is a different setting entirely. Agents there run
+/// unattended, and their authority is meant to come from exactly one reviewed,
+/// version-controlled source -- the resolved role policy in
+/// `.agtx/workflow.toml`, which agtx hands to the agent explicitly (for Claude,
+/// as `--allowed-tools` under `--permission-mode dontAsk`). Claude merges a
+/// present `settings.local.json` with those flags, so copying a personal
+/// `permissions.allow` block into the worktree lets ambient, unreviewed state
+/// take effect on equal footing with the policy, where it can:
+///
+///   * **expand** a role beyond `.agtx/workflow.toml` -- a stray
+///     `Bash(git push *)` approved once at the project root silently grants an
+///     autonomous agent an authority the workflow deliberately withholds; and
+///   * **contradict** the declared policy -- the role's entry becomes only part
+///     of what the agent may do, so what actually ran can no longer be
+///     reconstructed from the file that is supposed to govern it.
+///
+/// Either way the effective permissions of an unattended agent stop being
+/// reviewable and start depending on whichever prompts someone happened to
+/// approve on that machine. Excluding the file keeps `.agtx/workflow.toml` the
+/// single authority. agtx still writes the worktree's own
+/// `settings.local.json` for the settings it genuinely owns (MCP pre-trust, the
+/// bypass-dialog preflight, and its hooks); it just never inherits a personal
+/// allowlist. See `write_skills_to_worktree`, which drops an inherited
+/// `permissions` block if one reaches a worktree by some other route.
+pub const AGENT_CONFIG_SKIP_FILES: &[&str] = &["settings.local.json"];
+
 /// Output from a shell script run inside a worktree.
 #[derive(Debug)]
 pub(crate) struct ScriptOutput {
@@ -144,12 +181,12 @@ pub fn initialize_worktree(
 ) -> Vec<String> {
     let mut warnings = Vec::new();
 
-    // Always copy agent config directories
+    // Always copy agent config directories, minus AGENT_CONFIG_SKIP_FILES.
     for dir_name in AGENT_CONFIG_DIRS {
         let src = project_path.join(dir_name);
         if src.is_dir() {
             let dst = worktree_path.join(dir_name);
-            if let Err(e) = copy_dir_recursive(&src, &dst) {
+            if let Err(e) = copy_agent_config_dir(&src, &dst) {
                 warnings.push(format!("Failed to copy '{}' to worktree: {}", dir_name, e));
             }
         }
@@ -272,6 +309,32 @@ pub fn initialize_worktree(
     }
 
     warnings
+}
+
+/// Copy an agent config directory into a worktree, skipping
+/// [`AGENT_CONFIG_SKIP_FILES`] at every depth.
+///
+/// Deliberately separate from [`copy_dir_recursive`], which stays a
+/// general-purpose helper used for plugin and user-specified directories where
+/// no permission boundary applies. The exclusion is applied here, at the copy
+/// itself, rather than by deleting the file afterwards: a permission boundary
+/// should never depend on a cleanup step that a later error path could skip.
+fn copy_agent_config_dir(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let name = entry.file_name();
+        if src_path.is_dir() {
+            copy_agent_config_dir(&src_path, &dst.join(&name))?;
+        } else if !AGENT_CONFIG_SKIP_FILES
+            .iter()
+            .any(|skip| name.as_os_str() == *skip)
+        {
+            std::fs::copy(&src_path, dst.join(&name))?;
+        }
+    }
+    Ok(())
 }
 
 /// Recursively copy a directory and its contents.
