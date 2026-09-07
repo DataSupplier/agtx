@@ -3624,7 +3624,7 @@ fn test_switch_agent_claude_sends_exit() {
         if k == "/exit" {
             exit_sent_c.store(true, Ordering::SeqCst);
         }
-        if k == "env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT codex" {
+        if k == "cd -- \"$AGTX_WORKTREE\" && env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT codex" {
             new_agent_sent_c.store(true, Ordering::SeqCst);
         }
         Ok(())
@@ -11677,7 +11677,7 @@ fn test_switch_agent_claude_sends_exit_then_new_cmd() {
     // new agent command sent after shell found
     mock_tmux
         .expect_send_keys()
-        .withf(|_, cmd: &str| cmd == "env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT claude --dangerously-skip-permissions")
+        .withf(|_, cmd: &str| cmd == "cd -- \"$AGTX_WORKTREE\" && env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT claude --dangerously-skip-permissions")
         .times(1)
         .returning(|_, _| Ok(()));
 
@@ -11709,7 +11709,7 @@ fn test_switch_agent_codex_sends_ctrl_c_not_exit() {
     mock_tmux
         .expect_send_keys()
         .withf(|_, cmd: &str| {
-            cmd == "env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT codex --sandbox workspace-write"
+            cmd == "cd -- \"$AGTX_WORKTREE\" && env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT codex --sandbox workspace-write"
         })
         .times(1)
         .returning(|_, _| Ok(()));
@@ -11759,7 +11759,7 @@ fn test_switch_agent_retries_with_ctrl_c_when_shell_not_found() {
     // new agent cmd always sent at end
     mock_tmux
         .expect_send_keys()
-        .withf(|_, cmd: &str| cmd == "env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT newagent")
+        .withf(|_, cmd: &str| cmd == "cd -- \"$AGTX_WORKTREE\" && env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT newagent")
         .times(1)
         .returning(|_, _| Ok(()));
 
@@ -11794,7 +11794,7 @@ fn test_switch_agent_sends_ctrl_d_as_last_resort() {
     // new agent still sent
     mock_tmux
         .expect_send_keys()
-        .withf(|_, cmd: &str| cmd == "env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT newagent")
+        .withf(|_, cmd: &str| cmd == "cd -- \"$AGTX_WORKTREE\" && env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT newagent")
         .times(1)
         .returning(|_, _| Ok(()));
 
@@ -11817,7 +11817,7 @@ fn test_switch_agent_always_sends_new_agent_cmd() {
     // This is the key assertion — new_agent_cmd must be sent exactly once
     mock_tmux
         .expect_send_keys()
-        .withf(|_, cmd: &str| cmd == "env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT my-new-agent")
+        .withf(|_, cmd: &str| cmd == "cd -- \"$AGTX_WORKTREE\" && env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT my-new-agent")
         .times(1)
         .returning(|_, _| Ok(()));
 
@@ -12178,7 +12178,7 @@ fn test_switch_agent_cursor_sends_ctrl_c_not_exit() {
         .returning(|_| Ok(String::new()));
     mock_tmux
         .expect_send_keys()
-        .withf(|_, cmd: &str| cmd == "env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT agent --yolo")
+        .withf(|_, cmd: &str| cmd == "cd -- \"$AGTX_WORKTREE\" && env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT agent --yolo")
         .times(1)
         .returning(|_, _| Ok(()));
 

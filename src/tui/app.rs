@@ -13198,7 +13198,7 @@ fn switch_agent_in_tmux(
     // be stripped explicitly here (unlike create_window which uses env -u
     // on the initial command only).
     let cmd = format!(
-        "env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT {}",
+        "cd -- \"$AGTX_WORKTREE\" && env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT {}",
         new_agent_cmd
     );
     // **One layer of quoting here, not two.** `create_window` nests its command
