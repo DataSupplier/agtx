@@ -50,6 +50,92 @@ fn archive_workflow_artifact_preserves_superseded_evidence() {
 }
 
 #[test]
+fn failed_validation_requires_linked_review_resolution() {
+    use crate::config::{
+        PluginArtifacts, PluginCommands, PluginPromptTriggers, PluginPrompts, WorkflowPlugin,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let flow = temp.path().join(".agent-flow");
+    std::fs::create_dir_all(&flow).unwrap();
+    let final_artifact = flow.join("final-validation.yaml");
+    let review_artifact = flow.join("engineering-review.yaml");
+    std::fs::write(&final_artifact, "verdict: failed\nfailed_check: pytest\n").unwrap();
+    let failure_hash = workflow_artifact_sha256(&final_artifact).unwrap();
+    let plugin = WorkflowPlugin {
+        name: "test".to_string(),
+        description: None,
+        init_script: None,
+        state_machine: None,
+        supported_agents: vec![],
+        artifacts: PluginArtifacts {
+            final_validation: Some(".agent-flow/final-validation.yaml".to_string()),
+            review: Some(".agent-flow/engineering-review.yaml".to_string()),
+            ..PluginArtifacts::default()
+        },
+        commands: PluginCommands::default(),
+        prompts: PluginPrompts::default(),
+        prompt_triggers: PluginPromptTriggers::default(),
+        copy_dirs: vec![],
+        copy_files: vec![],
+        cyclic: false,
+        clear_context_on_advance: false,
+        copy_back: std::collections::HashMap::new(),
+        auto_dismiss: vec![],
+    };
+
+    std::fs::write(
+        &review_artifact,
+        format!(
+            "verdict: corrections_required\nvalidation_failure_sha256: {failure_hash}\nvalidation_failure_resolution: The targeted test fails because the seeded tenant slug is incorrect.\n"
+        ),
+    )
+    .unwrap();
+    assert!(ensure_review_addresses_failed_validation(
+        temp.path().to_str().unwrap(),
+        &plugin,
+        "task-1",
+        &review_artifact,
+        "corrections_required",
+    )
+    .is_ok());
+
+    std::fs::write(
+        &review_artifact,
+        format!(
+            "verdict: approved_for_validation\nvalidation_failure_sha256: {failure_hash}\nvalidation_failure_resolution: fixed\n"
+        ),
+    )
+    .unwrap();
+    assert!(ensure_review_addresses_failed_validation(
+        temp.path().to_str().unwrap(),
+        &plugin,
+        "task-1",
+        &review_artifact,
+        "approved_for_validation",
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("substantive"));
+
+    std::fs::write(
+        &review_artifact,
+        format!(
+            "verdict: approved_for_validation\nvalidation_failure_sha256: {failure_hash}\nvalidation_failure_resolution: The database endpoint is now reachable; repeat the same validation checks.\n"
+        ),
+    )
+    .unwrap();
+    assert!(ensure_review_addresses_failed_validation(
+        temp.path().to_str().unwrap(),
+        &plugin,
+        "task-1",
+        &review_artifact,
+        "approved_for_validation",
+    )
+    .is_ok());
+}
+
+#[test]
 fn visible_columns_use_all_columns_on_wide_terminals() {
     assert_eq!(visible_column_range(0, 160), 0..5);
     assert_eq!(visible_column_range(4, 140), 0..5);

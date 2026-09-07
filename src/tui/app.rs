@@ -6482,6 +6482,7 @@ impl App {
         }
         let artifact = workflow_artifact_path(&worktree, plugin.artifacts.review.as_deref(), &task.id, ".agent-flow/engineering-review.yaml");
         let verdict = workflow_artifact_value(&artifact, "verdict")?;
+        ensure_review_addresses_failed_validation(&worktree, &plugin, &task.id, &artifact, &verdict)?;
         let (action, phase, status) = match verdict.as_str() {
             "corrections_required" => ("engineering_corrections_required", "running", TaskStatus::Running),
             "plan_issue" => ("engineering_plan_issue", "planning", TaskStatus::Planning),
@@ -6545,9 +6546,17 @@ impl App {
         let next_agent = transition.destination_agent.clone().ok_or_else(|| anyhow::anyhow!("Workflow state has no bound agent"))?;
         let target = task.session_name.clone().ok_or_else(|| anyhow::anyhow!("Task session is unavailable"))?;
         let prompt = format!(
-            "{}\n\nFinal-validation verdict: {verdict}. Evidence: {}. Follow the declared role policy; do not merge feature/poc into main.",
+            "{}\n\nFinal-validation verdict: {verdict}. Evidence: {}.{} Follow the declared role policy; do not merge feature/poc into main.",
             resolve_prompt(&Some(plugin.clone()), phase, &task.content_text(), &task.id, task.cycle),
             artifact.strip_prefix(&worktree).unwrap_or(&artifact).display(),
+            if passed {
+                String::new()
+            } else {
+                format!(
+                    " A previous validation failure is an active gate: read this exact evidence and write a fresh engineering review. Your review must include validation_failure_sha256: {} and validation_failure_resolution: <what you verified or changed>. Choose the normal engineering-review verdict: corrections_required for unresolved source/test failures, plan_issue for a material plan defect, or approved_for_validation only when a repeat validation is justified.",
+                    workflow_artifact_sha256(&artifact)?,
+                )
+            },
         );
         let policy = project_workflow.policy_for_state(workflow, &transition.state.state)?;
         let command = build_policy_agent_command(self.state.agent_registry.get(&next_agent).as_ref(), &next_agent, &prompt, policy.as_ref());
@@ -12007,6 +12016,56 @@ fn workflow_artifact_value(path: &Path, field: &str) -> Result<String> {
         .map(|value| value.trim().trim_matches(['\'', '"']).to_string())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow::anyhow!("workflow evidence {} needs a non-empty {field}: value", path.display()))
+}
+
+/// A final-validation failure remains an active gate until the subsequent
+/// engineering review explicitly acknowledges the exact failed evidence and
+/// explains its resolution. This prevents an unsupported generic approval
+/// from silently bouncing a task back into final validation, while preserving
+/// the state graph's normal review verdicts.
+fn ensure_review_addresses_failed_validation(
+    worktree: &str,
+    plugin: &WorkflowPlugin,
+    task_id: &str,
+    review_artifact: &Path,
+    review_verdict: &str,
+) -> Result<()> {
+    let final_artifact = workflow_artifact_path(
+        worktree,
+        plugin.artifacts.final_validation.as_deref(),
+        task_id,
+        ".agent-flow/final-validation.yaml",
+    );
+    if !final_artifact.is_file() || workflow_artifact_value(&final_artifact, "verdict")? != "failed" {
+        return Ok(());
+    }
+
+    let failure_hash = workflow_artifact_sha256(&final_artifact)?;
+    let acknowledged_hash = workflow_artifact_value(review_artifact, "validation_failure_sha256")?;
+    if acknowledged_hash != failure_hash {
+        anyhow::bail!(
+            "{} must acknowledge failed final-validation evidence with validation_failure_sha256: {}",
+            review_artifact.display(),
+            failure_hash,
+        );
+    }
+    let resolution = workflow_artifact_value(review_artifact, "validation_failure_resolution")?;
+    if resolution.len() < 8 {
+        anyhow::bail!(
+            "{} needs a substantive validation_failure_resolution for failed validation evidence",
+            review_artifact.display(),
+        );
+    }
+    if !matches!(review_verdict, "corrections_required" | "plan_issue" | "approved_for_validation") {
+        anyhow::bail!("{} has unsupported engineering-review verdict '{review_verdict}'", review_artifact.display());
+    }
+    Ok(())
+}
+
+fn workflow_artifact_sha256(path: &Path) -> Result<String> {
+    let content = std::fs::read(path)
+        .map_err(|error| anyhow::anyhow!("failed to read workflow evidence {}: {error}", path.display()))?;
+    Ok(format!("{:x}", Sha256::digest(&content)))
 }
 
 /// Preserve superseded evidence outside the active artifact location. A task
