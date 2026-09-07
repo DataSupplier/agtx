@@ -35,6 +35,21 @@ fn claude_policy_command_separates_allowed_tools_from_prompt() {
 }
 
 #[test]
+fn archive_workflow_artifact_preserves_superseded_evidence() {
+    let temp = tempfile::tempdir().unwrap();
+    let artifact = temp.path().join("engineering-review.yaml");
+    std::fs::write(&artifact, "verdict: approved_for_validation\n").unwrap();
+
+    let archived = archive_workflow_artifact(&artifact, "superseded-after-validation-failure")
+        .unwrap()
+        .expect("existing evidence is archived");
+
+    assert!(!artifact.exists());
+    assert!(archived.starts_with(temp.path().join("history")));
+    assert_eq!(std::fs::read_to_string(archived).unwrap(), "verdict: approved_for_validation\n");
+}
+
+#[test]
 fn visible_columns_use_all_columns_on_wide_terminals() {
     assert_eq!(visible_column_range(0, 160), 0..5);
     assert_eq!(visible_column_range(4, 140), 0..5);

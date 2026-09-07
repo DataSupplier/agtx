@@ -6551,6 +6551,15 @@ impl App {
         );
         let policy = project_workflow.policy_for_state(workflow, &transition.state.state)?;
         let command = build_policy_agent_command(self.state.agent_registry.get(&next_agent).as_ref(), &next_agent, &prompt, policy.as_ref());
+        if !passed {
+            let review_artifact = workflow_artifact_path(
+                &worktree,
+                plugin.artifacts.review.as_deref(),
+                &task.id,
+                ".agent-flow/engineering-review.yaml",
+            );
+            archive_workflow_artifact(&review_artifact, "superseded-after-validation-failure")?;
+        }
         switch_agent_in_tmux(self.state.tmux_ops.as_ref(), &target, &task.agent, &command);
         let db = self.state.db.as_mut().ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
         db.advance_workflow_state(&transition.state, &transition.transition)?;
@@ -11998,6 +12007,29 @@ fn workflow_artifact_value(path: &Path, field: &str) -> Result<String> {
         .map(|value| value.trim().trim_matches(['\'', '"']).to_string())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow::anyhow!("workflow evidence {} needs a non-empty {field}: value", path.display()))
+}
+
+/// Preserve superseded evidence outside the active artifact location. A task
+/// that re-enters a review state must receive a newly written verdict; reusing
+/// an old approval would otherwise permit a validation/review loop.
+fn archive_workflow_artifact(path: &Path, reason: &str) -> Result<Option<PathBuf>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("workflow evidence {} has no parent directory", path.display()))?;
+    let archive_dir = parent.join("history");
+    std::fs::create_dir_all(&archive_dir)?;
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow::anyhow!("workflow evidence {} has no usable file name", path.display()))?;
+    let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("yaml");
+    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ");
+    let archived = archive_dir.join(format!("{stem}.{reason}.{timestamp}.{extension}"));
+    std::fs::rename(path, &archived)?;
+    Ok(Some(archived))
 }
 
 /// Build the narrowest native agent command available for a resolved workflow
