@@ -6036,59 +6036,59 @@ impl App {
             return Ok(());
         };
 
-        // A legacy board move must not change the declarative workflow.  Repair
-        // the presentation status when a task was accidentally moved from
-        // Planning to Running (as happened to F3.3) instead of attempting a
-        // second admission/planning transition.
-        if current.state == "planning" {
-            if task.status != TaskStatus::Planning {
-                task.status = TaskStatus::Planning;
-                task.updated_at = chrono::Utc::now();
-                self.state.db.as_mut().unwrap().update_task(&task)?;
-            }
-            self.state.warning_message = Some((
-                "Workflow and board aligned at Planning".into(),
-                Instant::now(),
-            ));
-            self.refresh_tasks()?;
-            return Ok(());
-        }
-
-        let ready = match prepare_transition(
-            workflow,
-            &project_workflow,
-            &current,
-            "admission_complete",
-            GuardContext {
-                admission_recorded: true,
-                ..GuardContext::default()
-            },
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                self.state.warning_message =
-                    Some((format!("Cannot start planning: {error}"), Instant::now()));
+        // Planning is deliberately restartable. A task can retain its durable
+        // admission evidence while a terminal or agent process exits. In that
+        // case Shift+S must relaunch the planner rather than merely align the
+        // legacy board column and leave an artifact-less task idle.
+        let restarting = current.state == "planning";
+        let (planner, planning_state, transitions) = if restarting {
+            let Some(role) = workflow.state("planning").and_then(|state| state.role.as_ref()) else {
+                self.state.warning_message = Some(("Planning state has no workflow role".into(), Instant::now()));
                 return Ok(());
-            }
-        };
-        let planning = match prepare_transition(
-            workflow,
-            &project_workflow,
-            &ready.state,
-            "start_planning",
-            GuardContext::default(),
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                self.state.warning_message =
-                    Some((format!("Cannot start planning: {error}"), Instant::now()));
+            };
+            let Some(agent) = project_workflow.role_bindings.get(role).cloned() else {
+                self.state.warning_message = Some((format!("Workflow role '{role}' has no agent binding"), Instant::now()));
                 return Ok(());
-            }
-        };
-        let Some(planner) = planning.destination_agent.clone() else {
-            self.state.warning_message =
-                Some(("Planning state has no bound agent".into(), Instant::now()));
-            return Ok(());
+            };
+            (agent, current.state.clone(), None)
+        } else {
+            let ready = match prepare_transition(
+                workflow,
+                &project_workflow,
+                &current,
+                "admission_complete",
+                GuardContext {
+                    admission_recorded: true,
+                    ..GuardContext::default()
+                },
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.state.warning_message =
+                        Some((format!("Cannot start planning: {error}"), Instant::now()));
+                    return Ok(());
+                }
+            };
+            let planning = match prepare_transition(
+                workflow,
+                &project_workflow,
+                &ready.state,
+                "start_planning",
+                GuardContext::default(),
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.state.warning_message =
+                        Some((format!("Cannot start planning: {error}"), Instant::now()));
+                    return Ok(());
+                }
+            };
+            let Some(agent) = planning.destination_agent.clone() else {
+                self.state.warning_message =
+                    Some(("Planning state has no bound agent".into(), Instant::now()));
+                return Ok(());
+            };
+            (agent, planning.state.state.clone(), Some((ready, planning)))
         };
         let agent_ops = self.state.agent_registry.get(&planner);
         let prompt = resolve_prompt(
@@ -6106,34 +6106,40 @@ impl App {
             &project_path,
             self.state.tmux_ops.as_ref(),
         );
-        let policy = project_workflow
-            .policy_for_state(workflow, &planning.state.state)?;
+        let policy = project_workflow.policy_for_state(workflow, &planning_state)?;
         let command = build_policy_agent_command(agent_ops.as_ref(), &planner, &prompt, policy.as_ref());
-        self.state.tmux_ops.create_window(
-            &self.state.tmux_project_name,
-            &window_name,
-            &worktree,
-            Some(command),
-            true,
-            &agtx_task_env(&task.id, &worktree),
-        )?;
+        if restarting && self.state.tmux_ops.window_exists(&target).unwrap_or(false) {
+            switch_agent_in_tmux(self.state.tmux_ops.as_ref(), &target, &task.agent, &command);
+        } else {
+            self.state.tmux_ops.create_window(
+                &self.state.tmux_project_name,
+                &window_name,
+                &worktree,
+                Some(command),
+                true,
+                &agtx_task_env(&task.id, &worktree),
+            )?;
+        }
 
         let db = self
             .state
             .db
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
-        db.advance_workflow_state(&ready.state, &ready.transition)?;
-        db.advance_workflow_state(&planning.state, &planning.transition)?;
+        if let Some((ready, planning)) = transitions {
+            db.advance_workflow_state(&ready.state, &ready.transition)?;
+            db.advance_workflow_state(&planning.state, &planning.transition)?;
+        }
         task.status = TaskStatus::Planning;
         task.agent = planner;
         task.session_name = Some(target);
         task.updated_at = chrono::Utc::now();
         db.update_task(&task)?;
-        self.state.warning_message = Some((
-            "Planning started in admitted worktree".into(),
-            Instant::now(),
-        ));
+        self.state.warning_message = Some(((if restarting {
+            "Planning session relaunched; save the required plan artifact before Shift+V"
+        } else {
+            "Planning started in admitted worktree"
+        }).into(), Instant::now()));
         self.refresh_tasks()?;
         Ok(())
     }
