@@ -263,6 +263,14 @@ pub struct WorkflowRolePolicy {
     /// the role receives no declared filesystem write scope.
     #[serde(default)]
     pub write_paths: Vec<String>,
+    /// Optional model override for this stable workflow role. This remains
+    /// project-owned so a workflow can be reproduced without hard-coding an
+    /// agent provider into the state graph.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Optional provider-native reasoning/effort level for this role.
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 /// Cross-role capabilities that default to the project policy rather than an
@@ -387,6 +395,12 @@ impl WorkflowProjectConfig {
             for path in &policy.write_paths {
                 validate_worktree_glob(path)?;
             }
+            if let Some(model) = &policy.model {
+                validate_agent_option("model", model)?;
+            }
+            if let Some(effort) = &policy.effort {
+                validate_agent_option("effort", effort)?;
+            }
         }
         for (state, policy) in &self.state_policies {
             validate_identifier("workflow state", state)?;
@@ -434,6 +448,17 @@ impl WorkflowProjectConfig {
         }
         Ok(Some(resolved))
     }
+}
+
+fn validate_agent_option(kind: &str, value: &str) -> anyhow::Result<()> {
+    if value.is_empty()
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+    {
+        bail!("workflow {kind} must contain only ASCII letters, digits, '-', '_' or '.'");
+    }
+    Ok(())
 }
 
 impl WorkflowRolePolicy {
@@ -590,6 +615,8 @@ merge_target = "feature/poc"
             r#"
 target_branch = "feature/poc"
 [role_policies.planner]
+model = "sonnet"
+effort = "medium"
 allowed_commands = ["git status", "rg", "cat"]
 write_paths = [".agtx/plans/**"]
 "#,
@@ -597,6 +624,8 @@ write_paths = [".agtx/plans/**"]
         .unwrap();
         config.validate().unwrap();
         let planner = &config.role_policies.roles["planner"];
+        assert_eq!(planner.model.as_deref(), Some("sonnet"));
+        assert_eq!(planner.effort.as_deref(), Some("medium"));
         assert!(planner.permits_command("git status --short"));
         assert!(planner.permits_command("rg workflow ."));
         assert!(!planner.permits_command("git statusx"));
@@ -608,6 +637,7 @@ write_paths = [".agtx/plans/**"]
         assert!(validate_command_prefix("git status; git push").is_err());
         assert!(validate_worktree_glob("../.git/config").is_err());
         assert!(validate_worktree_glob("/etc/passwd").is_err());
+        assert!(validate_agent_option("model", "sonnet; rm").is_err());
     }
 
     #[test]

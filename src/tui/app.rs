@@ -12006,16 +12006,34 @@ fn build_policy_agent_command(
 ) -> String {
     let Some(policy) = policy else { return agent_ops.build_interactive_command(prompt); };
     let quoted_prompt = prompt.replace('\'', "'\"'\"'");
+    let model = policy
+        .role_policy
+        .model
+        .as_deref()
+        .map(|value| format!(" --model {value}"))
+        .unwrap_or_default();
+    let effort = policy
+        .role_policy
+        .effort
+        .as_deref()
+        .map(|value| format!(" --effort {value}"))
+        .unwrap_or_default();
     if agent == "codex" {
         let sandbox = if policy.role_policy.write_paths.is_empty() { "read-only" } else { "workspace-write" };
-        return format!("codex --sandbox {sandbox} --ask-for-approval never '{quoted_prompt}'");
+        let reasoning_effort = policy
+            .role_policy
+            .effort
+            .as_deref()
+            .map(|value| format!(" --config model_reasoning_effort={value}"))
+            .unwrap_or_default();
+        return format!("codex{model}{reasoning_effort} --sandbox {sandbox} --ask-for-approval never '{quoted_prompt}'");
     }
     if agent == "claude" {
         let mut tools = vec!["Read".to_string(), "Glob".to_string(), "Grep".to_string()];
         tools.extend(policy.role_policy.allowed_commands.iter().map(|command| format!("Bash({command} *)")));
         tools.extend(policy.role_policy.write_paths.iter().flat_map(|path| [format!("Edit({path})"), format!("Write({path})")]));
         return format!(
-            "claude --permission-mode dontAsk --allowed-tools '{}' '{}'",
+            "claude{model}{effort} --permission-mode dontAsk --allowed-tools '{}' '{}'",
             tools.join(","), quoted_prompt
         );
     }
