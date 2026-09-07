@@ -233,6 +233,90 @@ fn validate_identifier(kind: &str, value: &str) -> Result<()> {
 /// Bind workflow roles to installed agent names at the project boundary.
 pub type RoleBindings = BTreeMap<String, String>;
 
+/// Project-owned capabilities for one stable workflow role.  The state graph
+/// determines when the role is active; the launcher maps these capabilities to
+/// agent-specific sandbox and approval settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowRolePolicy {
+    #[serde(default)]
+    pub states: Vec<String>,
+    #[serde(default)]
+    pub modify_plan_artifacts: bool,
+    #[serde(default)]
+    pub modify_review_artifacts: bool,
+    #[serde(default)]
+    pub modify_source_and_tests: bool,
+    #[serde(default)]
+    pub final_task_commit: bool,
+    #[serde(default)]
+    pub push_task_branch: bool,
+    #[serde(default)]
+    pub create_or_update_task_pr: bool,
+    #[serde(default)]
+    pub merge_task_into_target: bool,
+}
+
+/// Cross-role capabilities that default to the project policy rather than an
+/// individual workflow state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowPolicyDefaults {
+    #[serde(default)]
+    pub read_repository: bool,
+    #[serde(default)]
+    pub read_only_git: bool,
+    #[serde(default)]
+    pub run_approved_checks: bool,
+    #[serde(default)]
+    pub modify_outside_task_worktree: bool,
+    #[serde(default)]
+    pub merge_feature_to_main: bool,
+    #[serde(default)]
+    pub request_bypass: bool,
+    #[serde(default)]
+    pub approve_bypass: bool,
+    #[serde(default)]
+    pub network: bool,
+}
+
+/// TOML container for `[role_policies.defaults]` and one table per role.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowRolePolicies {
+    #[serde(default)]
+    pub defaults: WorkflowPolicyDefaults,
+    #[serde(flatten)]
+    pub roles: BTreeMap<String, WorkflowRolePolicy>,
+}
+
+/// A narrowly scoped elevation for a delivery state.  It preserves stable role
+/// bindings while preventing engineering review from implicitly gaining merge
+/// authority in every state it owns.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowStatePolicy {
+    pub role: String,
+    #[serde(default)]
+    pub modify_source_and_tests: bool,
+    #[serde(default)]
+    pub final_task_commit: bool,
+    #[serde(default)]
+    pub push_task_branch: bool,
+    #[serde(default)]
+    pub create_or_update_task_pr: bool,
+    #[serde(default)]
+    pub merge_task_into_target: bool,
+    pub merge_target: Option<String>,
+    #[serde(default)]
+    pub merge_feature_to_main: bool,
+}
+
+/// The fully resolved policy for one destination state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedWorkflowPolicy {
+    pub role: String,
+    pub defaults: WorkflowPolicyDefaults,
+    pub role_policy: WorkflowRolePolicy,
+    pub merge_target: Option<String>,
+}
+
 /// Project-owned bindings for a declared workflow.
 ///
 /// This is deliberately separate from `config.toml`: existing agtx versions
@@ -244,6 +328,10 @@ pub struct WorkflowProjectConfig {
     pub target_branch: String,
     #[serde(default)]
     pub role_bindings: RoleBindings,
+    #[serde(default)]
+    pub role_policies: WorkflowRolePolicies,
+    #[serde(default)]
+    pub state_policies: BTreeMap<String, WorkflowStatePolicy>,
 }
 
 impl WorkflowProjectConfig {
@@ -270,7 +358,66 @@ impl WorkflowProjectConfig {
                 bail!("workflow role '{role}' needs an agent binding");
             }
         }
+        if self.role_policies.defaults.modify_outside_task_worktree {
+            bail!("workflow policy may not allow modify_outside_task_worktree");
+        }
+        if self.role_policies.defaults.merge_feature_to_main {
+            bail!("workflow policy may not allow merge_feature_to_main");
+        }
+        if self.role_policies.defaults.approve_bypass {
+            bail!("workflow policy may not allow approve_bypass");
+        }
+        for (role, policy) in &self.role_policies.roles {
+            validate_identifier("role", role)?;
+            for state in &policy.states {
+                validate_identifier("workflow state", state)?;
+            }
+        }
+        for (state, policy) in &self.state_policies {
+            validate_identifier("workflow state", state)?;
+            validate_identifier("role", &policy.role)?;
+            if policy.merge_feature_to_main {
+                bail!("workflow state policy '{state}' may not allow merge_feature_to_main");
+            }
+        }
         Ok(())
+    }
+
+    /// Resolve policy for an owned workflow state.  State policy may only
+    /// elevate the role that owns that exact state; it can never authorize the
+    /// human-owned feature-to-main merge.
+    pub fn policy_for_state(
+        &self,
+        workflow: &WorkflowDefinition,
+        state_id: &str,
+    ) -> Result<Option<ResolvedWorkflowPolicy>> {
+        let state = workflow
+            .state(state_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown workflow state '{state_id}'"))?;
+        let Some(role) = state.role.as_ref() else { return Ok(None); };
+        let mut resolved = ResolvedWorkflowPolicy {
+            role: role.clone(),
+            defaults: self.role_policies.defaults.clone(),
+            role_policy: self.role_policies.roles.get(role).cloned().unwrap_or_default(),
+            merge_target: None,
+        };
+        if !resolved.role_policy.states.is_empty()
+            && !resolved.role_policy.states.iter().any(|state| state == state_id)
+        {
+            bail!("role policy '{role}' does not permit workflow state '{state_id}'");
+        }
+        if let Some(state_policy) = self.state_policies.get(state_id) {
+            if state_policy.role != *role {
+                bail!("workflow state policy '{state_id}' belongs to '{}', not '{role}'", state_policy.role);
+            }
+            resolved.role_policy.modify_source_and_tests |= state_policy.modify_source_and_tests;
+            resolved.role_policy.final_task_commit |= state_policy.final_task_commit;
+            resolved.role_policy.push_task_branch |= state_policy.push_task_branch;
+            resolved.role_policy.create_or_update_task_pr |= state_policy.create_or_update_task_pr;
+            resolved.role_policy.merge_task_into_target |= state_policy.merge_task_into_target;
+            resolved.merge_target = state_policy.merge_target.clone();
+        }
+        Ok(Some(resolved))
     }
 }
 
@@ -340,6 +487,48 @@ mod tests {
         .unwrap();
         config.validate().unwrap();
         assert_eq!(config.role_bindings["planner"], "claude");
+    }
+
+    #[test]
+    fn resolves_role_and_state_scoped_policy_without_delivery_leaking_to_review() {
+        let graph = WorkflowDefinition {
+            initial_state: "planning".into(),
+            states: vec![
+                WorkflowState { id: "planning".into(), label: "Planning".into(), role: Some("planner".into()), terminal: false },
+                WorkflowState { id: "integrate_to_feature".into(), label: "Integrate".into(), role: Some("engineering_reviewer".into()), terminal: false },
+                WorkflowState { id: "done".into(), label: "Done".into(), role: None, terminal: true },
+            ],
+            transitions: vec![],
+        };
+        let config: WorkflowProjectConfig = toml::from_str(
+            r#"
+target_branch = "feature/poc"
+[role_bindings]
+planner = "claude"
+engineering_reviewer = "codex"
+[role_policies.defaults]
+read_repository = true
+[role_policies.planner]
+states = ["planning"]
+modify_plan_artifacts = true
+[role_policies.engineering_reviewer]
+states = ["integrate_to_feature"]
+modify_source_and_tests = true
+[state_policies.integrate_to_feature]
+role = "engineering_reviewer"
+final_task_commit = true
+push_task_branch = true
+merge_task_into_target = true
+merge_target = "feature/poc"
+"#,
+        ).unwrap();
+        config.validate().unwrap();
+        let planning = config.policy_for_state(&graph, "planning").unwrap().unwrap();
+        assert!(planning.role_policy.modify_plan_artifacts);
+        assert!(!planning.role_policy.final_task_commit);
+        let delivery = config.policy_for_state(&graph, "integrate_to_feature").unwrap().unwrap();
+        assert!(delivery.role_policy.final_task_commit);
+        assert_eq!(delivery.merge_target.as_deref(), Some("feature/poc"));
     }
 
     #[test]
