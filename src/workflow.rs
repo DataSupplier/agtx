@@ -254,6 +254,15 @@ pub struct WorkflowRolePolicy {
     pub create_or_update_task_pr: bool,
     #[serde(default)]
     pub merge_task_into_target: bool,
+    /// Executable command prefixes this role may invoke in its task worktree.
+    /// Matching is token-boundary aware: `git status` permits `git status --short`,
+    /// but never `git statusx` or a shell compound command.
+    #[serde(default)]
+    pub allowed_commands: Vec<String>,
+    /// Worktree-relative glob paths this role may modify. An empty list means
+    /// the role receives no declared filesystem write scope.
+    #[serde(default)]
+    pub write_paths: Vec<String>,
 }
 
 /// Cross-role capabilities that default to the project policy rather than an
@@ -372,6 +381,12 @@ impl WorkflowProjectConfig {
             for state in &policy.states {
                 validate_identifier("workflow state", state)?;
             }
+            for command in &policy.allowed_commands {
+                validate_command_prefix(command)?;
+            }
+            for path in &policy.write_paths {
+                validate_worktree_glob(path)?;
+            }
         }
         for (state, policy) in &self.state_policies {
             validate_identifier("workflow state", state)?;
@@ -419,6 +434,44 @@ impl WorkflowProjectConfig {
         }
         Ok(Some(resolved))
     }
+}
+
+impl WorkflowRolePolicy {
+    /// Whether an already tokenized command line begins with a configured
+    /// allowlisted command. Shell operators are rejected by validation, so a
+    /// prefix cannot be extended into a second command.
+    pub fn permits_command(&self, command: &str) -> bool {
+        self.allowed_commands.iter().any(|allowed| {
+            command == allowed
+                || command
+                    .strip_prefix(allowed)
+                    .is_some_and(|suffix| suffix.chars().next().is_some_and(char::is_whitespace))
+        })
+    }
+}
+
+fn validate_command_prefix(command: &str) -> Result<()> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() || trimmed != command {
+        bail!("allowed command must be non-empty and trimmed");
+    }
+    if command.chars().any(|character| matches!(character, '\n' | '\r' | '|' | ';' | '&' | '>' | '<' | '`' | '$')) {
+        bail!("allowed command '{command}' may not contain shell operators");
+    }
+    if command.split_whitespace().next().is_none() {
+        bail!("allowed command '{command}' has no executable");
+    }
+    Ok(())
+}
+
+fn validate_worktree_glob(glob: &str) -> Result<()> {
+    if glob.is_empty() || Path::new(glob).is_absolute() {
+        bail!("write path '{glob}' must be a non-empty worktree-relative glob");
+    }
+    if Path::new(glob).components().any(|component| matches!(component, std::path::Component::ParentDir | std::path::Component::RootDir | std::path::Component::Prefix(_))) {
+        bail!("write path '{glob}' may not escape the task worktree");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -529,6 +582,32 @@ merge_target = "feature/poc"
         let delivery = config.policy_for_state(&graph, "integrate_to_feature").unwrap().unwrap();
         assert!(delivery.role_policy.final_task_commit);
         assert_eq!(delivery.merge_target.as_deref(), Some("feature/poc"));
+    }
+
+    #[test]
+    fn validates_command_and_worktree_path_policies() {
+        let config: WorkflowProjectConfig = toml::from_str(
+            r#"
+target_branch = "feature/poc"
+[role_policies.planner]
+allowed_commands = ["git status", "rg", "cat"]
+write_paths = [".agtx/plans/**"]
+"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let planner = &config.role_policies.roles["planner"];
+        assert!(planner.permits_command("git status --short"));
+        assert!(planner.permits_command("rg workflow ."));
+        assert!(!planner.permits_command("git statusx"));
+        assert!(!planner.permits_command("git status; git push"));
+    }
+
+    #[test]
+    fn rejects_shell_compounds_and_worktree_escapes_in_policies() {
+        assert!(validate_command_prefix("git status; git push").is_err());
+        assert!(validate_worktree_glob("../.git/config").is_err());
+        assert!(validate_worktree_glob("/etc/passwd").is_err());
     }
 
     #[test]
