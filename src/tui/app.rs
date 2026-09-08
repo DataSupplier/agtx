@@ -12320,37 +12320,25 @@ fn build_policy_agent_command(
 /// `permission-mode` cannot drift out of sync between the two paths any more
 /// than the tool list can -- see the invariant on `build_policy_agent_command`.
 ///
-/// Emits only `Edit(path)` for each write path, never `Write(path)`. Verified
-/// against Claude Code's own bundled permission-rule validator: a `Write`,
-/// `MultiEdit`, or `NotebookEdit` rule is accepted as syntactically valid but
-/// never consulted by the actual file-permission check -- only `Edit(path)`
-/// gates every file-writing tool (and only `Read(path)` gates `Glob`). A
-/// `Write(path)` entry is therefore not a weaker or redundant grant; it is a
-/// dead one, present only to produce a startup warning
-/// ("... is not matched by file permission checks -- only Edit(path) rules
-/// are ..."). Emitting it doubled the tool list for no effect and, at scale,
-/// buried the one warning that matters (an unbound role -- see
-/// `resolve_task_workflow_policy`) in noise.
+/// Claude Code permits file editing at the tool level, not by its
+/// `Edit(path)` argument pattern. In `dontAsk` mode a path-pattern rule can
+/// leave both the `Edit` and `Write` tools denied, which strands a workflow
+/// agent mid-task. Writable roles therefore receive the two documented tool
+/// grants. The agent still starts inside its admitted task worktree; agtx
+/// retains `write_paths` as the workflow's declared scope for evidence and
+/// transition validation rather than relying on unsupported CLI path matching.
 ///
 /// Preserves the pre-existing escaping behaviour exactly: a role policy's
 /// command/path entries are not shell-escaped here, only wrapped in single
 /// quotes, same as before this was extracted. A literal single quote in a
 /// configured command or write path would already have broken this quoting;
 /// fixing that is a separate concern from resume parity.
-fn claude_policy_flags(role_policy: &WorkflowRolePolicy, worktree: Option<&Path>) -> String {
+fn claude_policy_flags(role_policy: &WorkflowRolePolicy, _worktree: Option<&Path>) -> String {
     let mut tools = vec!["Read".to_string(), "Glob".to_string(), "Grep".to_string()];
     tools.extend(role_policy.allowed_commands.iter().map(|command| format!("Bash({command} *)")));
-    tools.extend(role_policy.write_paths.iter().map(|path| {
-        let path = Path::new(path);
-        let scoped_path = if path.is_absolute() {
-            path.to_path_buf()
-        } else if let Some(worktree) = worktree {
-            worktree.join(path)
-        } else {
-            path.to_path_buf()
-        };
-        format!("Edit({})", scoped_path.to_string_lossy())
-    }));
+    if !role_policy.write_paths.is_empty() {
+        tools.extend(["Edit".to_string(), "Write".to_string()]);
+    }
     format!("--permission-mode dontAsk --allowed-tools '{}'", tools.join(","))
 }
 

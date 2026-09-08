@@ -29,11 +29,11 @@ fn claude_policy_command_separates_allowed_tools_from_prompt() {
     let command =
         build_policy_agent_command(&agent_ops, "claude", "Review task F3.3", Some(&policy), None);
 
-    // Edit(path) alone covers file creation and modification -- see
-    // claude_policy_flags's doc comment. Write(path) is not emitted: Claude
-    // Code's own permission checker never consults it.
+    // Claude Code's live CLI grants file mutation at the tool level. A
+    // `write_paths` declaration marks this as a writable role, which must
+    // receive both tool names in dontAsk mode.
     assert!(command.contains(
-        "--allowed-tools 'Read,Glob,Grep,Bash(git status *),Edit(.agtx/plans/**)' -- 'Review task F3.3'"
+        "--allowed-tools 'Read,Glob,Grep,Bash(git status *),Edit,Write' -- 'Review task F3.3'"
     ));
 }
 
@@ -75,20 +75,19 @@ fn claude_fresh_and_resume_grant_identical_tools_for_the_same_policy() {
     let fresh = build_policy_agent_command(&agent_ops, "claude", "Implement F3.3", Some(&policy), None);
     let resumed = build_policy_resume_command(&agent_ops, "claude", Some(&policy), None);
 
-    let expected_tools =
-        "Read,Glob,Grep,Bash(ruff check *),Bash(mypy *),Edit(.agent-flow/implementation-result.yaml)";
+    let expected_tools = "Read,Glob,Grep,Bash(ruff check *),Bash(mypy *),Edit,Write";
     assert_eq!(allowed_tools_value(&fresh), expected_tools);
     assert_eq!(allowed_tools_value(&resumed), expected_tools);
     assert!(fresh.contains("--permission-mode dontAsk"));
     assert!(resumed.contains("--permission-mode dontAsk"));
 }
 
-/// Claude evaluates file permissions against the task worktree path it sends
-/// to the tool.  Relative workflow paths therefore have to be expanded before
-/// they enter `--allowed-tools`; otherwise `dontAsk` rejects an allowed edit.
+/// A writable role must receive both documented file-mutation tools.  Scoped
+/// `Edit(path)` entries are not accepted as a reliable allow rule by the live
+/// Claude CLI, so they must never be emitted as a substitute for `Edit,Write`.
 #[test]
 #[cfg(feature = "test-mocks")]
-fn claude_policy_scopes_edit_rules_to_the_admitted_worktree() {
+fn claude_policy_grants_edit_and_write_for_a_writable_role() {
     let agent_ops = MockAgentOperations::new();
     let policy = ResolvedWorkflowPolicy {
         role_policy: crate::workflow::WorkflowRolePolicy {
@@ -97,28 +96,24 @@ fn claude_policy_scopes_edit_rules_to_the_admitted_worktree() {
         },
         ..Default::default()
     };
-    let worktree = Path::new("/workspace/.agtx/worktrees/f3-3");
-
     let fresh = build_policy_agent_command(
         &agent_ops,
         "claude",
         "Implement F3.3",
         Some(&policy),
-        Some(worktree),
+        None,
     );
-    let resumed = build_policy_resume_command(&agent_ops, "claude", Some(&policy), Some(worktree));
+    let resumed = build_policy_resume_command(&agent_ops, "claude", Some(&policy), None);
 
-    assert!(fresh.contains("Edit(/workspace/.agtx/worktrees/f3-3/api/**)"));
-    assert!(resumed.contains("Edit(/workspace/.agtx/worktrees/f3-3/api/**)"));
+    assert!(fresh.contains("Edit,Write"));
+    assert!(resumed.contains("Edit,Write"));
+    assert!(!fresh.contains("Edit(api/**)"));
 }
 
 /// The scenario from the reported incident: an implementer with `write_paths`
 /// resumed after a lost tmux window must carry `Edit` for its result
 /// artifact and its `allowed_commands`, and must resume with `--continue`
-/// rather than a fresh prompt argument. No `Write(path)` entry: it is a dead
-/// rule Claude Code's permission checker never consults (see
-/// `claude_policy_flags`'s doc comment) -- asserting its absence here guards
-/// against it silently creeping back in.
+/// rather than a fresh prompt argument.
 #[test]
 #[cfg(feature = "test-mocks")]
 fn resumed_implementer_with_write_paths_preserves_edit_and_bash_entries() {
@@ -127,8 +122,7 @@ fn resumed_implementer_with_write_paths_preserves_edit_and_bash_entries() {
 
     let command = build_policy_resume_command(&agent_ops, "claude", Some(&policy), None);
 
-    assert!(command.contains("Edit(.agent-flow/implementation-result.yaml)"));
-    assert!(!command.contains("Write("));
+    assert!(command.contains("Edit,Write"));
     assert!(command.contains("Bash(ruff check *)"));
     assert!(command.contains("Bash(mypy *)"));
     assert!(command.ends_with("--continue"));
