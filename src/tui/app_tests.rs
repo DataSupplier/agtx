@@ -27,7 +27,7 @@ fn claude_policy_command_separates_allowed_tools_from_prompt() {
     };
 
     let command =
-        build_policy_agent_command(&agent_ops, "claude", "Review task F3.3", Some(&policy));
+        build_policy_agent_command(&agent_ops, "claude", "Review task F3.3", Some(&policy), None);
 
     // Edit(path) alone covers file creation and modification -- see
     // claude_policy_flags's doc comment. Write(path) is not emitted: Claude
@@ -72,8 +72,8 @@ fn claude_fresh_and_resume_grant_identical_tools_for_the_same_policy() {
     let agent_ops = MockAgentOperations::new();
     let policy = implementer_policy();
 
-    let fresh = build_policy_agent_command(&agent_ops, "claude", "Implement F3.3", Some(&policy));
-    let resumed = build_policy_resume_command(&agent_ops, "claude", Some(&policy));
+    let fresh = build_policy_agent_command(&agent_ops, "claude", "Implement F3.3", Some(&policy), None);
+    let resumed = build_policy_resume_command(&agent_ops, "claude", Some(&policy), None);
 
     let expected_tools =
         "Read,Glob,Grep,Bash(ruff check *),Bash(mypy *),Edit(.agent-flow/implementation-result.yaml)";
@@ -81,6 +81,35 @@ fn claude_fresh_and_resume_grant_identical_tools_for_the_same_policy() {
     assert_eq!(allowed_tools_value(&resumed), expected_tools);
     assert!(fresh.contains("--permission-mode dontAsk"));
     assert!(resumed.contains("--permission-mode dontAsk"));
+}
+
+/// Claude evaluates file permissions against the task worktree path it sends
+/// to the tool.  Relative workflow paths therefore have to be expanded before
+/// they enter `--allowed-tools`; otherwise `dontAsk` rejects an allowed edit.
+#[test]
+#[cfg(feature = "test-mocks")]
+fn claude_policy_scopes_edit_rules_to_the_admitted_worktree() {
+    let agent_ops = MockAgentOperations::new();
+    let policy = ResolvedWorkflowPolicy {
+        role_policy: crate::workflow::WorkflowRolePolicy {
+            write_paths: vec!["api/**".to_string()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let worktree = Path::new("/workspace/.agtx/worktrees/f3-3");
+
+    let fresh = build_policy_agent_command(
+        &agent_ops,
+        "claude",
+        "Implement F3.3",
+        Some(&policy),
+        Some(worktree),
+    );
+    let resumed = build_policy_resume_command(&agent_ops, "claude", Some(&policy), Some(worktree));
+
+    assert!(fresh.contains("Edit(/workspace/.agtx/worktrees/f3-3/api/**)"));
+    assert!(resumed.contains("Edit(/workspace/.agtx/worktrees/f3-3/api/**)"));
 }
 
 /// The scenario from the reported incident: an implementer with `write_paths`
@@ -96,7 +125,7 @@ fn resumed_implementer_with_write_paths_preserves_edit_and_bash_entries() {
     let agent_ops = MockAgentOperations::new();
     let policy = implementer_policy();
 
-    let command = build_policy_resume_command(&agent_ops, "claude", Some(&policy));
+    let command = build_policy_resume_command(&agent_ops, "claude", Some(&policy), None);
 
     assert!(command.contains("Edit(.agent-flow/implementation-result.yaml)"));
     assert!(!command.contains("Write("));
@@ -118,7 +147,7 @@ fn resume_without_a_policy_falls_back_to_the_plain_resume_command() {
         .expect_build_resume_command()
         .returning(|| "claude --dangerously-skip-permissions --continue".to_string());
 
-    let command = build_policy_resume_command(&agent_ops, "claude", None);
+    let command = build_policy_resume_command(&agent_ops, "claude", None, None);
 
     assert_eq!(command, "claude --dangerously-skip-permissions --continue");
 }
@@ -137,7 +166,7 @@ fn non_claude_agents_keep_their_existing_resume_behaviour_even_with_a_policy() {
         .returning(|| "codex resume --last".to_string());
     let policy = implementer_policy();
 
-    let command = build_policy_resume_command(&agent_ops, "codex", Some(&policy));
+    let command = build_policy_resume_command(&agent_ops, "codex", Some(&policy), None);
 
     assert_eq!(command, "codex resume --last");
 }

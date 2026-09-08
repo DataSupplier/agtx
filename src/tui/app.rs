@@ -6154,7 +6154,13 @@ impl App {
             self.state.tmux_ops.as_ref(),
         );
         let policy = project_workflow.policy_for_state(workflow, &planning_state)?;
-        let command = build_policy_agent_command(agent_ops.as_ref(), &planner, &prompt, policy.as_ref());
+        let command = build_policy_agent_command(
+            agent_ops.as_ref(),
+            &planner,
+            &prompt,
+            policy.as_ref(),
+            Some(Path::new(&worktree)),
+        );
         if restarting && self.state.tmux_ops.window_exists(&target).unwrap_or(false) {
             switch_agent_in_tmux(self.state.tmux_ops.as_ref(), &target, &task.agent, &command);
         } else {
@@ -6275,6 +6281,7 @@ impl App {
                 &reviewer,
                 &prompt,
                 Some(policy),
+                Some(Path::new(&worktree)),
             );
             switch_agent_in_tmux(
                 self.state.tmux_ops.as_ref(),
@@ -6462,7 +6469,13 @@ impl App {
             current.approved_plan_hash.as_deref().unwrap_or_default(),
         );
         let policy = project_workflow.policy_for_state(workflow, &implementation.state.state)?;
-        let command = build_policy_agent_command(self.state.agent_registry.get(&implementer).as_ref(), &implementer, &prompt, policy.as_ref());
+        let command = build_policy_agent_command(
+            self.state.agent_registry.get(&implementer).as_ref(),
+            &implementer,
+            &prompt,
+            policy.as_ref(),
+            Some(Path::new(&worktree)),
+        );
         // A Docker/container restart can preserve the admitted worktree and
         // approved-plan evidence while removing tmux entirely.  Implementation
         // must be restartable from that durable state, just as planning is.
@@ -6528,7 +6541,13 @@ impl App {
         let prompt = resolve_prompt(&Some(plugin.clone()), "review", &task.content_text(), &task.id, task.cycle);
         let target = task.session_name.clone().ok_or_else(|| anyhow::anyhow!("Task session is unavailable"))?;
         let policy = project_workflow.policy_for_state(workflow, &review.state.state)?;
-        let command = build_policy_agent_command(self.state.agent_registry.get(&reviewer).as_ref(), &reviewer, &prompt, policy.as_ref());
+        let command = build_policy_agent_command(
+            self.state.agent_registry.get(&reviewer).as_ref(),
+            &reviewer,
+            &prompt,
+            policy.as_ref(),
+            Some(Path::new(&worktree)),
+        );
         switch_agent_in_tmux(self.state.tmux_ops.as_ref(), &target, &task.agent, &command);
         let db = self.state.db.as_mut().ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
         db.advance_workflow_state(&implemented.state, &implemented.transition)?;
@@ -6575,7 +6594,13 @@ impl App {
             artifact.strip_prefix(&worktree).unwrap_or(&artifact).display(),
         );
         let policy = project_workflow.policy_for_state(workflow, &transition.state.state)?;
-        let command = build_policy_agent_command(self.state.agent_registry.get(&next_agent).as_ref(), &next_agent, &prompt, policy.as_ref());
+        let command = build_policy_agent_command(
+            self.state.agent_registry.get(&next_agent).as_ref(),
+            &next_agent,
+            &prompt,
+            policy.as_ref(),
+            Some(Path::new(&worktree)),
+        );
         switch_agent_in_tmux(self.state.tmux_ops.as_ref(), &target, &task.agent, &command);
         let db = self.state.db.as_mut().ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
         db.advance_workflow_state(&transition.state, &transition.transition)?;
@@ -6636,7 +6661,13 @@ impl App {
             },
         );
         let policy = project_workflow.policy_for_state(workflow, &transition.state.state)?;
-        let command = build_policy_agent_command(self.state.agent_registry.get(&next_agent).as_ref(), &next_agent, &prompt, policy.as_ref());
+        let command = build_policy_agent_command(
+            self.state.agent_registry.get(&next_agent).as_ref(),
+            &next_agent,
+            &prompt,
+            policy.as_ref(),
+            Some(Path::new(&worktree)),
+        );
         if !passed {
             let review_artifact = workflow_artifact_path(
                 &worktree,
@@ -9948,7 +9979,12 @@ fn recover_task_session(
     // `&task.agent`, not `default_agent`: the resume command must be built
     // for the agent this task's session actually runs, which can differ from
     // the project's current default if that default changed after launch.
-    let resume_cmd = build_policy_resume_command(agent_ops, &task.agent, policy.as_ref());
+    let resume_cmd = build_policy_resume_command(
+        agent_ops,
+        &task.agent,
+        policy.as_ref(),
+        Some(Path::new(worktree_path)),
+    );
 
     tmux_ops.create_window(
         session,
@@ -12243,6 +12279,7 @@ fn build_policy_agent_command(
     agent: &str,
     prompt: &str,
     policy: Option<&ResolvedWorkflowPolicy>,
+    worktree: Option<&Path>,
 ) -> String {
     let Some(policy) = policy else { return agent_ops.build_interactive_command(prompt); };
     let quoted_prompt = prompt.replace('\'', "'\"'\"'");
@@ -12269,7 +12306,7 @@ fn build_policy_agent_command(
         return format!("codex{model}{reasoning_effort} --sandbox {sandbox} --ask-for-approval never '{quoted_prompt}'");
     }
     if agent == "claude" {
-        let flags = claude_policy_flags(&policy.role_policy);
+        let flags = claude_policy_flags(&policy.role_policy, worktree);
         return format!("claude{model}{effort} {flags} -- '{quoted_prompt}'");
     }
     agent_ops.build_interactive_command(prompt)
@@ -12300,10 +12337,20 @@ fn build_policy_agent_command(
 /// quotes, same as before this was extracted. A literal single quote in a
 /// configured command or write path would already have broken this quoting;
 /// fixing that is a separate concern from resume parity.
-fn claude_policy_flags(role_policy: &WorkflowRolePolicy) -> String {
+fn claude_policy_flags(role_policy: &WorkflowRolePolicy, worktree: Option<&Path>) -> String {
     let mut tools = vec!["Read".to_string(), "Glob".to_string(), "Grep".to_string()];
     tools.extend(role_policy.allowed_commands.iter().map(|command| format!("Bash({command} *)")));
-    tools.extend(role_policy.write_paths.iter().map(|path| format!("Edit({path})")));
+    tools.extend(role_policy.write_paths.iter().map(|path| {
+        let path = Path::new(path);
+        let scoped_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else if let Some(worktree) = worktree {
+            worktree.join(path)
+        } else {
+            path.to_path_buf()
+        };
+        format!("Edit({})", scoped_path.to_string_lossy())
+    }));
     format!("--permission-mode dontAsk --allowed-tools '{}'", tools.join(","))
 }
 
@@ -12342,6 +12389,7 @@ fn build_policy_resume_command(
     agent_ops: &dyn AgentOperations,
     agent: &str,
     policy: Option<&ResolvedWorkflowPolicy>,
+    worktree: Option<&Path>,
 ) -> String {
     let Some(policy) = policy else { return agent_ops.build_resume_command(); };
     if agent != "claude" {
@@ -12359,7 +12407,7 @@ fn build_policy_resume_command(
         .as_deref()
         .map(|value| format!(" --effort {value}"))
         .unwrap_or_default();
-    let flags = claude_policy_flags(&policy.role_policy);
+    let flags = claude_policy_flags(&policy.role_policy, worktree);
     format!("claude{model}{effort} {flags} --continue")
 }
 
@@ -13495,7 +13543,12 @@ fn workflow_scoped_resume_command(
         return Ok(agent_ops.build_resume_command());
     };
     let policy = resolve_task_workflow_policy(&task, Some(project_path), &task.agent, Some(&db))?;
-    Ok(build_policy_resume_command(agent_ops, agent_name, policy.as_ref()))
+    Ok(build_policy_resume_command(
+        agent_ops,
+        agent_name,
+        policy.as_ref(),
+        Some(Path::new(worktree_path)),
+    ))
 }
 
 /// Gracefully switch the agent running in a tmux window.
