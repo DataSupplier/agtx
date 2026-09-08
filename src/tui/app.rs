@@ -6461,14 +6461,44 @@ impl App {
             approved_revision,
             current.approved_plan_hash.as_deref().unwrap_or_default(),
         );
-        let target = task.session_name.clone().ok_or_else(|| anyhow::anyhow!("Task session is unavailable"))?;
         let policy = project_workflow.policy_for_state(workflow, &implementation.state.state)?;
         let command = build_policy_agent_command(self.state.agent_registry.get(&implementer).as_ref(), &implementer, &prompt, policy.as_ref());
-        switch_agent_in_tmux(self.state.tmux_ops.as_ref(), &target, &task.agent, &command);
+        // A Docker/container restart can preserve the admitted worktree and
+        // approved-plan evidence while removing tmux entirely.  Implementation
+        // must be restartable from that durable state, just as planning is.
+        let existing_target = task.session_name.clone();
+        let session_available = existing_target
+            .as_ref()
+            .is_some_and(|target| self.state.tmux_ops.window_exists(target).unwrap_or(false));
+        let slug = generate_task_slug(&task.id, &task.title);
+        let window_name = format!("task-{slug}");
+        let target = if session_available {
+            existing_target.expect("checked above")
+        } else {
+            format!("{}:{window_name}", self.state.tmux_project_name)
+        };
+        if session_available {
+            switch_agent_in_tmux(self.state.tmux_ops.as_ref(), &target, &task.agent, &command);
+        } else {
+            ensure_project_tmux_session(
+                &self.state.tmux_project_name,
+                &project_path,
+                self.state.tmux_ops.as_ref(),
+            );
+            self.state.tmux_ops.create_window(
+                &self.state.tmux_project_name,
+                &window_name,
+                &worktree,
+                Some(command),
+                true,
+                &agtx_task_env(&task.id, &worktree),
+            )?;
+        }
         let db = self.state.db.as_mut().ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
         db.advance_workflow_state(&implementation.state, &implementation.transition)?;
         task.status = TaskStatus::Running;
         task.agent = implementer;
+        task.session_name = Some(target);
         task.updated_at = chrono::Utc::now();
         db.update_task(&task)?;
         self.state.warning_message = Some(("Implementation started from the approved plan".into(), Instant::now()));
