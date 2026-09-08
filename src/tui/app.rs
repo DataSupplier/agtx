@@ -8162,6 +8162,7 @@ impl App {
                                 tmux_ops.as_ref(),
                                 &session_clone,
                                 agent_ops.as_ref(),
+                                &running_agent_clone,
                                 wt_path.as_deref(),
                                 &hook_task_id,
                             );
@@ -8253,6 +8254,7 @@ impl App {
                             tmux_ops.as_ref(),
                             &session_clone,
                             agent_ops.as_ref(),
+                            &planning_agent_clone,
                             wt_path.as_deref(),
                             &hook_task_id,
                         );
@@ -8341,6 +8343,7 @@ impl App {
                                 tmux_ops.as_ref(),
                                 &session_clone,
                                 agent_ops.as_ref(),
+                                &planning_agent_clone,
                                 wt_path.as_deref(),
                                 &hook_task_id,
                             );
@@ -12495,6 +12498,7 @@ fn spawn_send_to_agent(
                 tmux_ops.as_ref(),
                 &target,
                 agent_ops.as_ref(),
+                &target_agent,
                 worktree_path.as_deref(),
                 &task_id,
             );
@@ -13390,27 +13394,15 @@ fn is_agent_active(tmux_ops: &dyn TmuxOperations, target: &str, agent_name: Opti
     false
 }
 
-/// If the tmux window for `target` is gone, recreate it with the agent's resume command.
-/// Used before `switch_agent_in_tmux` and `send_skill_and_prompt` to handle dead windows.
-///
-/// TODO(policy-resume): this recovery path does NOT resolve or apply workflow
-/// policy the way `recover_task_session` now does (see
-/// `resolve_task_workflow_policy` / `build_policy_resume_command`). A
-/// workflow-managed Claude session recovered through here can still come back
-/// as plain `claude --dangerously-skip-permissions --continue` -- resumed in
-/// Claude's persisted `dontAsk` mode with none of its role's allowlist, the
-/// exact bug fixed for `recover_task_session`. It is not fixed here because
-/// every call site runs inside a `std::thread::spawn(move || ...)` closure
-/// that only captures `Arc`-wrapped state (`tmux_ops`, `agent_registry`);
-/// `Database` is not `Clone`/`Send`-shareable in the current design, and
-/// giving this function policy access needs that resolved first (an
-/// `Arc<Database>` refactor, or passing an already-resolved
-/// `Option<ResolvedWorkflowPolicy>` down from each call site). Do not assume
-/// this function is covered by the resume-permission-parity fix.
+/// If the tmux window for `target` is gone, recreate it with the agent's
+/// policy-scoped resume command. Used before `switch_agent_in_tmux` and
+/// `send_skill_and_prompt` to handle dead windows without losing the workflow
+/// role's permission boundary.
 fn ensure_window_or_recover(
     tmux_ops: &dyn TmuxOperations,
     target: &str,
     agent_ops: &dyn AgentOperations,
+    agent_name: &str,
     worktree_path: Option<&str>,
     task_id: &str,
 ) {
@@ -13425,8 +13417,23 @@ fn ensure_window_or_recover(
         if !tmux_ops.has_session(session) {
             let _ = tmux_ops.create_session(session, wt_path);
         }
-        // TODO(policy-resume): plain resume, no policy -- see the doc above.
-        let resume_cmd = agent_ops.build_resume_command();
+        let resume_cmd = match workflow_scoped_resume_command(
+            agent_ops,
+            agent_name,
+            task_id,
+            wt_path,
+        ) {
+            Ok(command) => command,
+            // A workflow task whose policy cannot be resolved must not be
+            // revived with a plain Claude `--continue`: Claude persists
+            // `dontAsk`, but a plain resume carries none of the allowlist and
+            // turns every write into an opaque denial. Leave the window absent
+            // so the caller reports/retries the real recovery failure instead.
+            Err(error) => {
+                tracing::warn!(task_id, error = %error, "refusing unscoped workflow agent recovery");
+                return;
+            }
+        };
         let _ = tmux_ops.create_window(
             session,
             window,
@@ -13436,6 +13443,29 @@ fn ensure_window_or_recover(
             &agtx_task_env(task_id, wt_path),
         );
     }
+}
+
+/// Build a resume command from the task's persisted workflow state. This is
+/// deliberately resolved at recovery time rather than read from Claude's
+/// settings files: `.agtx/workflow.toml` remains the sole permission authority.
+fn workflow_scoped_resume_command(
+    agent_ops: &dyn AgentOperations,
+    agent_name: &str,
+    task_id: &str,
+    worktree_path: &str,
+) -> Result<String> {
+    let Some(project_path) = Path::new(worktree_path)
+        .ancestors()
+        .find(|path| path.join(".agtx/workflow.toml").is_file())
+    else {
+        return Ok(agent_ops.build_resume_command());
+    };
+    let db = Database::open_project(project_path)?;
+    let Some(task) = db.get_task(task_id)? else {
+        return Ok(agent_ops.build_resume_command());
+    };
+    let policy = resolve_task_workflow_policy(&task, Some(project_path), &task.agent, Some(&db))?;
+    Ok(build_policy_resume_command(agent_ops, agent_name, policy.as_ref()))
 }
 
 /// Gracefully switch the agent running in a tmux window.
