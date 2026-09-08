@@ -31,8 +31,14 @@ use crate::skills;
 use crate::tmux::{
     self, InputConfig, InputError, PaneInput, PaneInputSink, RealTmuxOps, TmuxOperations,
 };
-use crate::workflow::{GuardContext, ResolvedWorkflowPolicy, WorkflowProjectConfig, WorkflowRolePolicy};
-use crate::workflow_executor::{prepare_admission, prepare_transition};
+use crate::workflow::{ResolvedWorkflowPolicy, WorkflowProjectConfig, WorkflowRolePolicy};
+use crate::workflow_automation::run_automation_tick;
+use crate::workflow_executor::{
+    admit_task, complete_feature_integration, decide_workflow_plan,
+    start_workflow_implementation, start_workflow_planning, submit_engineering_review,
+    submit_final_validation, submit_workflow_implementation, submit_workflow_plan,
+    WorkflowRuntime, WorkflowStepOutcome,
+};
 use crate::AppMode;
 
 use super::board::{BoardState, DisplayLane};
@@ -1550,6 +1556,18 @@ impl App {
                     .global_db
                     .beat_tui_heartbeat(&path.to_string_lossy());
             }
+
+            // Declarative-workflow automation, on the same cadence as the
+            // queue drain above. This is a distinct concern from the tmux
+            // session recovery elsewhere in this tick: recovery notices a
+            // window that disappeared under a task already in flight, while
+            // this notices durable evidence (a fresh artifact, resolved
+            // dependencies) that is ready for the next handoff. Only runs
+            // when the project opts in via `.agtx/workflow.toml`'s
+            // `[automation] enabled = true` -- absent entirely by default,
+            // and only ever reached from this long-running TUI process's
+            // own tick, never from `agtx-web`.
+            self.run_workflow_automation_tick();
         }
 
         // tmux said a window closed. The refresh is what turns that into an
@@ -5894,7 +5912,7 @@ impl App {
     /// cuts the task branch from that commit. Planning is deliberately a
     /// separate later transition owned by the workflow's planner role.
     fn admit_selected_task(&mut self) -> Result<()> {
-        let (mut task, project_path) = match (
+        let (task, project_path) = match (
             self.state.board.selected_task().cloned(),
             self.state.project_path.clone(),
         ) {
@@ -5936,116 +5954,28 @@ impl App {
             ));
             return Ok(());
         };
-        let dependencies_resolved = self
-            .state
-            .db
-            .as_ref()
-            .map(|db| db.deps_satisfied(&task))
-            .unwrap_or(false);
-        let base_sha = match git::resolve_commit(&project_path, &project_workflow.target_branch) {
-            Ok(sha) => sha,
-            Err(error) => {
-                self.state.warning_message =
-                    Some((format!("Cannot admit task: {error}"), Instant::now()));
-                return Ok(());
-            }
-        };
-        let admission = match prepare_admission(
-            workflow,
-            &project_workflow,
-            &task,
-            dependencies_resolved,
-            base_sha.clone(),
-        ) {
-            Ok(admission) => admission,
-            Err(error) => {
-                self.state.warning_message =
-                    Some((format!("Cannot admit task: {error}"), Instant::now()));
-                return Ok(());
-            }
-        };
 
-        let slug = generate_task_slug(&task.id, &task.title);
-        let worktree_path = match self.state.git_ops.create_worktree(
-            &project_path,
-            &slug,
-            &base_sha,
-            &self.state.config.worktree_dir,
-            &self.state.config.branch_prefix,
-        ) {
-            Ok(path) => path,
-            Err(error) => {
-                self.state.warning_message = Some((
-                    format!("Cannot create admission worktree: {error}"),
-                    Instant::now(),
-                ));
-                return Ok(());
-            }
+        let runtime = WorkflowRuntime {
+            tmux_ops: &self.state.tmux_ops,
+            agent_registry: &self.state.agent_registry,
+            git_ops: &self.state.git_ops,
+            tmux_project_name: &self.state.tmux_project_name,
+            project_path: &project_path,
+            config: &self.state.config,
+            flags: &self.state.flags,
         };
-
-        let copy_files = match (&self.state.config.copy_files, plugin.copy_files.is_empty()) {
-            (Some(project_files), false) if !project_files.trim().is_empty() => {
-                Some(format!("{project_files},{}", plugin.copy_files.join(",")))
-            }
-            (Some(project_files), _) if !project_files.trim().is_empty() => {
-                Some(project_files.clone())
-            }
-            (_, false) => Some(plugin.copy_files.join(",")),
-            _ => None,
-        };
-        let init_script = if self.state.flags.no_init_scripts {
-            None
-        } else {
-            self.state.config.init_script.clone()
-        };
-        let _warnings = self.state.git_ops.initialize_worktree(
-            &project_path,
-            Path::new(&worktree_path),
-            copy_files,
-            init_script,
-            plugin.copy_dirs.clone(),
-        );
-
-        task.worktree_path = Some(worktree_path.clone());
-        task.branch_name = Some(format!("{}/{}", self.state.config.branch_prefix, slug));
-        task.base_branch = Some(project_workflow.target_branch.clone());
-        task.updated_at = chrono::Utc::now();
-
-        let persist_result = self
+        let db = self
             .state
             .db
             .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?
-            .record_workflow_admission(&task, &admission.state, &admission.transition);
-        if let Err(error) = persist_result {
-            let _ = self
-                .state
-                .git_ops
-                .remove_worktree(&project_path, &worktree_path);
-            if let Some(branch) = &task.branch_name {
-                let _ = self.state.git_ops.delete_branch(&project_path, branch);
-            }
-            self.state.warning_message = Some((
-                format!("Admission was rolled back: {error}"),
-                Instant::now(),
-            ));
-            return Ok(());
-        }
-
-        self.state.warning_message = Some((
-            format!(
-                "Admitted at {} — ready for planning",
-                &base_sha[..base_sha.len().min(12)]
-            ),
-            Instant::now(),
-        ));
-        self.refresh_tasks()?;
-        Ok(())
+            .ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
+        let outcome = admit_task(workflow, &project_workflow, &plugin, task, db, &runtime)?;
+        self.apply_workflow_step_outcome(outcome)
     }
 
     /// Start the configured planner from an admitted task worktree.
     fn start_selected_workflow_planning(&mut self) -> Result<()> {
-        let (mut task, project_path) = match (
+        let (task, project_path) = match (
             self.state.board.selected_task().cloned(),
             self.state.project_path.clone(),
         ) {
@@ -6065,142 +5995,29 @@ impl App {
                 Some(("Missing .agtx/workflow.toml".into(), Instant::now()));
             return Ok(());
         };
-        let Some(worktree) = task.worktree_path.clone() else {
-            self.state.warning_message = Some((
-                "Admit the task before starting planning".into(),
-                Instant::now(),
-            ));
-            return Ok(());
-        };
-        let Some(current) = self
-            .state
-            .db
-            .as_ref()
-            .and_then(|db| db.get_workflow_task_state(&task.id).ok().flatten())
-        else {
-            self.state.warning_message =
-                Some(("Task has no admission evidence".into(), Instant::now()));
-            return Ok(());
-        };
 
-        // Planning is deliberately restartable. A task can retain its durable
-        // admission evidence while a terminal or agent process exits. In that
-        // case Shift+S must relaunch the planner rather than merely align the
-        // legacy board column and leave an artifact-less task idle.
-        let restarting = current.state == "planning";
-        let (planner, planning_state, transitions) = if restarting {
-            let Some(role) = workflow.state("planning").and_then(|state| state.role.as_ref()) else {
-                self.state.warning_message = Some(("Planning state has no workflow role".into(), Instant::now()));
-                return Ok(());
-            };
-            let Some(agent) = project_workflow.role_bindings.get(role).cloned() else {
-                self.state.warning_message = Some((format!("Workflow role '{role}' has no agent binding"), Instant::now()));
-                return Ok(());
-            };
-            (agent, current.state.clone(), None)
-        } else {
-            let ready = match prepare_transition(
-                workflow,
-                &project_workflow,
-                &current,
-                "admission_complete",
-                GuardContext {
-                    admission_recorded: true,
-                    ..GuardContext::default()
-                },
-            ) {
-                Ok(value) => value,
-                Err(error) => {
-                    self.state.warning_message =
-                        Some((format!("Cannot start planning: {error}"), Instant::now()));
-                    return Ok(());
-                }
-            };
-            let planning = match prepare_transition(
-                workflow,
-                &project_workflow,
-                &ready.state,
-                "start_planning",
-                GuardContext::default(),
-            ) {
-                Ok(value) => value,
-                Err(error) => {
-                    self.state.warning_message =
-                        Some((format!("Cannot start planning: {error}"), Instant::now()));
-                    return Ok(());
-                }
-            };
-            let Some(agent) = planning.destination_agent.clone() else {
-                self.state.warning_message =
-                    Some(("Planning state has no bound agent".into(), Instant::now()));
-                return Ok(());
-            };
-            (agent, planning.state.state.clone(), Some((ready, planning)))
+        let runtime = WorkflowRuntime {
+            tmux_ops: &self.state.tmux_ops,
+            agent_registry: &self.state.agent_registry,
+            git_ops: &self.state.git_ops,
+            tmux_project_name: &self.state.tmux_project_name,
+            project_path: &project_path,
+            config: &self.state.config,
+            flags: &self.state.flags,
         };
-        let agent_ops = self.state.agent_registry.get(&planner);
-        let prompt = resolve_prompt(
-            &Some(plugin.clone()),
-            "planning",
-            &task.content_text(),
-            &task.id,
-            task.cycle,
-        );
-        let slug = generate_task_slug(&task.id, &task.title);
-        let window_name = format!("task-{slug}");
-        let target = format!("{}:{window_name}", self.state.tmux_project_name);
-        ensure_project_tmux_session(
-            &self.state.tmux_project_name,
-            &project_path,
-            self.state.tmux_ops.as_ref(),
-        );
-        let policy = project_workflow.policy_for_state(workflow, &planning_state)?;
-        let command = build_policy_agent_command(
-            agent_ops.as_ref(),
-            &planner,
-            &prompt,
-            policy.as_ref(),
-            Some(Path::new(&worktree)),
-        );
-        if restarting && self.state.tmux_ops.window_exists(&target).unwrap_or(false) {
-            switch_agent_in_tmux(self.state.tmux_ops.as_ref(), &target, &task.agent, &command);
-        } else {
-            self.state.tmux_ops.create_window(
-                &self.state.tmux_project_name,
-                &window_name,
-                &worktree,
-                Some(command),
-                true,
-                &agtx_task_env(&task.id, &worktree),
-            )?;
-        }
-
         let db = self
             .state
             .db
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
-        if let Some((ready, planning)) = transitions {
-            db.advance_workflow_state(&ready.state, &ready.transition)?;
-            db.advance_workflow_state(&planning.state, &planning.transition)?;
-        }
-        task.status = TaskStatus::Planning;
-        task.agent = planner;
-        task.session_name = Some(target);
-        task.updated_at = chrono::Utc::now();
-        db.update_task(&task)?;
-        self.state.warning_message = Some(((if restarting {
-            "Planning session relaunched; save the required plan artifact before Shift+V"
-        } else {
-            "Planning started in admitted worktree"
-        }).into(), Instant::now()));
-        self.refresh_tasks()?;
-        Ok(())
+        let outcome = start_workflow_planning(workflow, &project_workflow, &plugin, task, db, &runtime)?;
+        self.apply_workflow_step_outcome(outcome)
     }
 
     /// Hash the saved planning artifact, record it durably, and hand the exact
     /// revision to the role bound to `plan_reviewer`.
     fn submit_selected_workflow_plan(&mut self) -> Result<()> {
-        let (mut task, project_path) = match (
+        let (task, project_path) = match (
             self.state.board.selected_task().cloned(),
             self.state.project_path.clone(),
         ) {
@@ -6216,123 +6033,29 @@ impl App {
         let Some(project_workflow) = WorkflowProjectConfig::load(&project_path)? else {
             return Ok(());
         };
-        let Some(worktree) = task.worktree_path.clone() else {
-            self.state.warning_message = Some((
-                "Planning requires an admitted worktree".into(),
-                Instant::now(),
-            ));
-            return Ok(());
+
+        let runtime = WorkflowRuntime {
+            tmux_ops: &self.state.tmux_ops,
+            agent_registry: &self.state.agent_registry,
+            git_ops: &self.state.git_ops,
+            tmux_project_name: &self.state.tmux_project_name,
+            project_path: &project_path,
+            config: &self.state.config,
+            flags: &self.state.flags,
         };
-        let Some(current) = self
-            .state
-            .db
-            .as_ref()
-            .and_then(|db| db.get_workflow_task_state(&task.id).ok().flatten())
-        else {
-            return Ok(());
-        };
-        if current.state != "planning" {
-            self.state.warning_message = Some((
-                "Submit plan is only available in Planning".into(),
-                Instant::now(),
-            ));
-            return Ok(());
-        }
-        let path = planning_artifact_path(&worktree, &plugin, &task.id)?;
-        let contents = std::fs::read(&path)
-            .map_err(|_| anyhow::anyhow!("Missing planning artifact: {}", path.display()))?;
-        let revision = plan_revision(&contents).ok_or_else(|| {
-            anyhow::anyhow!("Planning artifact must contain 'plan_revision: <positive integer>'")
-        })?;
-        if revision <= current.plan_revision {
-            anyhow::bail!(
-                "Plan revision {revision} is not newer than recorded revision {}",
-                current.plan_revision
-            );
-        }
-        let mut evidenced = current;
-        evidenced.plan_revision = revision;
-        evidenced.plan_hash = Some(format!("{:x}", Sha256::digest(&contents)));
-        let handoff = prepare_transition(
-            workflow,
-            &project_workflow,
-            &evidenced,
-            "submit_plan",
-            GuardContext::default(),
-        )?;
-        let reviewer = handoff
-            .destination_agent
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Plan review state has no bound agent"))?;
-        let prompt = format!(
-            "You are the plan reviewer for task {}. Review only {} (revision {}, SHA-256 {}). Do not implement code. Check it against the task, identify concrete changes if needed, then leave your decision for the operator: approve with Shift+Y or request changes with Shift+N.",
-            task.id, path.strip_prefix(&worktree).unwrap_or(&path).display(), revision, evidenced.plan_hash.as_deref().unwrap_or_default()
-        );
-        let target = task
-            .session_name
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Planning session is unavailable"))?;
-        let previous_agent = task.agent.clone();
-        let policy = project_workflow
-            .policy_for_state(workflow, &handoff.state.state)?;
-        if let Some(policy) = policy.as_ref() {
-            let command = build_policy_agent_command(
-                self.state.agent_registry.get(&reviewer).as_ref(),
-                &reviewer,
-                &prompt,
-                Some(policy),
-                Some(Path::new(&worktree)),
-            );
-            switch_agent_in_tmux(
-                self.state.tmux_ops.as_ref(),
-                &target,
-                &previous_agent,
-                &command,
-            );
-        } else {
-            spawn_send_to_agent(
-                Arc::clone(&self.state.tmux_ops),
-                Arc::clone(&self.state.agent_registry),
-                task.id.clone(),
-                self.state.config.agent_hooks,
-                self.state.config.auto_trust,
-                target,
-                previous_agent,
-                reviewer.clone(),
-                true,
-                None,
-                None,
-                prompt,
-                None,
-                task.content_text(),
-                Vec::new(),
-                task.worktree_path.clone(),
-                project_path,
-                Some(plugin.clone()),
-            );
-        }
-        task.status = TaskStatus::Review;
-        task.agent = reviewer;
-        task.updated_at = chrono::Utc::now();
         let db = self
             .state
             .db
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
-        db.advance_workflow_state(&handoff.state, &handoff.transition)?;
-        db.update_task(&task)?;
-        self.state.warning_message = Some((
-            format!("Plan revision {revision} submitted for review"),
-            Instant::now(),
-        ));
-        self.refresh_tasks()?;
-        Ok(())
+        let outcome = submit_workflow_plan(workflow, &project_workflow, &plugin, task, db, &runtime)?;
+        self.apply_workflow_step_outcome(outcome)
     }
 
     /// Persist the operator's reviewer decision.  Approval freezes the exact
     /// recorded hash; request-changes returns ownership to the configured planner.
     fn decide_selected_workflow_plan(&mut self, approve: bool) -> Result<()> {
-        let (mut task, project_path) = match (
+        let (task, project_path) = match (
             self.state.board.selected_task().cloned(),
             self.state.project_path.clone(),
         ) {
@@ -6348,92 +6071,29 @@ impl App {
         let Some(project_workflow) = WorkflowProjectConfig::load(&project_path)? else {
             return Ok(());
         };
-        let Some(mut current) = self
-            .state
-            .db
-            .as_ref()
-            .and_then(|db| db.get_workflow_task_state(&task.id).ok().flatten())
-        else {
-            return Ok(());
+
+        let runtime = WorkflowRuntime {
+            tmux_ops: &self.state.tmux_ops,
+            agent_registry: &self.state.agent_registry,
+            git_ops: &self.state.git_ops,
+            tmux_project_name: &self.state.tmux_project_name,
+            project_path: &project_path,
+            config: &self.state.config,
+            flags: &self.state.flags,
         };
-        if current.state != "plan_review" {
-            return Ok(());
-        }
-        let action = if approve {
-            "approve_plan"
-        } else {
-            "plan_changes_requested"
-        };
-        if approve {
-            current.approved_plan_revision = Some(current.plan_revision);
-            current.approved_plan_hash = current.plan_hash.clone();
-        }
-        let decision = prepare_transition(
-            workflow,
-            &project_workflow,
-            &current,
-            action,
-            GuardContext {
-                approved_plan: approve && current.plan_hash.is_some(),
-                ..GuardContext::default()
-            },
-        )?;
-        let previous_agent = task.agent.clone();
-        task.status = TaskStatus::Planning;
-        task.agent = decision.destination_agent.clone().unwrap_or(task.agent);
-        task.updated_at = chrono::Utc::now();
         let db = self
             .state
             .db
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
-        db.advance_workflow_state(&decision.state, &decision.transition)?;
-        db.update_task(&task)?;
-        if !approve {
-            if let Some(target) = task.session_name.clone() {
-                let prompt = format!(
-                    "Plan review requested changes for task {}. Revise .agtx/plans/{}.md, increment plan_revision above {}, and do not implement code. When complete, save the artifact for another Shift+V submission.",
-                    task.id, task.id, current.plan_revision
-                );
-                spawn_send_to_agent(
-                    Arc::clone(&self.state.tmux_ops),
-                    Arc::clone(&self.state.agent_registry),
-                    task.id.clone(),
-                    self.state.config.agent_hooks,
-                    self.state.config.auto_trust,
-                    target,
-                    previous_agent,
-                    task.agent.clone(),
-                    true,
-                    None,
-                    None,
-                    prompt,
-                    None,
-                    task.content_text(),
-                    Vec::new(),
-                    task.worktree_path.clone(),
-                    project_path,
-                    Some(plugin.clone()),
-                );
-            }
-        }
-        self.state.warning_message = Some((
-            (if approve {
-                "Plan approved"
-            } else {
-                "Plan changes requested; returned to Planning"
-            })
-            .into(),
-            Instant::now(),
-        ));
-        self.refresh_tasks()?;
-        Ok(())
+        let outcome = decide_workflow_plan(workflow, &project_workflow, &plugin, task, approve, db, &runtime)?;
+        self.apply_workflow_step_outcome(outcome)
     }
 
     /// Start the bound implementer only after an exact plan revision and hash
     /// have been approved by the workflow evidence store.
     fn start_selected_workflow_implementation(&mut self) -> Result<()> {
-        let (mut task, project_path) = match (
+        let (task, project_path) = match (
             self.state.board.selected_task().cloned(),
             self.state.project_path.clone(),
         ) {
@@ -6443,310 +6103,207 @@ impl App {
         let Some(plugin) = self.load_task_plugin(&task) else { return Ok(()); };
         let Some(workflow) = plugin.state_machine.as_ref() else { return Ok(()); };
         let Some(project_workflow) = WorkflowProjectConfig::load(&project_path)? else { return Ok(()); };
-        let Some(worktree) = task.worktree_path.clone() else {
-            self.state.warning_message = Some(("Implementation requires an admitted worktree".into(), Instant::now()));
-            return Ok(());
+
+        let runtime = WorkflowRuntime {
+            tmux_ops: &self.state.tmux_ops,
+            agent_registry: &self.state.agent_registry,
+            git_ops: &self.state.git_ops,
+            tmux_project_name: &self.state.tmux_project_name,
+            project_path: &project_path,
+            config: &self.state.config,
+            flags: &self.state.flags,
         };
-        let Some(current) = self.state.db.as_ref().and_then(|db| db.get_workflow_task_state(&task.id).ok().flatten()) else { return Ok(()); };
-        let implementation = prepare_transition(
-            workflow,
-            &project_workflow,
-            &current,
-            "start_implementation",
-            GuardContext {
-                approved_plan: current.approved_plan_revision == Some(current.plan_revision)
-                    && current.approved_plan_hash == current.plan_hash
-                    && current.plan_hash.is_some(),
-                ..GuardContext::default()
-            },
-        )?;
-        let implementer = implementation.destination_agent.clone().ok_or_else(|| anyhow::anyhow!("Implementation state has no bound agent"))?;
-        let approved_revision = current.approved_plan_revision.unwrap_or_default();
-        let prompt = format!(
-            "{}\n\nApproved plan revision: {}\nApproved plan SHA-256: {}",
-            resolve_prompt(&Some(plugin.clone()), "running", &task.content_text(), &task.id, task.cycle),
-            approved_revision,
-            current.approved_plan_hash.as_deref().unwrap_or_default(),
-        );
-        let policy = project_workflow.policy_for_state(workflow, &implementation.state.state)?;
-        let command = build_policy_agent_command(
-            self.state.agent_registry.get(&implementer).as_ref(),
-            &implementer,
-            &prompt,
-            policy.as_ref(),
-            Some(Path::new(&worktree)),
-        );
-        // A Docker/container restart can preserve the admitted worktree and
-        // approved-plan evidence while removing tmux entirely.  Implementation
-        // must be restartable from that durable state, just as planning is.
-        let existing_target = task.session_name.clone();
-        let session_available = existing_target
-            .as_ref()
-            .is_some_and(|target| self.state.tmux_ops.window_exists(target).unwrap_or(false));
-        let slug = generate_task_slug(&task.id, &task.title);
-        let window_name = format!("task-{slug}");
-        let target = if session_available {
-            existing_target.expect("checked above")
-        } else {
-            format!("{}:{window_name}", self.state.tmux_project_name)
-        };
-        if session_available {
-            switch_agent_in_tmux(self.state.tmux_ops.as_ref(), &target, &task.agent, &command);
-        } else {
-            ensure_project_tmux_session(
-                &self.state.tmux_project_name,
-                &project_path,
-                self.state.tmux_ops.as_ref(),
-            );
-            self.state.tmux_ops.create_window(
-                &self.state.tmux_project_name,
-                &window_name,
-                &worktree,
-                Some(command),
-                true,
-                &agtx_task_env(&task.id, &worktree),
-            )?;
-        }
-        let db = self.state.db.as_mut().ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
-        db.advance_workflow_state(&implementation.state, &implementation.transition)?;
-        task.status = TaskStatus::Running;
-        task.agent = implementer;
-        task.session_name = Some(target);
-        task.updated_at = chrono::Utc::now();
-        db.update_task(&task)?;
-        self.state.warning_message = Some(("Implementation started from the approved plan".into(), Instant::now()));
-        self.refresh_tasks()?;
-        Ok(())
+        let db = self
+            .state
+            .db
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
+        let outcome = start_workflow_implementation(workflow, &project_workflow, &plugin, task, db, &runtime)?;
+        self.apply_workflow_step_outcome(outcome)
     }
 
     /// Validate the implementer's durable result before handing the worktree to
     /// the configured engineering reviewer.
     fn submit_selected_workflow_implementation(&mut self) -> Result<()> {
-        let (mut task, project_path) = match (self.state.board.selected_task().cloned(), self.state.project_path.clone()) {
+        let (task, project_path) = match (self.state.board.selected_task().cloned(), self.state.project_path.clone()) {
             (Some(task), Some(project_path)) => (task, project_path), _ => return Ok(()),
         };
         let Some(plugin) = self.load_task_plugin(&task) else { return Ok(()); };
         let Some(workflow) = plugin.state_machine.as_ref() else { return Ok(()); };
         let Some(project_workflow) = WorkflowProjectConfig::load(&project_path)? else { return Ok(()); };
-        let Some(worktree) = task.worktree_path.clone() else { return Ok(()); };
-        let Some(current) = self.state.db.as_ref().and_then(|db| db.get_workflow_task_state(&task.id).ok().flatten()) else { return Ok(()); };
-        let artifact = Path::new(&worktree).join(".agent-flow/implementation-result.yaml");
-        if !artifact.is_file() {
-            self.state.warning_message = Some((format!("Missing implementation evidence: {}", artifact.display()), Instant::now()));
-            return Ok(());
-        }
-        let implemented = prepare_transition(workflow, &project_workflow, &current, "implementation_complete", GuardContext { implementation_recorded: true, ..GuardContext::default() })?;
-        let review = prepare_transition(workflow, &project_workflow, &implemented.state, "start_engineering_review", GuardContext::default())?;
-        let reviewer = review.destination_agent.clone().ok_or_else(|| anyhow::anyhow!("Engineering review state has no bound agent"))?;
-        let prompt = resolve_prompt(&Some(plugin.clone()), "review", &task.content_text(), &task.id, task.cycle);
-        let target = task.session_name.clone().ok_or_else(|| anyhow::anyhow!("Task session is unavailable"))?;
-        let policy = project_workflow.policy_for_state(workflow, &review.state.state)?;
-        let command = build_policy_agent_command(
-            self.state.agent_registry.get(&reviewer).as_ref(),
-            &reviewer,
-            &prompt,
-            policy.as_ref(),
-            Some(Path::new(&worktree)),
-        );
-        switch_agent_in_tmux(self.state.tmux_ops.as_ref(), &target, &task.agent, &command);
-        let db = self.state.db.as_mut().ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
-        db.advance_workflow_state(&implemented.state, &implemented.transition)?;
-        db.advance_workflow_state(&review.state, &review.transition)?;
-        task.status = TaskStatus::Review;
-        task.agent = reviewer;
-        task.updated_at = chrono::Utc::now();
-        db.update_task(&task)?;
-        self.state.warning_message = Some(("Implementation evidence accepted; engineering review started".into(), Instant::now()));
-        self.refresh_tasks()?;
-        Ok(())
+
+        let runtime = WorkflowRuntime {
+            tmux_ops: &self.state.tmux_ops,
+            agent_registry: &self.state.agent_registry,
+            git_ops: &self.state.git_ops,
+            tmux_project_name: &self.state.tmux_project_name,
+            project_path: &project_path,
+            config: &self.state.config,
+            flags: &self.state.flags,
+        };
+        let db = self
+            .state
+            .db
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
+        let outcome = submit_workflow_implementation(workflow, &project_workflow, &plugin, task, db, &runtime)?;
+        self.apply_workflow_step_outcome(outcome)
     }
 
     /// Consume the engineering reviewer's durable verdict and hand the task to
     /// the role that owns the next declared workflow state.
     fn submit_selected_engineering_review(&mut self) -> Result<()> {
-        let (mut task, project_path) = match (self.state.board.selected_task().cloned(), self.state.project_path.clone()) {
+        let (task, project_path) = match (self.state.board.selected_task().cloned(), self.state.project_path.clone()) {
             (Some(task), Some(project_path)) => (task, project_path), _ => return Ok(()),
         };
         let Some(plugin) = self.load_task_plugin(&task) else { return Ok(()); };
         let Some(workflow) = plugin.state_machine.as_ref() else { return Ok(()); };
         let Some(project_workflow) = WorkflowProjectConfig::load(&project_path)? else { return Ok(()); };
-        let Some(worktree) = task.worktree_path.clone() else { return Ok(()); };
-        let Some(current) = self.state.db.as_ref().and_then(|db| db.get_workflow_task_state(&task.id).ok().flatten()) else { return Ok(()); };
-        if current.state != "engineering_review" {
-            self.state.warning_message = Some(("Submit engineering review is only available in Engineering review".into(), Instant::now()));
-            return Ok(());
-        }
-        let artifact = workflow_artifact_path(&worktree, plugin.artifacts.review.as_deref(), &task.id, ".agent-flow/engineering-review.yaml");
-        let verdict = workflow_artifact_value(&artifact, "verdict")?;
-        ensure_review_addresses_failed_validation(&worktree, &plugin, &task.id, &artifact, &verdict)?;
-        let (action, phase, status) = match verdict.as_str() {
-            "corrections_required" => ("engineering_corrections_required", "running", TaskStatus::Running),
-            "plan_issue" => ("engineering_plan_issue", "planning", TaskStatus::Planning),
-            "approved_for_validation" => ("start_final_validation", "final_validation", TaskStatus::Review),
-            _ => anyhow::bail!("{} has unsupported engineering-review verdict '{verdict}'", artifact.display()),
+
+        let runtime = WorkflowRuntime {
+            tmux_ops: &self.state.tmux_ops,
+            agent_registry: &self.state.agent_registry,
+            git_ops: &self.state.git_ops,
+            tmux_project_name: &self.state.tmux_project_name,
+            project_path: &project_path,
+            config: &self.state.config,
+            flags: &self.state.flags,
         };
-        let transition = prepare_transition(workflow, &project_workflow, &current, action, GuardContext::default())?;
-        let next_agent = transition.destination_agent.clone().ok_or_else(|| anyhow::anyhow!("Workflow state has no bound agent"))?;
-        let target = task.session_name.clone().ok_or_else(|| anyhow::anyhow!("Task session is unavailable"))?;
-        let prompt = format!(
-            "{}\n\nEngineering-review verdict: {verdict}. Evidence: {}. Follow the declared role policy; do not commit, push, create a PR, merge, or bypass controls.",
-            resolve_prompt(&Some(plugin.clone()), phase, &task.content_text(), &task.id, task.cycle),
-            artifact.strip_prefix(&worktree).unwrap_or(&artifact).display(),
-        );
-        let policy = project_workflow.policy_for_state(workflow, &transition.state.state)?;
-        let command = build_policy_agent_command(
-            self.state.agent_registry.get(&next_agent).as_ref(),
-            &next_agent,
-            &prompt,
-            policy.as_ref(),
-            Some(Path::new(&worktree)),
-        );
-        switch_agent_in_tmux(self.state.tmux_ops.as_ref(), &target, &task.agent, &command);
-        let db = self.state.db.as_mut().ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
-        db.advance_workflow_state(&transition.state, &transition.transition)?;
-        task.status = status;
-        task.agent = next_agent;
-        task.updated_at = chrono::Utc::now();
-        db.update_task(&task)?;
-        self.state.warning_message = Some((format!("Engineering review recorded: {verdict}"), Instant::now()));
-        self.refresh_tasks()?;
-        Ok(())
+        let db = self
+            .state
+            .db
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
+        let outcome = submit_engineering_review(workflow, &project_workflow, &plugin, task, db, &runtime)?;
+        self.apply_workflow_step_outcome(outcome)
     }
 
     /// Record the final-validation artifact. A pass hands control to the
     /// reviewer-owned integration state; a failure returns to engineering review.
     fn submit_selected_final_validation(&mut self) -> Result<()> {
-        let (mut task, project_path) = match (self.state.board.selected_task().cloned(), self.state.project_path.clone()) {
+        let (task, project_path) = match (self.state.board.selected_task().cloned(), self.state.project_path.clone()) {
             (Some(task), Some(project_path)) => (task, project_path), _ => return Ok(()),
         };
         let Some(plugin) = self.load_task_plugin(&task) else { return Ok(()); };
         let Some(workflow) = plugin.state_machine.as_ref() else { return Ok(()); };
         let Some(project_workflow) = WorkflowProjectConfig::load(&project_path)? else { return Ok(()); };
-        let Some(worktree) = task.worktree_path.clone() else { return Ok(()); };
-        let Some(mut current) = self.state.db.as_ref().and_then(|db| db.get_workflow_task_state(&task.id).ok().flatten()) else { return Ok(()); };
-        if current.state != "final_validation" {
-            self.state.warning_message = Some(("Submit final validation is only available in Final validation".into(), Instant::now()));
-            return Ok(());
-        }
-        let artifact = workflow_artifact_path(&worktree, plugin.artifacts.final_validation.as_deref(), &task.id, ".agent-flow/final-validation.yaml");
-        let verdict = workflow_artifact_value(&artifact, "verdict")?;
-        let (action, phase, passed) = match verdict.as_str() {
-            "passed" => ("begin_feature_integration", "integration", true),
-            "failed" => ("validation_failed", "review", false),
-            _ => anyhow::bail!("{} has unsupported final-validation verdict '{verdict}'", artifact.display()),
+
+        let runtime = WorkflowRuntime {
+            tmux_ops: &self.state.tmux_ops,
+            agent_registry: &self.state.agent_registry,
+            git_ops: &self.state.git_ops,
+            tmux_project_name: &self.state.tmux_project_name,
+            project_path: &project_path,
+            config: &self.state.config,
+            flags: &self.state.flags,
         };
-        if passed {
-            current.validation_passed_at = Some(chrono::Utc::now());
-        }
-        let transition = prepare_transition(
-            workflow,
-            &project_workflow,
-            &current,
-            action,
-            GuardContext { final_validation_passed: passed, clean_worktree: true, ..GuardContext::default() },
-        )?;
-        let next_agent = transition.destination_agent.clone().ok_or_else(|| anyhow::anyhow!("Workflow state has no bound agent"))?;
-        let target = task.session_name.clone().ok_or_else(|| anyhow::anyhow!("Task session is unavailable"))?;
-        let prompt = format!(
-            "{}\n\nFinal-validation verdict: {verdict}. Evidence: {}.{} Follow the declared role policy; do not merge feature/poc into main.",
-            resolve_prompt(&Some(plugin.clone()), phase, &task.content_text(), &task.id, task.cycle),
-            artifact.strip_prefix(&worktree).unwrap_or(&artifact).display(),
-            if passed {
-                String::new()
-            } else {
-                format!(
-                    " A previous validation failure is an active gate: read this exact evidence and write a fresh engineering review. Your review must include validation_failure_sha256: {} and validation_failure_resolution: <what you verified or changed>. Choose the normal engineering-review verdict: corrections_required for unresolved source/test failures, plan_issue for a material plan defect, or approved_for_validation only when a repeat validation is justified.",
-                    workflow_artifact_sha256(&artifact)?,
-                )
-            },
-        );
-        let policy = project_workflow.policy_for_state(workflow, &transition.state.state)?;
-        let command = build_policy_agent_command(
-            self.state.agent_registry.get(&next_agent).as_ref(),
-            &next_agent,
-            &prompt,
-            policy.as_ref(),
-            Some(Path::new(&worktree)),
-        );
-        if !passed {
-            let review_artifact = workflow_artifact_path(
-                &worktree,
-                plugin.artifacts.review.as_deref(),
-                &task.id,
-                ".agent-flow/engineering-review.yaml",
-            );
-            archive_workflow_artifact(&review_artifact, "superseded-after-validation-failure")?;
-        }
-        switch_agent_in_tmux(self.state.tmux_ops.as_ref(), &target, &task.agent, &command);
-        let db = self.state.db.as_mut().ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
-        db.advance_workflow_state(&transition.state, &transition.transition)?;
-        task.status = TaskStatus::Review;
-        task.agent = next_agent;
-        task.updated_at = chrono::Utc::now();
-        db.update_task(&task)?;
-        self.state.warning_message = Some((format!("Final validation recorded: {verdict}"), Instant::now()));
-        self.refresh_tasks()?;
-        Ok(())
+        let db = self
+            .state
+            .db
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
+        let outcome = submit_final_validation(workflow, &project_workflow, &plugin, task, db, &runtime)?;
+        self.apply_workflow_step_outcome(outcome)
     }
 
     /// Execute the narrowly-scoped, reviewer-authorized task integration. The
     /// configured target must be checked out and may never be `main`.
     fn complete_selected_feature_integration(&mut self) -> Result<()> {
-        let (mut task, project_path) = match (self.state.board.selected_task().cloned(), self.state.project_path.clone()) {
+        let (task, project_path) = match (self.state.board.selected_task().cloned(), self.state.project_path.clone()) {
             (Some(task), Some(project_path)) => (task, project_path), _ => return Ok(()),
         };
         let Some(plugin) = self.load_task_plugin(&task) else { return Ok(()); };
         let Some(workflow) = plugin.state_machine.as_ref() else { return Ok(()); };
         let Some(project_workflow) = WorkflowProjectConfig::load(&project_path)? else { return Ok(()); };
-        let Some(worktree) = task.worktree_path.clone() else { return Ok(()); };
-        let Some(branch) = task.branch_name.clone() else { return Ok(()); };
-        let Some(current) = self.state.db.as_ref().and_then(|db| db.get_workflow_task_state(&task.id).ok().flatten()) else { return Ok(()); };
-        if current.state != "integrate_to_feature" {
-            self.state.warning_message = Some(("Complete integration is only available in Integrate to feature".into(), Instant::now()));
-            return Ok(());
+
+        let runtime = WorkflowRuntime {
+            tmux_ops: &self.state.tmux_ops,
+            agent_registry: &self.state.agent_registry,
+            git_ops: &self.state.git_ops,
+            tmux_project_name: &self.state.tmux_project_name,
+            project_path: &project_path,
+            config: &self.state.config,
+            flags: &self.state.flags,
+        };
+        let db = self
+            .state
+            .db
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
+        let outcome = complete_feature_integration(workflow, &project_workflow, &plugin, task, db, &runtime)?;
+        self.apply_workflow_step_outcome(outcome)
+    }
+
+    /// Apply a `WorkflowStepOutcome` from an extracted `workflow_executor`
+    /// launch function: TUI-only bookkeeping (toast message, board refresh)
+    /// that the extracted function itself must not know about. Every DB
+    /// write, agent launch, and tmux operation already happened inside the
+    /// extracted function; this only mirrors the manual handlers' own
+    /// post-launch behaviour exactly.
+    fn apply_workflow_step_outcome(&mut self, outcome: WorkflowStepOutcome) -> Result<()> {
+        match outcome {
+            WorkflowStepOutcome::Advanced { message, .. } => {
+                self.state.warning_message = Some((message, Instant::now()));
+                self.refresh_tasks()?;
+            }
+            WorkflowStepOutcome::Blocked { message } => {
+                self.state.warning_message = Some((message, Instant::now()));
+            }
+            WorkflowStepOutcome::NoOp => {}
         }
-        let artifact = workflow_artifact_path(&worktree, plugin.artifacts.integration.as_deref(), &task.id, ".agent-flow/integration-ready.yaml");
-        if workflow_artifact_value(&artifact, "verdict")? != "ready_for_integration" {
-            anyhow::bail!("{} must declare verdict: ready_for_integration", artifact.display());
-        }
-        let policy = project_workflow.policy_for_state(workflow, &current.state)?
-            .ok_or_else(|| anyhow::anyhow!("Integration state has no role policy"))?;
-        let target_branch = policy.merge_target.clone().ok_or_else(|| anyhow::anyhow!("Integration state has no merge target"))?;
-        if target_branch != current.target_branch || target_branch == "main" {
-            anyhow::bail!("workflow integration may only target the admitted non-main branch");
-        }
-        if !(policy.role_policy.final_task_commit && policy.role_policy.push_task_branch && policy.role_policy.merge_task_into_target) {
-            anyhow::bail!("Integration state policy does not authorize commit, push, and target merge");
-        }
-        if self.state.git_ops.has_changes(&project_path) {
-            anyhow::bail!("configured target checkout has uncommitted changes; integration is refused");
-        }
-        if git::current_branch(&project_path)? != target_branch {
-            anyhow::bail!("configured target checkout is not on '{target_branch}'; integration is refused");
-        }
-        let (has_conflicts, files) = git::check_merge_conflicts(&project_path, &target_branch, &branch)?;
-        if has_conflicts {
-            anyhow::bail!("task branch conflicts with '{target_branch}': {}", files.join(", "));
-        }
-        if self.state.git_ops.has_changes(Path::new(&worktree)) {
-            self.state.git_ops.add_all(Path::new(&worktree))?;
-            self.state.git_ops.commit(Path::new(&worktree), &format!("workflow: complete task {}", task.id))?;
-        }
-        self.state.git_ops.push(Path::new(&worktree), &branch, true)?;
-        git::merge_branch(&project_path, &branch, &format!("workflow: integrate task {}", task.id))?;
-        self.state.git_ops.push(&project_path, &target_branch, false)?;
-        let integration_sha = git::resolve_commit(&project_path, &target_branch)?;
-        let completed = prepare_transition(workflow, &project_workflow, &current, "complete_feature_integration", GuardContext { integrated_into_target: true, ..GuardContext::default() })?;
-        let mut completed_state = completed.state;
-        completed_state.integration_sha = Some(integration_sha);
-        let db = self.state.db.as_mut().ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
-        db.advance_workflow_state(&completed_state, &completed.transition)?;
-        task.status = TaskStatus::Done;
-        task.updated_at = chrono::Utc::now();
-        db.update_task(&task)?;
-        self.state.warning_message = Some((format!("Task integrated into {target_branch}"), Instant::now()));
-        self.refresh_tasks()?;
         Ok(())
+    }
+
+    /// Run one pass of the declarative-workflow automation driver over the
+    /// current project, on the same tick as the transition-queue drain
+    /// above.
+    ///
+    /// Gated on `.agtx/workflow.toml`'s `[automation] enabled` field, which
+    /// defaults to `false`: a project with no `[automation]` table at all
+    /// (the common case today) never reaches `run_automation_tick`, exactly
+    /// as if this call were not here. This is the only place in the
+    /// codebase that calls `run_automation_tick` -- `agtx-web` must stay
+    /// read+queue-only, so it never wires this in.
+    ///
+    /// Uses the project's single configured plugin (`cached_plugin`), the
+    /// same one `load_plugin_if_configured` resolves at startup, not a
+    /// per-task override: `run_automation_tick` itself sweeps every
+    /// non-terminal task in this project's database in one call.
+    fn run_workflow_automation_tick(&mut self) {
+        let Some(project_path) = self.state.project_path.clone() else {
+            return;
+        };
+        let Some(Some(plugin)) = self.state.cached_plugin.clone() else {
+            return;
+        };
+        let Some(workflow) = plugin.state_machine.clone() else {
+            return;
+        };
+        let Some(project_workflow) = WorkflowProjectConfig::load(&project_path).unwrap_or(None) else {
+            return;
+        };
+        if !project_workflow.automation.enabled {
+            return;
+        }
+        let runtime = WorkflowRuntime {
+            tmux_ops: &self.state.tmux_ops,
+            agent_registry: &self.state.agent_registry,
+            git_ops: &self.state.git_ops,
+            tmux_project_name: &self.state.tmux_project_name,
+            project_path: &project_path,
+            config: &self.state.config,
+            flags: &self.state.flags,
+        };
+        let Some(db) = self.state.db.as_mut() else {
+            return;
+        };
+        let results = run_automation_tick(db, &workflow, &project_workflow, &plugin, &runtime);
+        let advanced = results
+            .iter()
+            .any(|result| matches!(result.outcome, Some(WorkflowStepOutcome::Advanced { .. })));
+        if advanced {
+            let _ = self.refresh_tasks();
+        }
     }
 
     /// Check if the current phase is incomplete (artifact missing + agent still running).
@@ -9930,7 +9487,7 @@ fn task_has_live_session(task: &Task, tmux_ops: &dyn TmuxOperations) -> bool {
         .map_or(false, |s| tmux_ops.window_exists(s).unwrap_or(false))
 }
 
-fn ensure_project_tmux_session(
+pub(crate) fn ensure_project_tmux_session(
     project_name: &str,
     project_path: &Path,
     tmux_ops: &dyn TmuxOperations,
@@ -10035,7 +9592,7 @@ fn has_live_phase_status(task: &Task) -> bool {
 }
 
 /// Generate a URL-safe slug from task ID and title
-fn generate_task_slug(task_id: &str, title: &str) -> String {
+pub(crate) fn generate_task_slug(task_id: &str, title: &str) -> String {
     let title_slug: String = title
         .chars()
         .map(|c| {
@@ -12076,7 +11633,7 @@ fn fuzzy_score(haystack: &str, needle: &str) -> i32 {
 
 /// Resolve the task prompt for a given phase transition, using plugin prompt template.
 /// Substitutes {task}, {task_id}, and {phase} placeholders. Returns empty if no template is configured.
-fn resolve_prompt(
+pub(crate) fn resolve_prompt(
     plugin: &Option<WorkflowPlugin>,
     phase: &str,
     task_content: &str,
@@ -12130,7 +11687,7 @@ fn resolve_prompt(
 }
 
 /// Resolve one artifact path without allowing a task ID to escape its worktree.
-fn workflow_artifact_path(worktree: &str, template: Option<&str>, task_id: &str, fallback: &str) -> PathBuf {
+pub(crate) fn workflow_artifact_path(worktree: &str, template: Option<&str>, task_id: &str, fallback: &str) -> PathBuf {
     let relative = template.unwrap_or(fallback).replace("{task_id}", task_id);
     Path::new(worktree).join(relative)
 }
@@ -12139,7 +11696,7 @@ fn workflow_artifact_path(worktree: &str, template: Option<&str>, task_id: &str,
 /// evidence files. The artifact remains human-readable YAML without pulling a
 /// parser into the agent launcher, while malformed/missing evidence blocks a
 /// transition rather than being treated as approval.
-fn workflow_artifact_value(path: &Path, field: &str) -> Result<String> {
+pub(crate) fn workflow_artifact_value(path: &Path, field: &str) -> Result<String> {
     let content = std::fs::read_to_string(path)
         .map_err(|error| anyhow::anyhow!("failed to read workflow evidence {}: {error}", path.display()))?;
     let prefix = format!("{field}:");
@@ -12176,7 +11733,7 @@ fn workflow_artifact_value(path: &Path, field: &str) -> Result<String> {
 /// explains its resolution. This prevents an unsupported generic approval
 /// from silently bouncing a task back into final validation, while preserving
 /// the state graph's normal review verdicts.
-fn ensure_review_addresses_failed_validation(
+pub(crate) fn ensure_review_addresses_failed_validation(
     worktree: &str,
     plugin: &WorkflowPlugin,
     task_id: &str,
@@ -12215,7 +11772,7 @@ fn ensure_review_addresses_failed_validation(
     Ok(())
 }
 
-fn workflow_artifact_sha256(path: &Path) -> Result<String> {
+pub(crate) fn workflow_artifact_sha256(path: &Path) -> Result<String> {
     let content = std::fs::read(path)
         .map_err(|error| anyhow::anyhow!("failed to read workflow evidence {}: {error}", path.display()))?;
     Ok(format!("{:x}", Sha256::digest(&content)))
@@ -12224,7 +11781,7 @@ fn workflow_artifact_sha256(path: &Path) -> Result<String> {
 /// Preserve superseded evidence outside the active artifact location. A task
 /// that re-enters a review state must receive a newly written verdict; reusing
 /// an old approval would otherwise permit a validation/review loop.
-fn archive_workflow_artifact(path: &Path, reason: &str) -> Result<Option<PathBuf>> {
+pub(crate) fn archive_workflow_artifact(path: &Path, reason: &str) -> Result<Option<PathBuf>> {
     if !path.is_file() {
         return Ok(None);
     }
@@ -12274,7 +11831,7 @@ fn archive_workflow_artifact(path: &Path, reason: &str) -> Result<Option<PathBuf
 /// under can always be reconstructed from one reviewed file in version control.
 /// Any second source -- ambient, inferred, or interactively granted -- destroys
 /// that property even when it happens to grant something reasonable.
-fn build_policy_agent_command(
+pub(crate) fn build_policy_agent_command(
     agent_ops: &dyn AgentOperations,
     agent: &str,
     prompt: &str,
@@ -12563,7 +12120,7 @@ fn resolve_skill_command(
 /// Spawn a background thread that optionally switches agent, waits for readiness,
 /// then sends a skill command and prompt to the tmux pane.
 #[allow(clippy::too_many_arguments)]
-fn spawn_send_to_agent(
+pub(crate) fn spawn_send_to_agent(
     tmux_ops: Arc<dyn TmuxOperations>,
     agent_registry: Arc<dyn agent::AgentRegistry>,
     task_id: String,
@@ -13159,7 +12716,7 @@ fn phase_artifact_exists(
 /// Resolve the task-specific planning artifact declared by a workflow plugin.
 /// Unlike the legacy phase helper this deliberately supports `{task_id}` so a
 /// plan belongs to precisely one admitted worktree task.
-fn planning_artifact_path(
+pub(crate) fn planning_artifact_path(
     worktree_path: &str,
     plugin: &WorkflowPlugin,
     task_id: &str,
@@ -13178,7 +12735,7 @@ fn planning_artifact_path(
 
 /// Read the explicit revision marker from a plan artifact.  It is intentionally
 /// format-light so teams can use Markdown with a YAML-style header or body.
-fn plan_revision(contents: &[u8]) -> Option<i32> {
+pub(crate) fn plan_revision(contents: &[u8]) -> Option<i32> {
     let text = std::str::from_utf8(contents).ok()?;
     text.lines().find_map(|line| {
         let value = line.trim().strip_prefix("plan_revision:")?.trim();
@@ -13582,7 +13139,7 @@ fn workflow_scoped_resume_command(
 /// Detection uses `tmux display -p #{pane_current_command}` which reports
 /// the actual process name (e.g. "claude", "node", "bash"), avoiding
 /// false positives from parsing pane text content.
-fn switch_agent_in_tmux(
+pub(crate) fn switch_agent_in_tmux(
     tmux_ops: &dyn TmuxOperations,
     target: &str,
     current_agent: &str,
@@ -14316,7 +13873,7 @@ fn compose_launch_text(skill_cmd: Option<&str>, prompt: &str) -> String {
 /// inherits it. Agent hooks are registered once with a task-agnostic command and
 /// read these to know what they are reporting about, which is what lets several
 /// tasks share one `.claude/settings.local.json` under `skip_worktree`.
-fn agtx_task_env(task_id: &str, worktree: &str) -> Vec<(String, String)> {
+pub(crate) fn agtx_task_env(task_id: &str, worktree: &str) -> Vec<(String, String)> {
     vec![
         ("AGTX_TASK_ID".to_string(), task_id.to_string()),
         ("AGTX_WORKTREE".to_string(), worktree.to_string()),

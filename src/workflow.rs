@@ -176,6 +176,29 @@ impl WorkflowDefinition {
         Ok(transition)
     }
 
+    /// Every transition legal from `current_state` right now: `from` matches
+    /// and every declared guard is currently satisfied. Pure read-only query
+    /// over the graph plus the supplied evidence -- it carries no automation
+    /// policy opinion about which of the returned transitions should be
+    /// taken, only which ones the graph currently permits. A human-facing
+    /// surface should always be able to offer any transition this returns.
+    pub fn available_transitions(
+        &self,
+        current_state: &str,
+        context: GuardContext,
+    ) -> Vec<&WorkflowTransition> {
+        self.transitions
+            .iter()
+            .filter(|transition| {
+                transition.from == current_state
+                    && transition
+                        .guards
+                        .iter()
+                        .all(|guard| guard_is_satisfied(guard, context))
+            })
+            .collect()
+    }
+
     /// Resolve a state owner from project-local role bindings.
     pub fn agent_for_state<'a>(
         &'a self,
@@ -351,6 +374,18 @@ pub struct ResolvedWorkflowPolicy {
     pub network: bool,
 }
 
+/// `[automation]` in `.agtx/workflow.toml`. Absent entirely -- or present
+/// with `enabled = false`, its default -- leaves a project completely
+/// unaffected: `run_automation_tick` is only ever wired into the
+/// long-running `agtx` TUI process's own periodic tick, never into
+/// `agtx-web`, so a project with no `[automation]` table never has any task
+/// advanced without an explicit human keybinding.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowAutomationConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 /// Project-owned bindings for a declared workflow.
 ///
 /// This is deliberately separate from `config.toml`: existing agtx versions
@@ -366,6 +401,8 @@ pub struct WorkflowProjectConfig {
     pub role_policies: WorkflowRolePolicies,
     #[serde(default)]
     pub state_policies: BTreeMap<String, WorkflowStatePolicy>,
+    #[serde(default)]
+    pub automation: WorkflowAutomationConfig,
 }
 
 impl WorkflowProjectConfig {
@@ -704,5 +741,85 @@ write_paths = [".agtx/plans/**"]
             )
             .unwrap();
         assert_eq!(transition.to, "planning");
+    }
+
+    fn branching_workflow() -> WorkflowDefinition {
+        WorkflowDefinition {
+            initial_state: "backlog".into(),
+            states: vec![
+                WorkflowState {
+                    id: "backlog".into(),
+                    label: "Backlog".into(),
+                    role: None,
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "planning".into(),
+                    label: "Planning".into(),
+                    role: Some("planner".into()),
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "done".into(),
+                    label: "Done".into(),
+                    role: None,
+                    terminal: true,
+                },
+            ],
+            transitions: vec![
+                WorkflowTransition {
+                    action: "start_planning".into(),
+                    from: "backlog".into(),
+                    to: "planning".into(),
+                    guards: vec![WorkflowGuard::DependenciesResolved],
+                },
+                WorkflowTransition {
+                    action: "admit".into(),
+                    from: "backlog".into(),
+                    to: "planning".into(),
+                    guards: vec![WorkflowGuard::AdmissionRecorded],
+                },
+                WorkflowTransition {
+                    action: "approve_plan".into(),
+                    from: "planning".into(),
+                    to: "done".into(),
+                    guards: vec![WorkflowGuard::ApprovedPlan],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn available_transitions_returns_only_the_transitions_whose_guards_currently_pass() {
+        let definition = branching_workflow();
+        let available = definition.available_transitions(
+            "backlog",
+            GuardContext {
+                dependencies_resolved: true,
+                admission_recorded: false,
+                ..GuardContext::default()
+            },
+        );
+        let actions: Vec<&str> = available.iter().map(|t| t.action.as_str()).collect();
+        assert_eq!(actions, vec!["start_planning"]);
+    }
+
+    #[test]
+    fn available_transitions_is_empty_for_a_terminal_state() {
+        let definition = branching_workflow();
+        let available = definition.available_transitions("done", GuardContext::default());
+        assert!(available.is_empty());
+    }
+
+    #[test]
+    fn available_transitions_is_empty_when_the_only_transitions_guard_fails_but_validate_transition_still_errors() {
+        let definition = branching_workflow();
+        let available = definition.available_transitions("planning", GuardContext::default());
+        assert!(available.is_empty());
+
+        let error = definition
+            .validate_transition("planning", "approve_plan", GuardContext::default())
+            .unwrap_err();
+        assert!(error.to_string().contains("approved_plan"));
     }
 }

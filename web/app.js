@@ -682,6 +682,27 @@ function phaseGlyph(task) {
   });
 }
 
+/// Read-only mirror of `assess()`'s verdict, as `card()` reports it —
+/// `agtx-web` never acts on this itself, it only shows what the TUI's
+/// automation tick would currently do (or would do, if automation were on).
+const AUTOMATION_CHIP_CLASS = {
+  ready: "ok",
+  waiting: "",
+  invalid: "conflict",
+  human_gate: "blocked",
+};
+
+function automationChip(task) {
+  const status = task.automation_status;
+  if (!status || status.kind === "not_applicable") return null;
+  const cls = AUTOMATION_CHIP_CLASS[status.kind] ?? "";
+  return el("span", {
+    class: `chip automation${cls ? ` ${cls}` : ""}`,
+    text: `auto: ${status.kind}`,
+    title: status.reason || status.kind,
+  });
+}
+
 function taskCard(pid, t) {
   return el(
     "button",
@@ -711,6 +732,7 @@ function taskCard(pid, t) {
       t.conflicted === true
         ? el("span", { class: "chip conflict", text: "conflicts" })
         : null,
+      automationChip(t),
     ),
   );
 }
@@ -810,10 +832,20 @@ function detailsBody(pid, task) {
     );
   }
 
+  const automation = task.automation_status || { kind: "not_applicable", reason: null };
   const rows = [
     ["Status", task.workflow_state || task.status],
     ...(task.workflow_state ? [["Board status", task.status]] : []),
     ["Phase", task.phase_status ? phaseText(task) : "not observed"],
+    // Read-only mirror of `assess()` / `available_transitions()` — agtx-web
+    // never runs these itself, it only reports what the TUI's automation
+    // tick sees (or would see, once `[automation] enabled` is turned on).
+    ...(task.workflow_state
+      ? [
+          ["Automation", `${task.automation_enabled ? "on" : "off"} · ${automation.kind}${automation.reason ? ` (${automation.reason})` : ""}`],
+          ["Workflow actions", (task.workflow_actions || []).length ? task.workflow_actions.join(", ") : "none"],
+        ]
+      : []),
     ["Agent", task.agent],
     ["Agent state", task.blocked_reason || task.agent_state || "—"],
     ["Plugin", task.plugin || "—"],

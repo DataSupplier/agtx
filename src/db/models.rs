@@ -183,6 +183,14 @@ impl Task {
 pub struct WorkflowTaskState {
     pub task_id: String,
     pub state: String,
+    /// Generation counter for the current entry into `state`. Every workflow
+    /// transition (advance_workflow_state) increments this by 1, including a
+    /// transition that re-enters a state the task has already visited (e.g.
+    /// engineering_review after rework). This makes an artifact left over
+    /// from a prior entry into the same conceptual state distinguishable from
+    /// a fresh one: an automation reader compares an artifacts own
+    /// `workflow_attempt` field against this value before trusting it.
+    pub state_attempt: i64,
     pub target_branch: String,
     pub base_sha: Option<String>,
     pub plan_revision: i32,
@@ -199,6 +207,7 @@ impl WorkflowTaskState {
         Self {
             task_id: task_id.into(),
             state: state.into(),
+            state_attempt: 1,
             target_branch: target_branch.into(),
             base_sha: None,
             plan_revision: 0,

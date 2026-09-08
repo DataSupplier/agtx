@@ -181,6 +181,7 @@ impl Database {
             CREATE TABLE IF NOT EXISTS workflow_task_states (
                 task_id TEXT PRIMARY KEY,
                 state TEXT NOT NULL,
+                state_attempt INTEGER NOT NULL DEFAULT 1,
                 target_branch TEXT NOT NULL,
                 base_sha TEXT,
                 plan_revision INTEGER NOT NULL DEFAULT 0,
@@ -234,6 +235,18 @@ impl Database {
         let _ = self
             .conn
             .execute("ALTER TABLE tasks ADD COLUMN base_branch TEXT", []);
+
+        // Migration: state_attempt is a generation counter for the current
+        // entry into whatever state a task occupies. Existing rows predate
+        // the column and default to 1; an in-flight task at the time of this
+        // migration will therefore treat any artifact written before the
+        // upgrade as stale until its role writes a fresh one. That is an
+        // intentional one-time cost, not a bug -- backfilling old artifacts
+        // is not attempted.
+        let _ = self.conn.execute(
+            "ALTER TABLE workflow_task_states ADD COLUMN state_attempt INTEGER NOT NULL DEFAULT 1",
+            [],
+        );
 
         // MCP transition request queue
         self.conn.execute_batch(
@@ -497,12 +510,13 @@ impl Database {
         self.conn.execute(
             r#"
             INSERT INTO workflow_task_states (
-                task_id, state, target_branch, base_sha, plan_revision, plan_hash,
+                task_id, state, state_attempt, target_branch, base_sha, plan_revision, plan_hash,
                 approved_plan_revision, approved_plan_hash, validation_passed_at,
                 integration_sha, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             ON CONFLICT(task_id) DO UPDATE SET
                 state = excluded.state,
+                state_attempt = excluded.state_attempt,
                 target_branch = excluded.target_branch,
                 base_sha = excluded.base_sha,
                 plan_revision = excluded.plan_revision,
@@ -516,6 +530,7 @@ impl Database {
             params![
                 state.task_id,
                 state.state,
+                state.state_attempt,
                 state.target_branch,
                 state.base_sha,
                 state.plan_revision,
@@ -541,6 +556,7 @@ impl Database {
         Ok(WorkflowTaskState {
             task_id: row.get("task_id")?,
             state: row.get("state")?,
+            state_attempt: row.get("state_attempt")?,
             target_branch: row.get("target_branch")?,
             base_sha: row.get("base_sha")?,
             plan_revision: row.get("plan_revision")?,
@@ -608,12 +624,13 @@ impl Database {
         tx.execute(
             r#"
             INSERT INTO workflow_task_states (
-                task_id, state, target_branch, base_sha, plan_revision, plan_hash,
+                task_id, state, state_attempt, target_branch, base_sha, plan_revision, plan_hash,
                 approved_plan_revision, approved_plan_hash, validation_passed_at,
                 integration_sha, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             ON CONFLICT(task_id) DO UPDATE SET
-                state = excluded.state, target_branch = excluded.target_branch,
+                state = excluded.state, state_attempt = excluded.state_attempt,
+                target_branch = excluded.target_branch,
                 base_sha = excluded.base_sha, plan_revision = excluded.plan_revision,
                 plan_hash = excluded.plan_hash, approved_plan_revision = excluded.approved_plan_revision,
                 approved_plan_hash = excluded.approved_plan_hash,
@@ -621,7 +638,7 @@ impl Database {
                 integration_sha = excluded.integration_sha, updated_at = excluded.updated_at
             "#,
             params![
-                state.task_id, state.state, state.target_branch, state.base_sha,
+                state.task_id, state.state, state.state_attempt, state.target_branch, state.base_sha,
                 state.plan_revision, state.plan_hash, state.approved_plan_revision,
                 state.approved_plan_hash,
                 state.validation_passed_at.map(|value| value.to_rfc3339()),
@@ -657,14 +674,14 @@ impl Database {
         tx.execute(
             r#"
             UPDATE workflow_task_states SET
-                state = ?2, target_branch = ?3, base_sha = ?4,
-                plan_revision = ?5, plan_hash = ?6,
-                approved_plan_revision = ?7, approved_plan_hash = ?8,
-                validation_passed_at = ?9, integration_sha = ?10, updated_at = ?11
+                state = ?2, state_attempt = ?3, target_branch = ?4, base_sha = ?5,
+                plan_revision = ?6, plan_hash = ?7,
+                approved_plan_revision = ?8, approved_plan_hash = ?9,
+                validation_passed_at = ?10, integration_sha = ?11, updated_at = ?12
             WHERE task_id = ?1
             "#,
             params![
-                state.task_id, state.state, state.target_branch, state.base_sha,
+                state.task_id, state.state, state.state_attempt, state.target_branch, state.base_sha,
                 state.plan_revision, state.plan_hash, state.approved_plan_revision,
                 state.approved_plan_hash,
                 state.validation_passed_at.map(|value| value.to_rfc3339()),

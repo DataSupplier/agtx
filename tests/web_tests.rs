@@ -10,8 +10,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::MutexGuard;
 
-use agtx::db::{Database, Project, Task, TaskRuntime, TaskStatus};
+use agtx::config::WorkflowPlugin;
+use agtx::db::{Database, Project, Task, TaskRuntime, TaskStatus, WorkflowTaskState};
 use agtx::web::{ServeMode, ServerState};
+use agtx::workflow::{
+    WorkflowDefinition, WorkflowGuard, WorkflowProjectConfig, WorkflowState, WorkflowTransition,
+};
+use agtx::workflow_executor::{assess, guard_context_for, AutomationDecision};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
@@ -363,6 +368,191 @@ async fn a_task_with_no_runtime_row_reports_none() {
     let (_, body) = get(state, &format!("/api/projects/{}/tasks", f.project_id)).await;
     assert!(body[0]["phase_status"].is_null());
     assert!(body[0]["phase_age_secs"].is_null());
+}
+
+// ── declarative workflow observability (Step 8: web board parity) ───────
+
+/// A two-state graph: `backlog` (no role, guarded only on dependencies) to a
+/// terminal `admission`. Small enough that `available_transitions`/`assess`
+/// have exactly one thing to say about a fresh task, which is what the
+/// parity test below checks `card()` repeats verbatim.
+fn small_workflow() -> WorkflowDefinition {
+    WorkflowDefinition {
+        initial_state: "backlog".into(),
+        states: vec![
+            WorkflowState { id: "backlog".into(), label: "Backlog".into(), role: None, terminal: false },
+            WorkflowState { id: "admission".into(), label: "Admission".into(), role: None, terminal: true },
+        ],
+        transitions: vec![WorkflowTransition {
+            action: "admit".into(),
+            from: "backlog".into(),
+            to: "admission".into(),
+            guards: vec![WorkflowGuard::DependenciesResolved],
+        }],
+    }
+}
+
+fn plugin_for_tests(name: &str, workflow: WorkflowDefinition) -> WorkflowPlugin {
+    WorkflowPlugin {
+        name: name.into(),
+        description: None,
+        init_script: None,
+        state_machine: Some(workflow),
+        supported_agents: Vec::new(),
+        artifacts: Default::default(),
+        commands: Default::default(),
+        prompts: Default::default(),
+        prompt_triggers: Default::default(),
+        copy_dirs: Vec::new(),
+        copy_files: Vec::new(),
+        cyclic: false,
+        clear_context_on_advance: false,
+        copy_back: Default::default(),
+        auto_dismiss: Vec::new(),
+    }
+}
+
+/// Write `.agtx/config.toml`, `.agtx/plugins/<name>/plugin.toml` and
+/// `.agtx/workflow.toml` for `f.project_path`, the same three files
+/// `MergedConfig`/`WorkflowPlugin::load`/`WorkflowProjectConfig::load` read on
+/// a real project, so `card()`'s `workflow_context_for` resolves a workflow
+/// exactly the way a real board would.
+fn seed_workflow_project(f: &Fixture, plugin_name: &str, automation_enabled: bool) {
+    let agtx_dir = f.project_path.join(".agtx");
+    std::fs::create_dir_all(&agtx_dir).unwrap();
+    std::fs::write(
+        agtx_dir.join("config.toml"),
+        format!("workflow_plugin = \"{plugin_name}\"\n"),
+    )
+    .unwrap();
+
+    let plugin = plugin_for_tests(plugin_name, small_workflow());
+    let plugin_dir = agtx_dir.join("plugins").join(plugin_name);
+    std::fs::create_dir_all(&plugin_dir).unwrap();
+    std::fs::write(plugin_dir.join("plugin.toml"), toml::to_string(&plugin).unwrap()).unwrap();
+
+    std::fs::write(
+        agtx_dir.join("workflow.toml"),
+        format!("target_branch = \"main\"\n\n[automation]\nenabled = {automation_enabled}\n"),
+    )
+    .unwrap();
+}
+
+/// A task admitted into the declarative workflow, sitting in `backlog` with
+/// no unresolved dependencies -- the same fixture shape
+/// `assess_advances_a_backlog_task_once_dependencies_resolve` in
+/// `workflow_executor.rs` uses, so `assess` is known to answer
+/// `Advance("admit")` and `available_transitions` to return exactly `admit`.
+fn add_workflow_task(f: &Fixture, title: &str) -> (Task, WorkflowTaskState) {
+    let db = Database::open_project(&f.project_path).unwrap();
+    let task = Task::new(title, "claude", &f.project_id);
+    db.create_task(&task).unwrap();
+    let state = WorkflowTaskState::new(&task.id, "backlog", "main");
+    db.upsert_workflow_task_state(&state).unwrap();
+    (task, state)
+}
+
+/// The specific regression the approved plan named: `card()`'s
+/// `workflow_actions`/`automation_status` must exactly match calling
+/// `available_transitions`/`assess` directly against the same fixture --
+/// no second, drifting guard computation inside `agtx-web`.
+#[tokio::test]
+async fn workflow_actions_and_automation_status_match_direct_calls() {
+    let f = fixture();
+    seed_workflow_project(&f, "testflow-parity", true);
+    let (task, state) = add_workflow_task(&f, "Seed cameras");
+
+    let workflow = small_workflow();
+    let plugin = plugin_for_tests("testflow-parity", workflow.clone());
+    let project = WorkflowProjectConfig {
+        target_branch: "main".into(),
+        automation: agtx::workflow::WorkflowAutomationConfig { enabled: true },
+        ..Default::default()
+    };
+    let db = Database::open_project(&f.project_path).unwrap();
+    let guards = guard_context_for(&db, &task, &state);
+    let expected_actions: Vec<String> = workflow
+        .available_transitions(&state.state, guards)
+        .into_iter()
+        .map(|t| t.action.clone())
+        .collect();
+    let expected_decision = assess(&workflow, &project, &plugin, &task, &state, &db);
+    assert_eq!(expected_decision, AutomationDecision::Advance("admit".to_string()));
+
+    let http_state = state_for(&f, ServeMode::Global);
+    let (status, body) = get(http_state, &format!("/api/projects/{}/tasks", f.project_id)).await;
+    assert_eq!(status, StatusCode::OK);
+    let card = &body[0];
+
+    let actions: Vec<String> = card["workflow_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(actions, expected_actions);
+    assert_eq!(card["automation_status"]["kind"], "ready");
+    assert_eq!(card["automation_status"]["reason"], "admit");
+    assert_eq!(card["automation_enabled"], true);
+
+    // Same parity on the task-detail route, which flattens the same `card()`.
+    let http_state = state_for(&f, ServeMode::Global);
+    let (status, detail) = get(
+        http_state,
+        &format!("/api/projects/{}/tasks/{}", f.project_id, task.id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        detail["workflow_actions"].as_array().unwrap().len(),
+        expected_actions.len()
+    );
+    assert_eq!(detail["automation_status"]["kind"], "ready");
+}
+
+/// A project with no declarative workflow at all (the common case today):
+/// `card()` must not panic or error, and the three new fields must degrade to
+/// their documented defaults rather than surfacing a workflow that does not
+/// exist.
+#[tokio::test]
+async fn a_non_workflow_project_degrades_gracefully() {
+    let f = fixture();
+    add_task(&f, "Legacy task", TaskStatus::Backlog);
+
+    let state = state_for(&f, ServeMode::Global);
+    let (status, body) = get(state, &format!("/api/projects/{}/tasks", f.project_id)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let card = &body[0];
+    assert_eq!(card["workflow_actions"].as_array().unwrap().len(), 0);
+    assert_eq!(card["automation_status"]["kind"], "not_applicable");
+    assert!(card["automation_status"]["reason"].is_null());
+    assert_eq!(card["automation_enabled"], false);
+}
+
+/// `card()` only reads: repeated calls (via repeated board fetches) must
+/// never mutate the workflow row it reports on, and this whole path never
+/// touches tmux or an agent-launch trait -- it has no such parameter to
+/// begin with, so the absence of one is itself part of what this asserts.
+#[tokio::test]
+async fn card_has_no_side_effects_on_the_workflow_row() {
+    let f = fixture();
+    seed_workflow_project(&f, "testflow-noop", false);
+    let (task, _state) = add_workflow_task(&f, "Seed cameras");
+
+    let db = Database::open_project(&f.project_path).unwrap();
+    let before = db.get_workflow_task_state(&task.id).unwrap().unwrap();
+
+    for _ in 0..5 {
+        let http_state = state_for(&f, ServeMode::Global);
+        let (status, _) = get(http_state, &format!("/api/projects/{}/tasks", f.project_id)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let after = db.get_workflow_task_state(&task.id).unwrap().unwrap();
+    assert_eq!(before.state_attempt, after.state_attempt);
+    assert_eq!(before.state, after.state);
+    assert_eq!(before.updated_at, after.updated_at);
 }
 
 #[tokio::test]

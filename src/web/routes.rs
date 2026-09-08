@@ -269,6 +269,77 @@ struct TaskCard {
     /// rather than as clean, which is the answer someone might merge on.
     conflicted: Option<bool>,
     conflicting_files: Vec<String>,
+    /// Actions the declarative graph currently permits from this task's
+    /// workflow state, per `WorkflowDefinition::available_transitions` — the
+    /// same legality query the TUI uses, computed fresh on every request.
+    /// Empty for a task with no workflow state at all (legacy tasks, or a
+    /// project with no declarative workflow configured): this field is
+    /// purely additive and must never error for those.
+    workflow_actions: Vec<String>,
+    /// What `workflow_executor::assess` currently says automation would do
+    /// with this task, read-only — `agtx-web` never calls
+    /// `run_automation_tick` itself, this only reports what it *would*
+    /// decide.
+    automation_status: AutomationStatusView,
+    /// The project's `[automation] enabled` flag from `.agtx/workflow.toml`.
+    /// `false` when no workflow config is loaded for the project at all.
+    automation_enabled: bool,
+}
+
+/// `card()`'s read-only mirror of `workflow_executor::AutomationDecision`,
+/// shaped for JSON rather than for the executor's own match arms.
+#[derive(Debug, Clone, Serialize)]
+struct AutomationStatusView {
+    kind: &'static str,
+    reason: Option<String>,
+}
+
+impl AutomationStatusView {
+    fn not_applicable() -> Self {
+        Self { kind: "not_applicable", reason: None }
+    }
+
+    fn from_decision(decision: crate::workflow_executor::AutomationDecision) -> Self {
+        use crate::workflow_executor::AutomationDecision;
+        match decision {
+            AutomationDecision::Wait => Self { kind: "waiting", reason: None },
+            AutomationDecision::Advance(action) => Self { kind: "ready", reason: Some(action) },
+            AutomationDecision::InvalidArtifact(reason) => Self { kind: "invalid", reason: Some(reason) },
+            AutomationDecision::HumanGate(reason) => Self { kind: "human_gate", reason: Some(reason) },
+        }
+    }
+}
+
+/// A project's loaded declarative-workflow bindings, resolved once per
+/// request (not once per card: every card on a board shares one project's
+/// config) exactly the way `run_workflow_automation_tick` resolves them for
+/// the TUI's own tick, minus anything that reads TUI-only state
+/// (`cached_plugin`, tmux/agent handles) -- `agtx-web` re-resolves from disk
+/// instead, since it is a separate process with no access to the TUI's
+/// in-memory cache.
+struct WorkflowContext {
+    workflow: crate::workflow::WorkflowDefinition,
+    project: crate::workflow::WorkflowProjectConfig,
+    plugin: crate::config::WorkflowPlugin,
+}
+
+/// Resolve `WorkflowContext` for a project, the same merge-then-load chain
+/// `defaults_for` (in `web/writes.rs`) already uses to find a project's
+/// configured plugin. `None` covers every reason a project might not have
+/// one: no `workflow_plugin` configured, the plugin has no `state_machine`,
+/// or no `.agtx/workflow.toml` -- all of them mean "this project does not use
+/// the declarative workflow feature," not an error.
+fn workflow_context_for(project_path: &std::path::Path) -> Option<WorkflowContext> {
+    let global = crate::config::GlobalConfig::load().unwrap_or_default();
+    let project_cfg = crate::config::ProjectConfig::load(project_path).unwrap_or_default();
+    let merged = crate::config::MergedConfig::merge(&global, &project_cfg);
+    let name = merged.workflow_plugin.as_ref()?;
+    let plugin = crate::config::WorkflowPlugin::load(name, Some(project_path)).ok()?;
+    let workflow = plugin.state_machine.clone()?;
+    let project = crate::workflow::WorkflowProjectConfig::load(project_path)
+        .ok()
+        .flatten()?;
+    Some(WorkflowContext { workflow, project, plugin })
 }
 
 fn card(
@@ -276,19 +347,49 @@ fn card(
     t: Task,
     runtime: Option<&crate::db::TaskRuntime>,
     conflict: Option<ConflictState>,
+    workflow_ctx: Option<&WorkflowContext>,
 ) -> TaskCard {
     let dep_state = db.dependency_state(&t);
     let deps_ok = dep_state.is_ready();
-    let workflow_state = db
-        .get_workflow_task_state(&t.id)
-        .ok()
-        .flatten()
-        .map(|state| state.state);
+    let workflow_task_state = db.get_workflow_task_state(&t.id).ok().flatten();
+    let workflow_state = workflow_task_state.as_ref().map(|s| s.state.clone());
+
+    // Read-only: `guard_context_for` and `assess` are the same pure
+    // graph/filesystem queries the TUI's own tick and `available_transitions`
+    // callers already use -- no mutation, no tmux, no `run_automation_tick`.
+    let (workflow_actions, automation_status) = match (workflow_ctx, &workflow_task_state) {
+        (Some(ctx), Some(state)) => {
+            let guards = crate::workflow_executor::guard_context_for(db, &t, state);
+            let actions = ctx
+                .workflow
+                .available_transitions(&state.state, guards)
+                .into_iter()
+                .map(|transition| transition.action.clone())
+                .collect();
+            let decision = crate::workflow_executor::assess(
+                &ctx.workflow,
+                &ctx.project,
+                &ctx.plugin,
+                &t,
+                state,
+                db,
+            );
+            (actions, AutomationStatusView::from_decision(decision))
+        }
+        _ => (Vec::new(), AutomationStatusView::not_applicable()),
+    };
+    let automation_enabled = workflow_ctx
+        .map(|ctx| ctx.project.automation.enabled)
+        .unwrap_or(false);
+
     TaskCard {
         conflicted: conflict.as_ref().map(|c| c.conflicted),
         conflicting_files: conflict.map(|c| c.files).unwrap_or_default(),
         allowed_actions: allowed_actions(&t, deps_ok, CallerKind::Human),
         workflow_state,
+        workflow_actions,
+        automation_status,
+        automation_enabled,
         deps_satisfied: deps_ok,
         blocked_by: dep_state.blocked_by().to_vec(),
         phase_status: runtime.map(|r| r.phase_status.as_str().to_string()),
@@ -313,7 +414,8 @@ async fn tasks(
     let db = state.project_db(&pid)?;
     // Tell the TUI someone is reading, so it starts publishing phase status.
     // Without a reader it publishes nothing, which is the point.
-    if let Ok(path) = state.project_path(&pid) {
+    let project_path = state.project_path(&pid).ok();
+    if let Some(path) = &project_path {
         state.note_board_watched(&path.to_string_lossy());
     }
     let all = db
@@ -324,6 +426,10 @@ async fn tasks(
     // request a phone makes most, and it is the one that grows with the project.
     let runtime = db.list_task_runtime().unwrap_or_default();
 
+    // One lookup for the whole board, not one per card: every card here
+    // shares the same project's workflow config.
+    let workflow_ctx = project_path.as_deref().and_then(workflow_context_for);
+
     // Kick off a conflict pass for anything in Review whose answer is missing
     // or stale. It runs *after* this response: the board never waits on git.
     spawn_conflict_refresh(state.clone(), &pid, &all);
@@ -333,7 +439,7 @@ async fn tasks(
             .map(|t| {
                 let rt = runtime.iter().find(|r| r.task_id == t.id);
                 let conflict = state.conflicts.get(&t.id);
-                card(&db, t, rt, conflict)
+                card(&db, t, rt, conflict, workflow_ctx.as_ref())
             })
             .collect(),
     ))
@@ -477,9 +583,13 @@ async fn task_detail(
     let base_branch = t.base_branch.clone();
     let referenced_tasks = t.referenced_tasks.clone();
     let created_at = t.created_at.to_rfc3339();
+    let workflow_ctx = state
+        .project_path(&pid)
+        .ok()
+        .and_then(|p| workflow_context_for(&p));
 
     Ok(Json(TaskDetail {
-        card: card(&db, t, runtime.as_ref(), conflict),
+        card: card(&db, t, runtime.as_ref(), conflict, workflow_ctx.as_ref()),
         description,
         worktree_path,
         session_name,

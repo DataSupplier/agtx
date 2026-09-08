@@ -1,4 +1,4 @@
-mod app;
+pub(crate) mod app;
 pub mod board;
 pub mod config_editor;
 pub mod dep_graph;

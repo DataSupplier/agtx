@@ -7,6 +7,7 @@ pub mod mcp;
 pub mod skills;
 pub mod tmux;
 pub mod workflow;
+pub mod workflow_automation;
 pub mod workflow_executor;
 pub mod tui;
 pub mod update;
