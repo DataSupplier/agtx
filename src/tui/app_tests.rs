@@ -29,8 +29,11 @@ fn claude_policy_command_separates_allowed_tools_from_prompt() {
     let command =
         build_policy_agent_command(&agent_ops, "claude", "Review task F3.3", Some(&policy));
 
+    // Edit(path) alone covers file creation and modification -- see
+    // claude_policy_flags's doc comment. Write(path) is not emitted: Claude
+    // Code's own permission checker never consults it.
     assert!(command.contains(
-        "--allowed-tools 'Read,Glob,Grep,Bash(git status *),Edit(.agtx/plans/**),Write(.agtx/plans/**)' -- 'Review task F3.3'"
+        "--allowed-tools 'Read,Glob,Grep,Bash(git status *),Edit(.agtx/plans/**)' -- 'Review task F3.3'"
     ));
 }
 
@@ -73,7 +76,7 @@ fn claude_fresh_and_resume_grant_identical_tools_for_the_same_policy() {
     let resumed = build_policy_resume_command(&agent_ops, "claude", Some(&policy));
 
     let expected_tools =
-        "Read,Glob,Grep,Bash(ruff check *),Bash(mypy *),Edit(.agent-flow/implementation-result.yaml),Write(.agent-flow/implementation-result.yaml)";
+        "Read,Glob,Grep,Bash(ruff check *),Bash(mypy *),Edit(.agent-flow/implementation-result.yaml)";
     assert_eq!(allowed_tools_value(&fresh), expected_tools);
     assert_eq!(allowed_tools_value(&resumed), expected_tools);
     assert!(fresh.contains("--permission-mode dontAsk"));
@@ -81,19 +84,22 @@ fn claude_fresh_and_resume_grant_identical_tools_for_the_same_policy() {
 }
 
 /// The scenario from the reported incident: an implementer with `write_paths`
-/// resumed after a lost tmux window must carry `Edit`/`Write` for its result
+/// resumed after a lost tmux window must carry `Edit` for its result
 /// artifact and its `allowed_commands`, and must resume with `--continue`
-/// rather than a fresh prompt argument.
+/// rather than a fresh prompt argument. No `Write(path)` entry: it is a dead
+/// rule Claude Code's permission checker never consults (see
+/// `claude_policy_flags`'s doc comment) -- asserting its absence here guards
+/// against it silently creeping back in.
 #[test]
 #[cfg(feature = "test-mocks")]
-fn resumed_implementer_with_write_paths_preserves_edit_write_and_bash_entries() {
+fn resumed_implementer_with_write_paths_preserves_edit_and_bash_entries() {
     let agent_ops = MockAgentOperations::new();
     let policy = implementer_policy();
 
     let command = build_policy_resume_command(&agent_ops, "claude", Some(&policy));
 
     assert!(command.contains("Edit(.agent-flow/implementation-result.yaml)"));
-    assert!(command.contains("Write(.agent-flow/implementation-result.yaml)"));
+    assert!(!command.contains("Write("));
     assert!(command.contains("Bash(ruff check *)"));
     assert!(command.contains("Bash(mypy *)"));
     assert!(command.ends_with("--continue"));

@@ -12250,6 +12250,18 @@ fn build_policy_agent_command(
 /// `permission-mode` cannot drift out of sync between the two paths any more
 /// than the tool list can -- see the invariant on `build_policy_agent_command`.
 ///
+/// Emits only `Edit(path)` for each write path, never `Write(path)`. Verified
+/// against Claude Code's own bundled permission-rule validator: a `Write`,
+/// `MultiEdit`, or `NotebookEdit` rule is accepted as syntactically valid but
+/// never consulted by the actual file-permission check -- only `Edit(path)`
+/// gates every file-writing tool (and only `Read(path)` gates `Glob`). A
+/// `Write(path)` entry is therefore not a weaker or redundant grant; it is a
+/// dead one, present only to produce a startup warning
+/// ("... is not matched by file permission checks -- only Edit(path) rules
+/// are ..."). Emitting it doubled the tool list for no effect and, at scale,
+/// buried the one warning that matters (an unbound role -- see
+/// `resolve_task_workflow_policy`) in noise.
+///
 /// Preserves the pre-existing escaping behaviour exactly: a role policy's
 /// command/path entries are not shell-escaped here, only wrapped in single
 /// quotes, same as before this was extracted. A literal single quote in a
@@ -12258,7 +12270,7 @@ fn build_policy_agent_command(
 fn claude_policy_flags(role_policy: &WorkflowRolePolicy) -> String {
     let mut tools = vec!["Read".to_string(), "Glob".to_string(), "Grep".to_string()];
     tools.extend(role_policy.allowed_commands.iter().map(|command| format!("Bash({command} *)")));
-    tools.extend(role_policy.write_paths.iter().flat_map(|path| [format!("Edit({path})"), format!("Write({path})")]));
+    tools.extend(role_policy.write_paths.iter().map(|path| format!("Edit({path})")));
     format!("--permission-mode dontAsk --allowed-tools '{}'", tools.join(","))
 }
 
