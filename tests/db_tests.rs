@@ -1,6 +1,6 @@
 use agtx::db::{
-    Database, Notification, NotificationKind, PhaseStatus, Project, Task, TaskRuntime, TaskStatus,
-    TransitionRequest, WorkflowTaskState, WorkflowTransitionRecord,
+    Database, DependencyState, Notification, NotificationKind, PhaseStatus, Project, Task,
+    TaskRuntime, TaskStatus, TransitionRequest, WorkflowTaskState, WorkflowTransitionRecord,
 };
 
 // === TaskStatus Tests ===
@@ -965,4 +965,144 @@ fn deleting_a_task_removes_its_workflow_evidence() {
     db.delete_task(&task.id).unwrap();
     assert!(db.get_workflow_task_state(&task.id).unwrap().is_none());
     assert!(db.workflow_transition_history(&task.id).unwrap().is_empty());
+}
+
+// === Dependency State Tests ===
+
+/// A task with `status`, already stored, so dependents can reference it.
+fn stored_dep(db: &Database, title: &str, status: TaskStatus) -> Task {
+    let mut dep = Task::new(title, "claude", "proj");
+    dep.status = status;
+    db.create_task(&dep).unwrap();
+    dep
+}
+
+/// A task depending on `deps`, already stored.
+fn stored_dependent(db: &Database, title: &str, deps: &[&str]) -> Task {
+    let mut task = Task::new(title, "claude", "proj");
+    task.referenced_tasks = Some(deps.join(","));
+    db.create_task(&task).unwrap();
+    task
+}
+
+#[test]
+fn test_dependency_state_no_deps_is_ready() {
+    let db = Database::open_in_memory_project().unwrap();
+    let task = Task::new("No deps", "claude", "proj");
+    db.create_task(&task).unwrap();
+
+    assert_eq!(db.dependency_state(&task), DependencyState::Ready);
+    assert!(db.deps_satisfied(&task));
+}
+
+#[test]
+fn test_dependency_state_running_dep_blocks() {
+    let db = Database::open_in_memory_project().unwrap();
+    let dep = stored_dep(&db, "A", TaskStatus::Running);
+    let task = stored_dependent(&db, "B", &[&dep.id]);
+
+    assert_eq!(
+        db.dependency_state(&task),
+        DependencyState::Blocked(vec![dep.id.clone()])
+    );
+    assert!(!db.deps_satisfied(&task));
+}
+
+#[test]
+fn test_dependency_state_ready_once_dep_reaches_review() {
+    let db = Database::open_in_memory_project().unwrap();
+    let mut dep = stored_dep(&db, "A", TaskStatus::Running);
+    let task = stored_dependent(&db, "B", &[&dep.id]);
+    assert!(!db.deps_satisfied(&task));
+
+    dep.status = TaskStatus::Review;
+    db.update_task(&dep).unwrap();
+
+    assert_eq!(db.dependency_state(&task), DependencyState::Ready);
+    assert!(db.deps_satisfied(&task));
+}
+
+#[test]
+fn test_dependency_state_done_dep_is_ready() {
+    let db = Database::open_in_memory_project().unwrap();
+    let dep = stored_dep(&db, "A", TaskStatus::Done);
+    let task = stored_dependent(&db, "B", &[&dep.id]);
+
+    assert_eq!(db.dependency_state(&task), DependencyState::Ready);
+    assert!(db.deps_satisfied(&task));
+}
+
+#[test]
+fn test_dependency_state_deleted_dep_is_missing_but_ready() {
+    let db = Database::open_in_memory_project().unwrap();
+    let dep = stored_dep(&db, "A", TaskStatus::Running);
+    let task = stored_dependent(&db, "B", &[&dep.id]);
+
+    db.delete_task(&dep.id).unwrap();
+
+    assert_eq!(
+        db.dependency_state(&task),
+        DependencyState::Missing(vec![dep.id.clone()])
+    );
+    // A deleted dependency is no longer required, so it does not block.
+    assert!(db.deps_satisfied(&task));
+}
+
+#[test]
+fn test_dependency_state_reports_every_blocker() {
+    let db = Database::open_in_memory_project().unwrap();
+    let a = stored_dep(&db, "A", TaskStatus::Running);
+    let c = stored_dep(&db, "C", TaskStatus::Planning);
+    let d = stored_dep(&db, "D", TaskStatus::Done);
+    let task = stored_dependent(&db, "B", &[&a.id, &c.id, &d.id]);
+
+    assert_eq!(
+        db.dependency_state(&task),
+        DependencyState::Blocked(vec![a.id.clone(), c.id.clone()])
+    );
+}
+
+#[test]
+fn test_dependency_state_existing_blocker_outranks_missing() {
+    let db = Database::open_in_memory_project().unwrap();
+    let mut a = stored_dep(&db, "A", TaskStatus::Running);
+    let c = stored_dep(&db, "C", TaskStatus::Backlog);
+    let d = stored_dep(&db, "D", TaskStatus::Done);
+    let task = stored_dependent(&db, "B", &[&a.id, &c.id, &d.id]);
+    db.delete_task(&c.id).unwrap();
+
+    assert_eq!(
+        db.dependency_state(&task),
+        DependencyState::Blocked(vec![a.id.clone()])
+    );
+    assert!(!db.deps_satisfied(&task));
+
+    // The deleted dependency surfaces only once a real blocker clears, and it
+    // leaves the task safe to pick up.
+    a.status = TaskStatus::Review;
+    db.update_task(&a).unwrap();
+
+    assert_eq!(
+        db.dependency_state(&task),
+        DependencyState::Missing(vec![c.id.clone()])
+    );
+    assert!(db.deps_satisfied(&task));
+}
+
+#[test]
+fn test_dependency_state_helpers() {
+    assert!(DependencyState::Ready.is_ready());
+    assert!(DependencyState::Missing(vec!["gone".to_string()]).is_ready());
+    assert!(!DependencyState::Blocked(vec!["a".to_string()]).is_ready());
+
+    assert_eq!(
+        DependencyState::Blocked(vec!["a".to_string()]).blocked_by(),
+        ["a".to_string()]
+    );
+    assert!(DependencyState::Ready.blocked_by().is_empty());
+    assert_eq!(
+        DependencyState::Missing(vec!["gone".to_string()]).missing(),
+        ["gone".to_string()]
+    );
+    assert!(DependencyState::Ready.missing().is_empty());
 }

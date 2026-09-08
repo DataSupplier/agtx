@@ -19,6 +19,7 @@ import {
   PHASE,
   PRIMARY_ACTION,
   isStale,
+  laneOf,
   needsAttention,
 } from "./api.js";
 import { paintPane } from "./ansi.js";
@@ -511,6 +512,14 @@ async function screenProjects() {
   );
 }
 
+/// What a blocked card says. The count is what separates "one review away"
+/// from "waiting on four things"; older servers send no `blocked_by`, so the
+/// bare wording stays the fallback.
+function blockedText(task) {
+  const n = Array.isArray(task.blocked_by) ? task.blocked_by.length : 0;
+  return n ? `blocked on ${n} dep${n === 1 ? "" : "s"}` : "blocked on deps";
+}
+
 async function screenBoard(pid, column) {
   let tasks;
   let projects;
@@ -524,12 +533,12 @@ async function screenBoard(pid, column) {
   const project = projects.find((p) => p.id === pid);
   await reconcilePending(pid, tasks);
   const counts = Object.fromEntries(
-    COLUMNS.map((c) => [c.id, tasks.filter((t) => t.status === c.id).length]),
+    COLUMNS.map((c) => [c.id, tasks.filter((t) => laneOf(t) === c.id).length]),
   );
   // Open on the first column with anything in it, so a board whose work is all
   // in Running does not greet the user with an empty Backlog.
   const active = column || COLUMNS.find((c) => counts[c.id] > 0)?.id || "backlog";
-  const shown = tasks.filter((t) => t.status === active);
+  const shown = tasks.filter((t) => laneOf(t) === active);
 
   const segs = el(
     "div",
@@ -695,7 +704,7 @@ function taskCard(pid, t) {
       t.cycle > 1 ? el("span", { class: "chip", text: `cycle ${t.cycle}` }) : null,
       t.pr_number ? el("span", { class: "chip", text: `#${t.pr_number}` }) : null,
       t.deps_satisfied === false
-        ? el("span", { class: "chip deps", text: "blocked on deps" })
+        ? el("span", { class: "chip deps", text: blockedText(t) })
         : null,
       // `null` is "not checked yet", which must not read as clean — that is
       // the answer someone might merge on. Only a definite `true` shows.
@@ -812,7 +821,7 @@ function detailsBody(pid, task) {
     ["Base", task.base_branch || "—"],
     ["Worktree", task.worktree_path || "—"],
     ["Session", task.session_name || "—"],
-    ["Dependencies", task.deps_satisfied ? "satisfied" : "not satisfied"],
+    ["Dependencies", task.deps_satisfied ? "satisfied" : blockedText(task)],
     ["Updated", new Date(task.updated_at).toLocaleString()],
   ];
 

@@ -250,6 +250,9 @@ struct TaskCard {
     escalation_note: Option<String>,
     updated_at: String,
     deps_satisfied: bool,
+    /// Dependency ids still short of Review/Done. The board splits Backlog on
+    /// `deps_satisfied`; this says what a blocked card is waiting for.
+    blocked_by: Vec<String>,
     allowed_actions: Vec<String>,
     /// Declarative workflow state. Present only for tasks admitted through a
     /// state-machine plugin; legacy tasks continue to use `status`.
@@ -274,7 +277,8 @@ fn card(
     runtime: Option<&crate::db::TaskRuntime>,
     conflict: Option<ConflictState>,
 ) -> TaskCard {
-    let deps_ok = db.deps_satisfied(&t);
+    let dep_state = db.dependency_state(&t);
+    let deps_ok = dep_state.is_ready();
     let workflow_state = db
         .get_workflow_task_state(&t.id)
         .ok()
@@ -286,6 +290,7 @@ fn card(
         allowed_actions: allowed_actions(&t, deps_ok, CallerKind::Human),
         workflow_state,
         deps_satisfied: deps_ok,
+        blocked_by: dep_state.blocked_by().to_vec(),
         phase_status: runtime.map(|r| r.phase_status.as_str().to_string()),
         phase_age_secs: runtime.map(|r| (chrono::Utc::now() - r.updated_at).num_seconds()),
         id: t.id,

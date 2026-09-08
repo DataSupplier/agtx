@@ -152,23 +152,35 @@ fn workflow_artifact_value_reads_folded_yaml_scalar() {
 }
 
 #[test]
-fn visible_columns_use_all_columns_on_wide_terminals() {
+fn visible_columns_use_all_lanes_on_wide_terminals() {
+    assert_eq!(visible_column_range(0, 180), 0..6);
+    assert_eq!(visible_column_range(5, 168), 0..6);
+}
+
+#[test]
+fn visible_columns_drop_one_lane_below_the_widest_tier() {
     assert_eq!(visible_column_range(0, 160), 0..5);
-    assert_eq!(visible_column_range(4, 140), 0..5);
+    assert_eq!(visible_column_range(5, 140), 1..6);
 }
 
 #[test]
 fn visible_columns_follow_selection_on_standard_terminals() {
     assert_eq!(visible_column_range(0, 120), 0..3);
     assert_eq!(visible_column_range(2, 120), 1..4);
-    assert_eq!(visible_column_range(4, 120), 2..5);
+    assert_eq!(visible_column_range(5, 120), 3..6);
 }
 
 #[test]
 fn visible_columns_keep_two_usable_columns_on_narrow_terminals() {
     assert_eq!(visible_column_range(0, 80), 0..2);
     assert_eq!(visible_column_range(2, 80), 1..3);
-    assert_eq!(visible_column_range(4, 80), 3..5);
+    assert_eq!(visible_column_range(5, 80), 4..6);
+}
+
+#[test]
+fn blocked_badge_names_how_many_dependencies_are_outstanding() {
+    assert_eq!(blocked_badge(1), "\u{2298}1 ");
+    assert_eq!(blocked_badge(4), "\u{2298}4 ");
 }
 
 #[test]
@@ -209,9 +221,19 @@ fn styled_footer_emphasizes_shortcuts_without_changing_text() {
 
 #[test]
 fn footer_groups_related_shortcuts() {
-    let text = build_footer_text(None, false, 1, false, false);
+    let text = build_footer_text(None, false, 2, false, false);
     assert!(text.contains("[d] diff  ·  [m] run"), "{text}");
     assert!(text.contains("·  [?] help  [q] quit"), "{text}");
+}
+
+/// Backlog and Ready hold the same tasks, so they offer the same actions.
+#[test]
+fn footer_is_the_same_for_both_backlog_lanes() {
+    assert_eq!(
+        build_footer_text(None, false, 0, false, false),
+        build_footer_text(None, false, 1, false, false)
+    );
+    assert!(build_footer_text(None, false, 1, false, false).contains("[S] start planning"));
 }
 
 /// The footer is a summary now, not the list. It had reached 155 characters and
@@ -221,7 +243,7 @@ fn footer_groups_related_shortcuts() {
 fn every_footer_fits_a_narrow_terminal() {
     for cyclic in [false, true] {
         for fullscreen in [false, true] {
-            for column in 0..=4 {
+            for column in 0..=5 {
                 let text = build_footer_text(None, false, column, cyclic, fullscreen);
                 assert!(
                     text.chars().count() <= 120,
@@ -237,7 +259,7 @@ fn every_footer_fits_a_narrow_terminal() {
 #[test]
 fn every_footer_points_at_the_help_overlay() {
     for cyclic in [false, true] {
-        for column in 0..=4 {
+        for column in 0..=5 {
             let text = build_footer_text(None, false, column, cyclic, false);
             assert!(text.contains("[?] help"), "column {column}: {text}");
         }
@@ -1916,7 +1938,7 @@ fn test_footer_text_backlog_column() {
 
 #[test]
 fn test_footer_text_planning_column() {
-    let text = build_footer_text(None, false, 1, false, false);
+    let text = build_footer_text(None, false, 2, false, false);
     assert!(text.contains("[m] run"));
     assert!(!text.contains("[M] run"));
     assert!(!text.contains("[r] move left"));
@@ -1924,15 +1946,15 @@ fn test_footer_text_planning_column() {
 
 #[test]
 fn test_footer_text_running_column() {
-    let text = build_footer_text(None, false, 2, false, false);
+    let text = build_footer_text(None, false, 3, false, false);
     assert!(text.contains("[r] back"));
     assert!(text.contains("[m] move"));
 }
 
 #[test]
 fn test_footer_text_fullscreen_on_enter_hides_ctrl_f() {
-    // Columns 1-3 should hide [C-f] when fullscreen_on_enter is true
-    for col in 1..=3 {
+    // Planning through Review should hide [C-f] when fullscreen_on_enter is true
+    for col in 2..=4 {
         let text = build_footer_text(None, false, col, false, true);
         assert!(
             !text.contains("[C-f]"),
@@ -1941,7 +1963,7 @@ fn test_footer_text_fullscreen_on_enter_hides_ctrl_f() {
         );
     }
     // And show it when false
-    for col in 1..=3 {
+    for col in 2..=4 {
         let text = build_footer_text(None, false, col, false, false);
         assert!(
             text.contains("[C-f]"),
@@ -1953,14 +1975,14 @@ fn test_footer_text_fullscreen_on_enter_hides_ctrl_f() {
 
 #[test]
 fn test_footer_text_review_column() {
-    let text = build_footer_text(None, false, 3, false, false);
+    let text = build_footer_text(None, false, 4, false, false);
     assert!(text.contains("[r] back"));
     assert!(text.contains("[m] move"));
 }
 
 #[test]
 fn test_footer_text_review_column_cyclic() {
-    let text = build_footer_text(None, false, 3, true, false);
+    let text = build_footer_text(None, false, 4, true, false);
     assert!(text.contains("[p] next phase"));
     assert!(text.contains("[r] resume"));
     assert!(text.contains("[m] done"));
@@ -1968,7 +1990,7 @@ fn test_footer_text_review_column_cyclic() {
 
 #[test]
 fn test_footer_text_done_column() {
-    let text = build_footer_text(None, false, 4, false, false);
+    let text = build_footer_text(None, false, 5, false, false);
     assert!(!text.contains("[m] move"));
     assert!(!text.contains("[r]"));
     assert!(!text.contains("[d] diff"));
@@ -5709,9 +5731,15 @@ fn test_board_navigation_with_tasks() {
     app.refresh_tasks().unwrap();
     assert_eq!(app.state.board.tasks.len(), 2);
 
-    // Board starts at column 0 (Backlog), row 0
+    // Board starts at column 0 (Backlog), row 0. Both tasks are dependency-free,
+    // so they render one lane over, in Ready.
     assert_eq!(app.state.board.selected_column, 0);
     assert_eq!(app.state.board.selected_row, 0);
+    assert_eq!(app.state.board.tasks_in_column(1).len(), 2);
+
+    // Press 'l' to move to the Ready lane
+    press_key(&mut app, KeyCode::Char('l'));
+    assert_eq!(app.state.board.selected_column, 1);
 
     // Press 'j' to move down
     press_key(&mut app, KeyCode::Char('j'));
@@ -5721,13 +5749,13 @@ fn test_board_navigation_with_tasks() {
     press_key(&mut app, KeyCode::Char('k'));
     assert_eq!(app.state.board.selected_row, 0);
 
-    // Press 'l' to move to next column (Planning — empty, but cursor moves)
+    // Press 'l' again to reach Planning — empty, but the cursor moves
     press_key(&mut app, KeyCode::Char('l'));
-    assert_eq!(app.state.board.selected_column, 1);
+    assert_eq!(app.state.board.selected_column, 2);
 
     // Press 'h' to move back
     press_key(&mut app, KeyCode::Char('h'));
-    assert_eq!(app.state.board.selected_column, 0);
+    assert_eq!(app.state.board.selected_column, 1);
 }
 
 // --- Delete task flow ---
@@ -5743,6 +5771,8 @@ fn test_delete_task_confirm() {
         .unwrap();
     app.refresh_tasks().unwrap();
     assert_eq!(app.state.board.tasks.len(), 1);
+    // A task with no dependencies renders in Ready.
+    app.state.board.selected_column = 1;
 
     // Press 'x' to delete — should show confirmation popup
     press_key(&mut app, KeyCode::Char('x'));
@@ -5763,6 +5793,8 @@ fn test_delete_task_cancel() {
     db.create_task(&Task::new("Keep me", "claude", "test-project"))
         .unwrap();
     app.refresh_tasks().unwrap();
+    // A task with no dependencies renders in Ready.
+    app.state.board.selected_column = 1;
 
     press_key(&mut app, KeyCode::Char('x'));
     assert!(app.state.delete_confirm_popup.is_some());
@@ -16226,4 +16258,143 @@ fn queued_completion_allows_clean_worktree() {
         .unwrap()
         .error
         .is_none());
+}
+
+// --- Ready lane ---
+
+/// The Ready lane is a projection: a refresh recomputes dependency state, and a
+/// Backlog card crosses from Backlog to Ready without its status changing and
+/// without anything unlocking it explicitly.
+#[test]
+#[cfg(feature = "test-mocks")]
+fn refresh_moves_a_backlog_card_into_ready_when_its_dependency_reaches_review() {
+    let mut app = make_test_app();
+
+    let mut dep = Task::new("A", "claude", "test-project");
+    dep.status = TaskStatus::Running;
+    let mut task = Task::new("B", "claude", "test-project");
+    task.referenced_tasks = Some(dep.id.clone());
+    {
+        let db = app.state.db.as_ref().unwrap();
+        db.create_task(&dep).unwrap();
+        db.create_task(&task).unwrap();
+    }
+    app.refresh_tasks().unwrap();
+
+    assert_eq!(
+        app.state.board.dep_state(&task.id),
+        &crate::db::DependencyState::Blocked(vec![dep.id.clone()])
+    );
+    assert_eq!(
+        app.state
+            .board
+            .tasks_in_column(0)
+            .iter()
+            .map(|t| t.title.as_str())
+            .collect::<Vec<_>>(),
+        vec!["B"]
+    );
+    assert!(app.state.board.tasks_in_column(1).is_empty());
+
+    dep.status = TaskStatus::Review;
+    app.state.db.as_ref().unwrap().update_task(&dep).unwrap();
+    app.refresh_tasks().unwrap();
+
+    assert_eq!(
+        app.state.board.dep_state(&task.id),
+        &crate::db::DependencyState::Ready
+    );
+    assert!(app.state.board.tasks_in_column(0).is_empty());
+    assert_eq!(
+        app.state
+            .board
+            .tasks_in_column(1)
+            .iter()
+            .map(|t| t.title.as_str())
+            .collect::<Vec<_>>(),
+        vec!["B"]
+    );
+    // A itself moved on to the Review lane, which is what unblocked B.
+    assert_eq!(
+        app.state
+            .board
+            .tasks_in_column(4)
+            .iter()
+            .map(|t| t.title.as_str())
+            .collect::<Vec<_>>(),
+        vec!["A"]
+    );
+    // The lane moved; the stored status did not.
+    let saved = app
+        .state
+        .db
+        .as_ref()
+        .unwrap()
+        .get_task(&task.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.status, TaskStatus::Backlog);
+}
+
+/// A deleted dependency is not a blocker, so the card it left behind is safe to
+/// pick up and belongs in Ready.
+#[test]
+#[cfg(feature = "test-mocks")]
+fn a_card_whose_dependency_was_deleted_lands_in_ready() {
+    let mut app = make_test_app();
+
+    let dep = Task::new("A", "claude", "test-project");
+    let mut task = Task::new("B", "claude", "test-project");
+    task.referenced_tasks = Some(dep.id.clone());
+    {
+        let db = app.state.db.as_ref().unwrap();
+        db.create_task(&dep).unwrap();
+        db.create_task(&task).unwrap();
+        db.delete_task(&dep.id).unwrap();
+    }
+    app.refresh_tasks().unwrap();
+
+    assert_eq!(
+        app.state.board.dep_state(&task.id),
+        &crate::db::DependencyState::Missing(vec![dep.id.clone()])
+    );
+    assert_eq!(app.state.board.column_of(&app.state.board.tasks[0]), 1);
+}
+
+/// The Ready lane adds no transition of its own: the gate that stops a blocked
+/// Backlog card still stops it, and it stays in Backlog.
+#[test]
+#[cfg(feature = "test-mocks")]
+fn a_blocked_backlog_card_still_cannot_move_right() {
+    let mut app = make_test_app();
+
+    let mut dep = Task::new("A", "claude", "test-project");
+    dep.status = TaskStatus::Running;
+    let mut task = Task::new("B", "claude", "test-project");
+    task.referenced_tasks = Some(dep.id.clone());
+    {
+        let db = app.state.db.as_ref().unwrap();
+        db.create_task(&dep).unwrap();
+        db.create_task(&task).unwrap();
+    }
+    app.refresh_tasks().unwrap();
+    app.state.board.selected_column = 0; // Backlog: the blocked card
+    app.state.board.selected_row = 0;
+
+    app.move_task_right().unwrap();
+
+    assert!(app
+        .state
+        .warning_message
+        .as_ref()
+        .is_some_and(|(msg, _)| msg.contains("Dependencies not in Review/Done")));
+    let saved = app
+        .state
+        .db
+        .as_ref()
+        .unwrap()
+        .get_task(&task.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.status, TaskStatus::Backlog);
 }

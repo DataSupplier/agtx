@@ -35,7 +35,7 @@ use crate::workflow::{GuardContext, ResolvedWorkflowPolicy, WorkflowProjectConfi
 use crate::workflow_executor::{prepare_admission, prepare_transition};
 use crate::AppMode;
 
-use super::board::BoardState;
+use super::board::{BoardState, DisplayLane};
 use super::config_editor::{ConfigEditor, EditorAction, FieldKind};
 use super::help;
 use super::shell_popup::{self, ShellPopup};
@@ -71,14 +71,16 @@ fn build_footer_text(
                 } else {
                     "  [C-f] fullscreen"
                 };
+                // Backlog and Ready are both TaskStatus::Backlog, so they offer
+                // the same actions; the gate only lets them through from Ready.
                 match selected_column {
-                    0 => "[o] new  [Enter] edit  [d] diff  ·  [A] admit  [S] start planning  ·  [?] help  [q] quit".to_string(),
-                    1 => format!("[o] new  [Enter] open{fullscreen}  [d] diff  ·  [m] run  ·  [?] help  [q] quit"),
-                    2 => format!("[o] new  [Enter] open{fullscreen}  [d] diff  ·  [r] back  [m] move  ·  [?] help  [q] quit"),
-                    3 if has_cyclic_plugin => format!(
+                    0 | 1 => "[o] new  [Enter] edit  [d] diff  ·  [A] admit  [S] start planning  ·  [?] help  [q] quit".to_string(),
+                    2 => format!("[o] new  [Enter] open{fullscreen}  [d] diff  ·  [m] run  ·  [?] help  [q] quit"),
+                    3 => format!("[o] new  [Enter] open{fullscreen}  [d] diff  ·  [r] back  [m] move  ·  [?] help  [q] quit"),
+                    4 if has_cyclic_plugin => format!(
                         "[o] new  [Enter] open{fullscreen}  ·  [r] resume  [p] next phase  [m] done  ·  [?] help  [q] quit"
                     ),
-                    3 => format!("[o] new  [Enter] open{fullscreen}  [d] diff  ·  [r] back  [m] move  ·  [?] help  [q] quit"),
+                    4 => format!("[o] new  [Enter] open{fullscreen}  [d] diff  ·  [r] back  [m] move  ·  [?] help  [q] quit"),
                     _ => "[o] new  [Enter] open  [x] delete  ·  [?] help  [q] quit".to_string(),
                 }
             }
@@ -125,17 +127,28 @@ fn styled_footer(text: &str, styles: TuiStyles) -> Line<'static> {
 }
 
 fn visible_column_range(selected: usize, width: u16) -> std::ops::Range<usize> {
-    let visible = if width >= 140 {
+    let lanes = DisplayLane::lanes().len();
+    let visible = if width >= 168 {
+        6
+    } else if width >= 140 {
         5
     } else if width >= 96 {
         3
     } else {
         2
-    };
+    }
+    .min(lanes);
     let start = selected
         .saturating_sub(visible / 2)
-        .min(5usize.saturating_sub(visible));
+        .min(lanes.saturating_sub(visible));
     start..start + visible
+}
+
+/// The prefix a blocked Backlog card wears: the lock glyph plus how many
+/// dependencies are still short of Review/Done. The count is what tells apart
+/// "one more review away" from "waiting on four things".
+fn blocked_badge(blocked_count: usize) -> String {
+    format!("\u{2298}{blocked_count} ")
 }
 
 /// Terminal cells are typically about twice as tall as they are wide, so a
@@ -435,8 +448,7 @@ struct AppState {
     // Update popup ([u]) and the background install it can start
     update_popup: Option<UpdatePopup>,
     update_install_rx: Option<mpsc::Receiver<Result<String, String>>>,
-    // Cache of dependency satisfaction per task ID (refreshed with tasks)
-    deps_satisfied_cache: HashMap<String, bool>,
+
     // Full-screen dependency-graph overlay (Shift+D)
     dep_graph_popup: Option<DepGraphPopup>,
     /// The `W` overlay: serve the board to a phone, and manage paired devices.
@@ -942,7 +954,6 @@ impl App {
                 update_available: None,
                 update_popup: None,
                 update_install_rx: None,
-                deps_satisfied_cache: HashMap::new(),
                 dep_graph_popup: None,
                 mobile_popup: None,
                 serve_session: None,
@@ -1193,7 +1204,6 @@ impl App {
                 update_available: None,
                 update_popup: None,
                 update_install_rx: None,
-                deps_satisfied_cache: HashMap::new(),
                 dep_graph_popup: None,
                 mobile_popup: None,
                 serve_session: None,
@@ -1715,15 +1725,15 @@ impl App {
         }
         let board_areas = Layout::horizontal(constraints).split(chunks[1]);
 
-        let statuses = TaskStatus::columns();
+        let lanes = DisplayLane::lanes();
         for (slot, i) in visible_range.enumerate() {
-            let status = &statuses[i];
+            let lane = lanes[i];
             let column_area = board_areas[slot * 2];
             let tasks: Vec<&Task> = state
                 .board
                 .tasks
                 .iter()
-                .filter(|t| t.status == *status)
+                .filter(|t| state.board.lane_of(t) == lane)
                 .collect();
 
             let is_selected_column = state.board.selected_column == i;
@@ -1742,7 +1752,7 @@ impl App {
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled(
-                        format!(" {}", status.display_name().to_uppercase()),
+                        format!(" {}", lane.display_name().to_uppercase()),
                         title_style,
                     ),
                     count,
@@ -1815,10 +1825,7 @@ impl App {
                     break;
                 }
 
-                let deps_blocked = state
-                    .deps_satisfied_cache
-                    .get(&task.id)
-                    .map_or(false, |satisfied| !satisfied);
+                let blocker_count = state.board.dep_state(&task.id).blocked_by().len();
                 Self::draw_task_card(
                     frame,
                     task,
@@ -1826,7 +1833,7 @@ impl App {
                     is_selected,
                     &state.config.theme,
                     state.phase_status_cache.get(&task.id),
-                    deps_blocked,
+                    blocker_count,
                 );
             }
 
@@ -3051,7 +3058,7 @@ impl App {
         is_selected: bool,
         theme: &ThemeConfig,
         phase_status: Option<&(PhaseStatus, Instant)>,
-        deps_blocked: bool,
+        blocked_count: usize,
     ) {
         let styles = TuiStyles::from_theme(theme);
         let border_style = if is_selected {
@@ -3153,9 +3160,9 @@ impl App {
                 height: 1,
             };
             frame.render_widget(title_line, title_area);
-        } else if deps_blocked {
+        } else if blocked_count > 0 {
             let lock_span = Span::styled(
-                "\u{2298} ",
+                blocked_badge(blocked_count),
                 Style::default().fg(hex_to_color(&theme.color_dimmed)),
             );
             let title_spans = Line::from(vec![lock_span, Span::styled(title, title_style)]);
@@ -4239,25 +4246,32 @@ impl App {
             KeyCode::Enter => {
                 // Jump to selected task and open it
                 if let Some(ref search) = self.state.task_search {
-                    if let Some((task_id, _, status)) = search.matches.get(search.selected).cloned()
-                    {
-                        // Find column index for this status
-                        let col_idx = TaskStatus::columns()
-                            .iter()
-                            .position(|s| *s == status)
-                            .unwrap_or(0);
-                        self.state.board.selected_column = col_idx;
-
-                        // Find row index for this task
-                        let tasks_in_col: Vec<_> = self
+                    if let Some((task_id, _, _)) = search.matches.get(search.selected).cloned() {
+                        // A Backlog hit lands in Backlog or Ready depending on
+                        // its dependencies, so the lane has to come from the
+                        // task on the board rather than from its status alone.
+                        let target = self
                             .state
                             .board
                             .tasks
                             .iter()
-                            .filter(|t| t.status == status)
-                            .collect();
-                        if let Some(row_idx) = tasks_in_col.iter().position(|t| t.id == task_id) {
-                            self.state.board.selected_row = row_idx;
+                            .find(|t| t.id == task_id)
+                            .map(|t| (self.state.board.column_of(t), self.state.board.lane_of(t)));
+                        if let Some((col_idx, lane)) = target {
+                            self.state.board.selected_column = col_idx;
+
+                            // Find row index for this task
+                            let tasks_in_col: Vec<_> = self
+                                .state
+                                .board
+                                .tasks
+                                .iter()
+                                .filter(|t| self.state.board.lane_of(t) == lane)
+                                .collect();
+                            if let Some(row_idx) = tasks_in_col.iter().position(|t| t.id == task_id)
+                            {
+                                self.state.board.selected_row = row_idx;
+                            }
                         }
                     }
                 }
@@ -5440,6 +5454,7 @@ impl App {
             Some(wizard.prompt.buffer.clone())
         };
 
+        let mut created_id = None;
         match wizard.editing_task_id.clone() {
             Some(task_id) => {
                 if let Some(mut task) = db.get_task(&task_id)? {
@@ -5461,9 +5476,37 @@ impl App {
                 // Task starts in Backlog without tmux window.
                 // No orchestrator notification — it only manages Planning/Running.
                 db.create_task(&task)?;
+                created_id = Some(task.id.clone());
             }
         }
-        self.refresh_tasks()
+        self.refresh_tasks()?;
+        // A new task lands in Backlog or Ready depending on its references, so
+        // the cursor has to follow it: otherwise creating a task leaves the
+        // selection on an empty lane and the next keystroke acts on nothing.
+        if let Some(id) = created_id {
+            self.select_task(&id);
+        }
+        Ok(())
+    }
+
+    /// Put the cursor on a task wherever it currently renders.
+    fn select_task(&mut self, task_id: &str) {
+        let Some(task) = self.state.board.tasks.iter().find(|t| t.id == task_id) else {
+            return;
+        };
+        let lane = self.state.board.lane_of(task);
+        let column = self.state.board.column_of(task);
+        let row = self
+            .state
+            .board
+            .tasks
+            .iter()
+            .filter(|t| self.state.board.lane_of(t) == lane)
+            .position(|t| t.id == task_id);
+        if let Some(row) = row {
+            self.state.board.selected_column = column;
+            self.state.board.selected_row = row;
+        }
     }
 
     /// On a first launch, ask which agent to use in the editor that owns that
@@ -8882,15 +8925,18 @@ impl App {
     pub fn refresh_tasks(&mut self) -> Result<()> {
         if let Some(db) = &self.state.db {
             self.state.board.tasks = db.get_all_tasks()?;
-            // Refresh dependency satisfaction cache for backlog tasks with references
-            self.state.deps_satisfied_cache.clear();
+            // Recompute dependency state for tasks with references. Lanes are
+            // derived from this, so a status change elsewhere in the graph moves
+            // its dependents between Backlog and Ready on the next refresh —
+            // nothing unlocks a task explicitly.
+            let mut dep_states = std::mem::take(&mut self.state.board.dep_states);
+            dep_states.clear();
             for task in &self.state.board.tasks {
                 if task.referenced_tasks.is_some() {
-                    self.state
-                        .deps_satisfied_cache
-                        .insert(task.id.clone(), db.deps_satisfied(task));
+                    dep_states.insert(task.id.clone(), db.dependency_state(task));
                 }
             }
+            self.state.board.dep_states = dep_states;
         }
         Ok(())
     }
