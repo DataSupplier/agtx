@@ -71,3 +71,26 @@ test('refresh replaces a suspended socket without replacing input DOM', async ()
   assert.equal(run('term.pane === originalPane'), true);
   assert.equal(connections[0].readyState, 3);
 });
+
+// The Ready lane, mirrored from the TUI: a backlog card whose dependencies are
+// all in Review/Done shows up under Ready, and no other status is affected.
+const { COLUMNS, laneOf } = await import('../web/api.js');
+
+test('backlog splits into Backlog and Ready on dependency state', () => {
+  assert.equal(laneOf({ status: 'backlog', deps_satisfied: false }), 'backlog');
+  assert.equal(laneOf({ status: 'backlog', deps_satisfied: true }), 'ready');
+});
+
+test('lane follows status once a task has been picked up', () => {
+  for (const status of ['planning', 'running', 'review', 'done']) {
+    assert.equal(laneOf({ status, deps_satisfied: false }), status);
+    assert.equal(laneOf({ status, deps_satisfied: true }), status);
+  }
+});
+
+test('ready sits between backlog and planning', () => {
+  assert.deepEqual(
+    COLUMNS.map((c) => c.id),
+    ['backlog', 'ready', 'planning', 'running', 'review', 'done'],
+  );
+});

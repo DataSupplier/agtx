@@ -266,6 +266,9 @@ struct TaskSummary {
     referenced_tasks: Option<String>,
     base_branch: Option<String>,
     deps_satisfied: bool,
+    /// Dependency ids still short of Review/Done — empty when the task can be
+    /// picked up. Names *what* to wait for, next to `deps_satisfied`'s whether.
+    blocked_by: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -292,6 +295,9 @@ struct TaskDetail {
     deps_satisfied: bool,
     /// Dependencies that are not yet in Review or Done status.
     blocking_tasks: Vec<BlockingTask>,
+    /// Referenced ids with no task behind them. A deleted dependency does not
+    /// block, so these are reported rather than counted as blockers.
+    missing_deps: Vec<String>,
     /// Actions the orchestrator can take on this task given its current status and plugin rules.
     allowed_actions: Vec<String>,
     /// The agent's own report of what it is doing: "working", "blocked",
@@ -535,7 +541,9 @@ impl AgtxMcpServer {
                         let summaries: Vec<TaskSummary> = tasks
                             .into_iter()
                             .map(|t| {
-                                let deps_satisfied = db.deps_satisfied(&t);
+                                let dep_state = db.dependency_state(&t);
+                                let deps_satisfied = dep_state.is_ready();
+                                let blocked_by = dep_state.blocked_by().to_vec();
                                 TaskSummary {
                                     id: t.id,
                                     title: t.title,
@@ -548,6 +556,7 @@ impl AgtxMcpServer {
                                     referenced_tasks: t.referenced_tasks,
                                     base_branch: t.base_branch,
                                     deps_satisfied,
+                                    blocked_by,
                                 }
                             })
                             .collect();
@@ -569,28 +578,23 @@ impl AgtxMcpServer {
         match self.open_project_db_for(params.project_id.as_deref()) {
             Ok(db) => match db.get_task(&params.task_id) {
                 Ok(Some(t)) => {
-                    let deps_ok = db.deps_satisfied(&t);
+                    let dep_state = db.dependency_state(&t);
+                    let deps_ok = dep_state.is_ready();
                     let allowed = self.allowed_actions(&t, deps_ok);
-                    let blocking = match &t.referenced_tasks {
-                        Some(refs) if !refs.is_empty() => refs
-                            .split(',')
-                            .filter(|s| !s.is_empty())
-                            .filter_map(|ref_id| {
-                                db.get_task(ref_id)
-                                    .ok()
-                                    .flatten()
-                                    .filter(|dep| {
-                                        !matches!(dep.status, TaskStatus::Review | TaskStatus::Done)
-                                    })
-                                    .map(|dep| BlockingTask {
-                                        id: dep.id,
-                                        title: dep.title,
-                                        status: dep.status.as_str().to_string(),
-                                    })
-                            })
-                            .collect(),
-                        _ => Vec::new(),
-                    };
+                    // One rule for what blocks a task lives in
+                    // `Database::dependency_state`; this only adds the titles a
+                    // caller needs to report the wait.
+                    let blocking: Vec<BlockingTask> = dep_state
+                        .blocked_by()
+                        .iter()
+                        .filter_map(|ref_id| db.get_task(ref_id).ok().flatten())
+                        .map(|dep| BlockingTask {
+                            id: dep.id,
+                            title: dep.title,
+                            status: dep.status.as_str().to_string(),
+                        })
+                        .collect();
+                    let missing_deps = dep_state.missing().to_vec();
                     // Read the agent's own status file, written by its hooks.
                     // Works cross-process precisely because it is a file rather
                     // than TUI state.
@@ -633,6 +637,7 @@ impl AgtxMcpServer {
                         updated_at: t.updated_at.to_rfc3339(),
                         deps_satisfied: deps_ok,
                         blocking_tasks: blocking,
+                        missing_deps,
                         allowed_actions: allowed,
                         agent_state,
                         blocked_reason,

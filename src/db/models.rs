@@ -55,6 +55,49 @@ impl TaskStatus {
     }
 }
 
+/// Whether a task's dependencies allow it to be picked up, and which
+/// dependencies stand in the way.
+///
+/// Derived from the task graph on every read and never persisted. It answers
+/// "is this task safe to pick up?", a different question from [`TaskStatus`]'s
+/// "where is this task in its lifecycle?".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DependencyState {
+    /// No dependencies, or every one of them is in Review or Done.
+    Ready,
+    /// Dependencies that exist but have not reached Review or Done. Carries
+    /// every blocker rather than the first, so a card can name all of them.
+    Blocked(Vec<String>),
+    /// Referenced tasks that no longer exist. A deleted dependency reads as
+    /// "no longer required", so this state is still safe to pick up.
+    Missing(Vec<String>),
+}
+
+impl DependencyState {
+    /// Whether the task may be started. Missing dependencies count as ready:
+    /// deleting a task must not leave its dependents blocked forever.
+    pub fn is_ready(&self) -> bool {
+        matches!(self, DependencyState::Ready | DependencyState::Missing(_))
+    }
+
+    /// Dependency ids holding the task back; empty unless the state is Blocked.
+    pub fn blocked_by(&self) -> &[String] {
+        match self {
+            DependencyState::Blocked(ids) => ids,
+            _ => &[],
+        }
+    }
+
+    /// Referenced ids with no task behind them. Populated only when nothing
+    /// else blocks the task — an existing blocker outranks a deleted one.
+    pub fn missing(&self) -> &[String] {
+        match self {
+            DependencyState::Missing(ids) => ids,
+            _ => &[],
+        }
+    }
+}
+
 /// A task on the kanban board
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {

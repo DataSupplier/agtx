@@ -196,12 +196,41 @@ Backlog → Planning → Running → Review → Done
 ```
 
 - **Backlog**: Task ideas, not started. Also hosts the optional **Research** phase (`R`) — the research session runs in place, so a Backlog task can already have a worktree and tmux window. There is no separate `Research` status: `TaskStatus` is `Backlog | Planning | Running | Review | Done`, and Backlog's display name is `backlog/research`.
+- **Ready**: a board lane, not a status. See "The Ready lane" below.
 - **Planning**: Creates git worktree at `{worktree_dir}/{slug}` (default `.agtx/worktrees/{slug}`, configurable via `worktree_dir`), copies configured files, runs init script, deploys skills, starts agent in planning mode
 - **Running**: Agent is implementing (sends execute command/prompt)
 - **Review**: Optionally create PR. Tmux window stays open. Can resume to address feedback
 - **Done**: Cleanup worktree + tmux window (branch kept locally). Runs the project `cleanup_script` before removal
 
 Backlog tasks can also skip straight to Running (`M`), and Running can be sent back to Planning (`r`).
+
+#### The Ready lane
+
+The board shows six lanes over the five statuses:
+
+```
+Backlog → Ready → Planning → Running → Review → Done
+```
+
+`Ready` is a projection, not a lifecycle state — nothing persists it and no transition targets it.
+Three types keep the questions apart:
+
+- `TaskStatus` — where a task is in its lifecycle. Unchanged, still five variants.
+- `DependencyState` (`db/models.rs`) — `Ready | Blocked(ids) | Missing(ids)`, computed by
+  `Database::dependency_state`. An existing dependency short of Review/Done outranks a deleted one,
+  so a task with both is `Blocked`; `Missing` surfaces only once the real blockers clear.
+  `deps_satisfied()` is `dependency_state().is_ready()`, which keeps deleted dependencies
+  non-blocking as before.
+- `DisplayLane` (`tui/board.rs`) — where the card belongs. `display_lane()` sends a Backlog task to
+  `Ready` when its dependency state is safe to pick up, and every other status to its own lane.
+
+`refresh_tasks` caches `HashMap<TaskId, DependencyState>` on `BoardState`, so a status change
+anywhere in the graph moves dependents between Backlog and Ready on the next refresh — there is no
+`unlock` operation. Moving a card right out of Ready persists `Backlog → Planning`, and the existing
+`deps_satisfied` gate still refuses a blocked Backlog card. Blocked cards wear `⊘N`, where N is how
+many dependencies are outstanding; the phone board splits the same way (`laneOf` in `web/api.js`),
+and MCP reports the ids in `blocked_by` (`list_tasks`) and `blocking_tasks` / `missing_deps`
+(`get_task`).
 
 #### Removing a worktree
 
@@ -878,7 +907,7 @@ color_popup_header = "#69fae7"  # Popup headers (light cyan)
 ### Board Mode
 | Key | Action |
 |-----|--------|
-| `h/l` or arrows | Move between columns |
+| `h/l` or arrows | Move between columns (Backlog, Ready, Planning, Running, Review, Done) |
 | `j/k` or arrows | Move between tasks |
 | `o` | Create new task |
 | `Enter` | Open task popup (tmux view) / Edit task (backlog) |
@@ -1271,7 +1300,7 @@ writes one.
 - In description input, type `!` (at start of line or after space) to search existing tasks
 - Selecting a task inserts `![task-title]` and tracks the reference ID
 - Referenced task IDs stored as comma-separated string in `task.referenced_tasks`
-- References double as **dependencies**: `Database::deps_satisfied` returns true only when every referenced task is in Review or Done. Starting research or moving a Backlog task forward is blocked until then (a warning is shown instead)
+- References double as **dependencies**: `Database::deps_satisfied` returns true only when every referenced task is in Review or Done. Starting research or moving a Backlog task forward is blocked until then (a warning is shown instead). `Database::dependency_state` answers the same question in more detail (`Ready` / `Blocked(ids)` / `Missing(ids)`) and is what the board's Ready lane projects from
 - `src/tui/dep_graph.rs` builds a topologically-leveled `DepGraph` from `referenced_tasks` — level 0 = no in-graph deps, and a node is `unblocked` when it is in Backlog with satisfied deps. The `D` overlay renders it and can batch-move unblocked tasks. The module is free of ratatui/DB types (the caller passes a `deps_satisfied` closure), so it is unit-testable in isolation
 - MCP `create_tasks_batch` wires the same dependencies via 0-based `depends_on` indices
 - At worktree setup, referenced tasks' artifacts are copied to `.agtx/references/`:

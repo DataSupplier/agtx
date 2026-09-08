@@ -334,6 +334,12 @@ async fn unsatisfied_dependencies_hide_the_forward_moves() {
         .find(|c| c["id"] == blocked.id)
         .unwrap();
     assert_eq!(card["deps_satisfied"], false);
+    // The card also names what it waits for, so the phone can say how many
+    // dependencies are outstanding rather than only that some are.
+    assert_eq!(
+        card["blocked_by"].as_array().unwrap(),
+        &vec![serde_json::json!(dep.id)]
+    );
     let actions: Vec<&str> = card["allowed_actions"]
         .as_array()
         .unwrap()

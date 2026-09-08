@@ -202,15 +202,27 @@ export const PRIMARY_ACTION = {
   review: "move_to_done",
 };
 
-/// The board's five columns, in board order. `backlog` carries research, which
-/// is why its label is not just "Backlog" — it matches `TaskStatus::display_name`.
+/// The board's six lanes, in board order. `backlog` carries research, and it
+/// splits in two: a backlog task whose dependencies are all in Review/Done
+/// shows up under Ready, so what can be picked up now is visible without
+/// opening a card. `ready` is a lane, never a status — the server stores
+/// `backlog` for both, and the same actions apply to each.
 export const COLUMNS = [
   { id: "backlog", label: "Backlog" },
+  { id: "ready", label: "Ready" },
   { id: "planning", label: "Planning" },
   { id: "running", label: "Running" },
   { id: "review", label: "Review" },
   { id: "done", label: "Done" },
 ];
+
+/// The lane a card belongs to: its status, except that backlog splits on
+/// whether the task's dependencies let it be picked up. Mirrors the TUI's
+/// `display_lane`.
+export function laneOf(task) {
+  if (task.status !== "backlog") return task.status;
+  return task.deps_satisfied ? "ready" : "backlog";
+}
 
 /// Phase glyphs, matching the TUI's vocabulary so the two views read the same.
 export const PHASE = {

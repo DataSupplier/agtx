@@ -3,8 +3,8 @@ use rusqlite::{params, Connection};
 use std::path::Path;
 
 use super::models::{
-    MobileDevice, Notification, NotificationKind, PhaseStatus, Project, Task, TaskRuntime,
-    TaskStatus, TransitionRequest, WorkflowTaskState, WorkflowTransitionRecord,
+    DependencyState, MobileDevice, Notification, NotificationKind, PhaseStatus, Project, Task,
+    TaskRuntime, TaskStatus, TransitionRequest, WorkflowTaskState, WorkflowTransitionRecord,
 };
 
 /// Database wrapper for SQLite operations
@@ -774,18 +774,43 @@ impl Database {
         Ok(tasks)
     }
 
-    /// Check whether all referenced_tasks (dependencies) are in Review or Done.
-    /// Returns true if the task has no dependencies or all deps are satisfied.
-    pub fn deps_satisfied(&self, task: &Task) -> bool {
+    /// Classify a task's referenced_tasks (dependencies) as Ready, Blocked or
+    /// Missing.
+    ///
+    /// An existing dependency short of Review/Done outranks a deleted one: a
+    /// task with both is Blocked, and only once the real blockers clear does
+    /// the Missing list surface. Both lists carry every id, not the first.
+    pub fn dependency_state(&self, task: &Task) -> DependencyState {
         let refs_str = match &task.referenced_tasks {
             Some(s) if !s.is_empty() => s,
-            _ => return true,
+            _ => return DependencyState::Ready,
         };
-        refs_str.split(',').filter(|s| !s.is_empty()).all(|ref_id| {
-            self.get_task(ref_id).ok().flatten().map_or(true, |t| {
-                matches!(t.status, TaskStatus::Review | TaskStatus::Done)
-            })
-        })
+        let mut blocked = Vec::new();
+        let mut missing = Vec::new();
+        for ref_id in refs_str.split(',').filter(|s| !s.is_empty()) {
+            match self.get_task(ref_id).ok().flatten() {
+                Some(dep) => {
+                    if !matches!(dep.status, TaskStatus::Review | TaskStatus::Done) {
+                        blocked.push(dep.id);
+                    }
+                }
+                None => missing.push(ref_id.to_string()),
+            }
+        }
+        if !blocked.is_empty() {
+            DependencyState::Blocked(blocked)
+        } else if !missing.is_empty() {
+            DependencyState::Missing(missing)
+        } else {
+            DependencyState::Ready
+        }
+    }
+
+    /// Check whether all referenced_tasks (dependencies) are in Review or Done.
+    /// Returns true if the task has no dependencies or all deps are satisfied.
+    /// Deleted dependencies count as satisfied.
+    pub fn deps_satisfied(&self, task: &Task) -> bool {
+        self.dependency_state(task).is_ready()
     }
 
     // === Project Operations (for global db) ===
