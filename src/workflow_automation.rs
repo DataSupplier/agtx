@@ -40,7 +40,7 @@ use crate::config::WorkflowPlugin;
 use crate::db::{Database, Task, TaskStatus};
 use crate::workflow::{WorkflowDefinition, WorkflowProjectConfig};
 use crate::workflow_executor::{
-    admit_task, assess, complete_feature_integration, decide_workflow_plan,
+    admit_task, assess, complete_admission, complete_feature_integration, decide_workflow_plan,
     start_workflow_implementation, submit_engineering_review, submit_final_validation,
     submit_workflow_implementation, submit_workflow_plan, AutomationDecision, WorkflowRuntime,
     WorkflowStepOutcome,
@@ -189,6 +189,13 @@ pub fn run_automation_tick(
 /// no-guard, no-role holding state (see `assess`'s own doc comment), so
 /// there is nothing to route here, and this driver must never call it
 /// itself regardless.
+///
+/// `admission_complete` (`admission` -> `ready_for_planning`) is dispatched
+/// to the standalone, launch-free [`complete_admission`] rather than to
+/// [`start_workflow_planning`] (which fuses the same transition with
+/// launching the planner, for the manual `Shift+S` path) — this is what lets
+/// automation carry a dependency-clean task all the way to
+/// `ready_for_planning` without ever starting an agent on its own.
 fn dispatch_advance(
     action: &str,
     workflow: &WorkflowDefinition,
@@ -199,6 +206,7 @@ fn dispatch_advance(
     runtime: &WorkflowRuntime,
 ) -> anyhow::Result<WorkflowStepOutcome> {
     match action {
+        "admission_complete" => complete_admission(workflow, project, task, db),
         "submit_plan" => submit_workflow_plan(workflow, project, plugin, task, db, runtime),
         "approve_plan" => decide_workflow_plan(workflow, project, plugin, task, true, db, runtime),
         "plan_changes_requested" => {

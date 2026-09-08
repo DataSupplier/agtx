@@ -287,6 +287,48 @@ pub fn admit_task(
     })
 }
 
+/// Standalone execution of the `admission_complete` transition
+/// (`admission` -> `ready_for_planning`).
+///
+/// No artifact, no agent launch, no `TaskStatus` change — this is a pure
+/// dependency-projection step, safe for automation to perform on its own.
+/// The manual `Shift+S` keybinding never calls this directly: it fuses this
+/// same transition together with `start_planning` inside
+/// [`start_workflow_planning`], since a human pressing Shift+S wants the
+/// planner launched immediately. Automation is different: it stops here,
+/// leaving a task visibly parked in `ready_for_planning` (still `Backlog` on
+/// the board) until a human deliberately commits it into `planning`.
+pub fn complete_admission(
+    workflow: &WorkflowDefinition,
+    project_workflow: &WorkflowProjectConfig,
+    task: Task,
+    db: &mut Database,
+) -> Result<WorkflowStepOutcome> {
+    let Some(current) = db.get_workflow_task_state(&task.id)? else {
+        return Ok(WorkflowStepOutcome::NoOp);
+    };
+    if current.state != "admission" {
+        return Ok(WorkflowStepOutcome::Blocked {
+            message: "admission_complete is only available in Admission".into(),
+        });
+    }
+    let ready = prepare_transition(
+        workflow,
+        project_workflow,
+        &current,
+        "admission_complete",
+        GuardContext {
+            admission_recorded: true,
+            ..GuardContext::default()
+        },
+    )?;
+    db.advance_workflow_state(&ready.state, &ready.transition)?;
+    Ok(WorkflowStepOutcome::Advanced {
+        message: "Admission complete — ready for planning".to_string(),
+        task,
+    })
+}
+
 /// Extracted body of `App::start_selected_workflow_planning`.
 ///
 /// Planning is deliberately restartable: a task can retain its durable
