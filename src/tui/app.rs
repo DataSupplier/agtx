@@ -12297,13 +12297,22 @@ fn build_policy_agent_command(
         .unwrap_or_default();
     if agent == "codex" {
         let sandbox = if policy.role_policy.write_paths.is_empty() { "read-only" } else { "workspace-write" };
+        // Codex's workspace-write sandbox has networking disabled by default.
+        // A state must opt in explicitly before a reviewer can contact an
+        // in-scope companion API or dedicated test database. This does not
+        // widen filesystem scope, and keeps review/integration isolated.
+        let network_config = if policy.network {
+            " --config sandbox_workspace_write.network_access=true"
+        } else {
+            ""
+        };
         let reasoning_effort = policy
             .role_policy
             .effort
             .as_deref()
             .map(|value| format!(" --config model_reasoning_effort={value}"))
             .unwrap_or_default();
-        return format!("codex{model}{reasoning_effort} --sandbox {sandbox} --ask-for-approval never '{quoted_prompt}'");
+        return format!("codex{model}{reasoning_effort}{network_config} --sandbox {sandbox} --ask-for-approval never '{quoted_prompt}'");
     }
     if agent == "claude" {
         let flags = claude_policy_flags(&policy.role_policy, worktree);
@@ -12362,12 +12371,11 @@ fn claude_policy_flags(role_policy: &WorkflowRolePolicy, _worktree: Option<&Path
 /// relaunched an in-flight implementer's session via plain resume and it
 /// silently lost the `write_paths`/`allowed_commands` its role required.
 ///
-/// Only Claude's resume path can carry policy today: Codex's `resume --last`
-/// takes no `--sandbox` or `--ask-for-approval` (see the codex entry in
-/// [`crate::agent::spec::AGENT_SPECS`]), so there is no CLI surface here to
-/// reapply a role's `write_paths` to. Codex, and every agent besides Claude,
-/// fall back to their plain resume command -- unchanged, and consistent with
-/// `build_policy_agent_command`'s existing claude/codex-only policy scoping.
+/// Claude and Codex can both resume under their resolved policy. Codex accepts
+/// `--sandbox`, `--ask-for-approval`, and `--config` before `resume --last`;
+/// keeping those flags is essential when final validation is recovered after a
+/// container or tmux restart. Every other agent falls back to its native
+/// resume command unchanged.
 ///
 /// `agent` must be the task's own bound agent (`task.agent`), not the
 /// project's configured default agent -- those can differ, and using the
@@ -12380,6 +12388,29 @@ fn build_policy_resume_command(
     worktree: Option<&Path>,
 ) -> String {
     let Some(policy) = policy else { return agent_ops.build_resume_command(); };
+    if agent == "codex" {
+        let model = policy
+            .role_policy
+            .model
+            .as_deref()
+            .map(|value| format!(" --model {value}"))
+            .unwrap_or_default();
+        let reasoning_effort = policy
+            .role_policy
+            .effort
+            .as_deref()
+            .map(|value| format!(" --config model_reasoning_effort={value}"))
+            .unwrap_or_default();
+        let sandbox = if policy.role_policy.write_paths.is_empty() { "read-only" } else { "workspace-write" };
+        let network_config = if policy.network {
+            " --config sandbox_workspace_write.network_access=true"
+        } else {
+            ""
+        };
+        return format!(
+            "codex{model}{reasoning_effort}{network_config} --sandbox {sandbox} --ask-for-approval never resume --last"
+        );
+    }
     if agent != "claude" {
         return agent_ops.build_resume_command();
     }

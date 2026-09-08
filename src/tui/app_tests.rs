@@ -110,6 +110,34 @@ fn claude_policy_grants_edit_and_write_for_a_writable_role() {
     assert!(!fresh.contains("Edit(api/**)"));
 }
 
+/// A final-validation session can explicitly reach an in-scope companion API
+/// or test database, without granting networking to other review states.
+#[test]
+#[cfg(feature = "test-mocks")]
+fn codex_policy_enables_network_only_when_state_declares_it() {
+    let agent_ops = MockAgentOperations::new();
+    let isolated = ResolvedWorkflowPolicy::default();
+    let validation = ResolvedWorkflowPolicy {
+        role_policy: crate::workflow::WorkflowRolePolicy {
+            write_paths: vec![".agent-flow/final-validation.yaml".to_string()],
+            ..Default::default()
+        },
+        network: true,
+        ..Default::default()
+    };
+
+    let isolated_command = build_policy_agent_command(
+        &agent_ops, "codex", "Review F3.3", Some(&isolated), None,
+    );
+    let validation_command = build_policy_agent_command(
+        &agent_ops, "codex", "Validate F3.3", Some(&validation), None,
+    );
+
+    assert!(!isolated_command.contains("sandbox_workspace_write.network_access=true"));
+    assert!(validation_command.contains("--config sandbox_workspace_write.network_access=true"));
+    assert!(validation_command.contains("--sandbox workspace-write"));
+}
+
 /// The scenario from the reported incident: an implementer with `write_paths`
 /// resumed after a lost tmux window must carry `Edit` for its result
 /// artifact and its `allowed_commands`, and must resume with `--continue`
@@ -146,23 +174,27 @@ fn resume_without_a_policy_falls_back_to_the_plain_resume_command() {
     assert_eq!(command, "claude --dangerously-skip-permissions --continue");
 }
 
-/// Codex's `resume --last` takes no `--sandbox`/`--ask-for-approval` (see the
-/// codex entry in `AGENT_SPECS`), so there is no CLI surface to reapply a
-/// role's `write_paths` to on resume. This pins that as an explicit, tested
-/// limitation rather than a gap someone silently relies on: a policy present
-/// for a non-claude agent changes nothing.
+/// Codex can resume with the same sandbox, noninteractive approval policy, and
+/// explicit state-scoped network elevation as a fresh launch. Other agents
+/// remain on their native resume command.
 #[test]
 #[cfg(feature = "test-mocks")]
-fn non_claude_agents_keep_their_existing_resume_behaviour_even_with_a_policy() {
-    let mut agent_ops = MockAgentOperations::new();
-    agent_ops
-        .expect_build_resume_command()
-        .returning(|| "codex resume --last".to_string());
-    let policy = implementer_policy();
+fn codex_resume_reapplies_state_scoped_network_policy() {
+    let agent_ops = MockAgentOperations::new();
+    let policy = ResolvedWorkflowPolicy {
+        role_policy: crate::workflow::WorkflowRolePolicy {
+            write_paths: vec![".agent-flow/final-validation.yaml".to_string()],
+            ..Default::default()
+        },
+        network: true,
+        ..Default::default()
+    };
 
     let command = build_policy_resume_command(&agent_ops, "codex", Some(&policy), None);
 
-    assert_eq!(command, "codex resume --last");
+    assert!(command.contains("--config sandbox_workspace_write.network_access=true"));
+    assert!(command.contains("--sandbox workspace-write"));
+    assert!(command.ends_with("resume --last"));
 }
 
 /// `resolve_task_workflow_policy` must distinguish "never workflow-managed"

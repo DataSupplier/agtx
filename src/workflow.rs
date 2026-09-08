@@ -335,6 +335,10 @@ pub struct WorkflowStatePolicy {
     pub merge_target: Option<String>,
     #[serde(default)]
     pub merge_feature_to_main: bool,
+    /// Explicit network elevation for this one state. `None` preserves the
+    /// project default, which is normally false.
+    #[serde(default)]
+    pub network: Option<bool>,
 }
 
 /// The fully resolved policy for one destination state.
@@ -344,6 +348,7 @@ pub struct ResolvedWorkflowPolicy {
     pub defaults: WorkflowPolicyDefaults,
     pub role_policy: WorkflowRolePolicy,
     pub merge_target: Option<String>,
+    pub network: bool,
 }
 
 /// Project-owned bindings for a declared workflow.
@@ -462,6 +467,7 @@ impl WorkflowProjectConfig {
                     )
                 })?,
             merge_target: None,
+            network: self.role_policies.defaults.network,
         };
         if !resolved.role_policy.states.is_empty()
             && !resolved.role_policy.states.iter().any(|state| state == state_id)
@@ -478,6 +484,9 @@ impl WorkflowProjectConfig {
             resolved.role_policy.create_or_update_task_pr |= state_policy.create_or_update_task_pr;
             resolved.role_policy.merge_task_into_target |= state_policy.merge_task_into_target;
             resolved.merge_target = state_policy.merge_target.clone();
+            if let Some(network) = state_policy.network {
+                resolved.network = network;
+            }
         }
         Ok(Some(resolved))
     }
