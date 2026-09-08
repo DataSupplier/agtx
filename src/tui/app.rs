@@ -31,7 +31,7 @@ use crate::skills;
 use crate::tmux::{
     self, InputConfig, InputError, PaneInput, PaneInputSink, RealTmuxOps, TmuxOperations,
 };
-use crate::workflow::{GuardContext, ResolvedWorkflowPolicy, WorkflowProjectConfig};
+use crate::workflow::{GuardContext, ResolvedWorkflowPolicy, WorkflowProjectConfig, WorkflowRolePolicy};
 use crate::workflow_executor::{prepare_admission, prepare_transition};
 use crate::AppMode;
 
@@ -1016,13 +1016,17 @@ impl App {
 
             for task in &tasks_to_recover {
                 let agent_ops = app.state.agent_registry.get(&task.agent);
-                let _ = recover_task_session(
+                if let Err(e) = recover_task_session(
                     task,
                     &app.state.tmux_project_name,
                     app.state.project_path.as_deref().unwrap_or(Path::new(".")),
                     app.state.tmux_ops.as_ref(),
                     agent_ops.as_ref(),
-                );
+                    app.state.db.as_ref(),
+                    &app.state.config.default_agent,
+                ) {
+                    eprintln!("Failed to recover task session for '{}': {e}", task.id);
+                }
             }
         }
 
@@ -8838,13 +8842,18 @@ impl App {
                 {
                     let agent_ops = self.state.agent_registry.get(&task.agent);
                     let project_path = self.state.project_path.as_deref().unwrap_or(Path::new("."));
-                    let _ = recover_task_session(
+                    if let Err(e) = recover_task_session(
                         task,
                         &self.state.tmux_project_name,
                         project_path,
                         self.state.tmux_ops.as_ref(),
                         agent_ops.as_ref(),
-                    );
+                        self.state.db.as_ref(),
+                        &self.state.config.default_agent,
+                    ) {
+                        self.state.warning_message =
+                            Some((format!("Could not recover task session: {e}"), Instant::now()));
+                    }
                     // Clear stale phase status so it gets re-evaluated
                     self.state.phase_status_cache.remove(&task.id);
                     self.state.pane_content_hashes.remove(&task.id);
@@ -9877,6 +9886,8 @@ fn recover_task_session(
     project_path: &Path,
     tmux_ops: &dyn TmuxOperations,
     agent_ops: &dyn AgentOperations,
+    db: Option<&Database>,
+    default_agent: &str,
 ) -> Result<String> {
     let worktree_path = task
         .worktree_path
@@ -9897,7 +9908,14 @@ fn recover_task_session(
 
     ensure_project_tmux_session(project_name, project_path, tmux_ops);
 
-    let resume_cmd = agent_ops.build_resume_command();
+    // `?`, not a silent fallback: see resolve_task_workflow_policy's Ok(None)
+    // vs Err contract. A resolution failure here must abort the recovery
+    // rather than recreate the window with a plain (unscoped) resume.
+    let policy = resolve_task_workflow_policy(task, Some(project_path), default_agent, db)?;
+    // `&task.agent`, not `default_agent`: the resume command must be built
+    // for the agent this task's session actually runs, which can differ from
+    // the project's current default if that default changed after launch.
+    let resume_cmd = build_policy_resume_command(agent_ops, &task.agent, policy.as_ref());
 
     tmux_ops.create_window(
         session,
@@ -12218,15 +12236,150 @@ fn build_policy_agent_command(
         return format!("codex{model}{reasoning_effort} --sandbox {sandbox} --ask-for-approval never '{quoted_prompt}'");
     }
     if agent == "claude" {
-        let mut tools = vec!["Read".to_string(), "Glob".to_string(), "Grep".to_string()];
-        tools.extend(policy.role_policy.allowed_commands.iter().map(|command| format!("Bash({command} *)")));
-        tools.extend(policy.role_policy.write_paths.iter().flat_map(|path| [format!("Edit({path})"), format!("Write({path})")]));
-        return format!(
-            "claude{model}{effort} --permission-mode dontAsk --allowed-tools '{}' -- '{}'",
-            tools.join(","), quoted_prompt
-        );
+        let flags = claude_policy_flags(&policy.role_policy);
+        return format!("claude{model}{effort} {flags} -- '{quoted_prompt}'");
     }
     agent_ops.build_interactive_command(prompt)
+}
+
+/// The `--permission-mode dontAsk --allowed-tools '<tools>'` fragment for a
+/// Claude launch under `role_policy`.
+///
+/// Shared verbatim by [`build_policy_agent_command`] (fresh launch) and
+/// [`build_policy_resume_command`] (resume after a lost tmux window), so
+/// `permission-mode` cannot drift out of sync between the two paths any more
+/// than the tool list can -- see the invariant on `build_policy_agent_command`.
+///
+/// Preserves the pre-existing escaping behaviour exactly: a role policy's
+/// command/path entries are not shell-escaped here, only wrapped in single
+/// quotes, same as before this was extracted. A literal single quote in a
+/// configured command or write path would already have broken this quoting;
+/// fixing that is a separate concern from resume parity.
+fn claude_policy_flags(role_policy: &WorkflowRolePolicy) -> String {
+    let mut tools = vec!["Read".to_string(), "Glob".to_string(), "Grep".to_string()];
+    tools.extend(role_policy.allowed_commands.iter().map(|command| format!("Bash({command} *)")));
+    tools.extend(role_policy.write_paths.iter().flat_map(|path| [format!("Edit({path})"), format!("Write({path})")]));
+    format!("--permission-mode dontAsk --allowed-tools '{}'", tools.join(","))
+}
+
+/// Build the resume command for a native agent under a resolved workflow
+/// role, preserving the exact permission scope a fresh policy-scoped launch
+/// would use -- see the invariant on [`build_policy_agent_command`], which
+/// this function exists to uphold across a lost-window recovery, not just a
+/// fresh state transition.
+///
+/// Before this existed, a recovered task fell back to
+/// `agent_ops.build_resume_command()` alone: for Claude,
+/// `claude --dangerously-skip-permissions --continue` with no
+/// `--allowed-tools` at all. Claude Code persists a session's permission mode
+/// (`dontAsk`, set by the original policy-scoped launch) across `--continue`
+/// independently of the CLI flags the resume itself is invoked with, so the
+/// recovered process ran in `dontAsk` mode while carrying none of the
+/// allowlist that mode requires: every tool call outside `Read`/`Glob`/`Grep`
+/// was denied outright, silently, with no prompt and no way to recover except
+/// abandoning the session. This is exactly what surfaced in production: a
+/// container/tmux-server restart triggered `recover_task_session`, which
+/// relaunched an in-flight implementer's session via plain resume and it
+/// silently lost the `write_paths`/`allowed_commands` its role required.
+///
+/// Only Claude's resume path can carry policy today: Codex's `resume --last`
+/// takes no `--sandbox` or `--ask-for-approval` (see the codex entry in
+/// [`crate::agent::spec::AGENT_SPECS`]), so there is no CLI surface here to
+/// reapply a role's `write_paths` to. Codex, and every agent besides Claude,
+/// fall back to their plain resume command -- unchanged, and consistent with
+/// `build_policy_agent_command`'s existing claude/codex-only policy scoping.
+///
+/// `agent` must be the task's own bound agent (`task.agent`), not the
+/// project's configured default agent -- those can differ, and using the
+/// wrong one here would pick the wrong command builder on resume even though
+/// the original launch used the task's actual agent.
+fn build_policy_resume_command(
+    agent_ops: &dyn AgentOperations,
+    agent: &str,
+    policy: Option<&ResolvedWorkflowPolicy>,
+) -> String {
+    let Some(policy) = policy else { return agent_ops.build_resume_command(); };
+    if agent != "claude" {
+        return agent_ops.build_resume_command();
+    }
+    let model = policy
+        .role_policy
+        .model
+        .as_deref()
+        .map(|value| format!(" --model {value}"))
+        .unwrap_or_default();
+    let effort = policy
+        .role_policy
+        .effort
+        .as_deref()
+        .map(|value| format!(" --effort {value}"))
+        .unwrap_or_default();
+    let flags = claude_policy_flags(&policy.role_policy);
+    format!("claude{model}{effort} {flags} --continue")
+}
+
+/// Resolve the workflow role policy currently active for a task, so a
+/// recovered/resumed session can be launched under the same permission scope
+/// as its original state-transition launch (see
+/// [`build_policy_resume_command`]).
+///
+/// The `Ok(None)` / `Err` distinction matters and must not be collapsed:
+///
+///   * `Ok(None)` means the task has genuinely never been workflow-managed --
+///     no bound plugin, no declarative state machine, or no persisted
+///     `workflow_task_state` row -- so a plain resume is correct.
+///   * `Err(_)` means the task **has** a persisted workflow state (it is
+///     unambiguously workflow-managed) but something needed to resolve its
+///     policy failed: no project path, no `.agtx/workflow.toml`, or
+///     `policy_for_state` itself erroring (an unknown state, or a role with
+///     no `[role_policies.<role>]` entry -- see the invariant note on
+///     `policy_for_state`).
+///
+/// Callers must propagate `Err` rather than treating it as `Ok(None)`.
+/// Falling back to a plain resume after a resolution failure would silently
+/// recreate the exact bug this function exists to fix: a workflow-managed
+/// Claude session resumed with no `--allowed-tools` at all.
+fn resolve_task_workflow_policy(
+    task: &Task,
+    project_path: Option<&Path>,
+    default_agent: &str,
+    db: Option<&Database>,
+) -> Result<Option<ResolvedWorkflowPolicy>> {
+    let Some(plugin) = load_task_plugin(task, project_path, default_agent) else {
+        return Ok(None);
+    };
+    let Some(workflow) = plugin.state_machine.as_ref() else {
+        return Ok(None);
+    };
+    let Some(db) = db else {
+        anyhow::bail!(
+            "task '{}' is workflow-managed but no project database is available to resolve its policy",
+            task.id
+        );
+    };
+    let Some(current) = db.get_workflow_task_state(&task.id)? else {
+        return Ok(None);
+    };
+    let Some(project_path) = project_path else {
+        anyhow::bail!(
+            "task '{}' is workflow-managed (state '{}') but no project path is available to load .agtx/workflow.toml",
+            task.id, current.state
+        );
+    };
+    let Some(project_workflow) = WorkflowProjectConfig::load(project_path)? else {
+        anyhow::bail!(
+            "task '{}' is workflow-managed (state '{}') but no .agtx/workflow.toml was found",
+            task.id, current.state
+        );
+    };
+    let policy = project_workflow.policy_for_state(workflow, &current.state)?;
+    if policy.is_none() {
+        anyhow::bail!(
+            "task '{}' workflow state '{}' has no bound role in the state machine",
+            task.id, current.state
+        );
+    }
+    Ok(policy)
 }
 
 /// Resolve the skill command to send via send_keys for a given phase.
@@ -13227,6 +13380,21 @@ fn is_agent_active(tmux_ops: &dyn TmuxOperations, target: &str, agent_name: Opti
 
 /// If the tmux window for `target` is gone, recreate it with the agent's resume command.
 /// Used before `switch_agent_in_tmux` and `send_skill_and_prompt` to handle dead windows.
+///
+/// TODO(policy-resume): this recovery path does NOT resolve or apply workflow
+/// policy the way `recover_task_session` now does (see
+/// `resolve_task_workflow_policy` / `build_policy_resume_command`). A
+/// workflow-managed Claude session recovered through here can still come back
+/// as plain `claude --dangerously-skip-permissions --continue` -- resumed in
+/// Claude's persisted `dontAsk` mode with none of its role's allowlist, the
+/// exact bug fixed for `recover_task_session`. It is not fixed here because
+/// every call site runs inside a `std::thread::spawn(move || ...)` closure
+/// that only captures `Arc`-wrapped state (`tmux_ops`, `agent_registry`);
+/// `Database` is not `Clone`/`Send`-shareable in the current design, and
+/// giving this function policy access needs that resolved first (an
+/// `Arc<Database>` refactor, or passing an already-resolved
+/// `Option<ResolvedWorkflowPolicy>` down from each call site). Do not assume
+/// this function is covered by the resume-permission-parity fix.
 fn ensure_window_or_recover(
     tmux_ops: &dyn TmuxOperations,
     target: &str,
@@ -13245,6 +13413,7 @@ fn ensure_window_or_recover(
         if !tmux_ops.has_session(session) {
             let _ = tmux_ops.create_session(session, wt_path);
         }
+        // TODO(policy-resume): plain resume, no policy -- see the doc above.
         let resume_cmd = agent_ops.build_resume_command();
         let _ = tmux_ops.create_window(
             session,

@@ -34,6 +34,182 @@ fn claude_policy_command_separates_allowed_tools_from_prompt() {
     ));
 }
 
+/// Extracts the exact value inside `--allowed-tools '<value>'`, so parity
+/// assertions compare the actual tool set rather than doing substring
+/// matching that would miss reordering or a missing/extra entry.
+#[cfg(feature = "test-mocks")]
+fn allowed_tools_value(command: &str) -> &str {
+    let after = command
+        .split("--allowed-tools '")
+        .nth(1)
+        .expect("command has no --allowed-tools flag");
+    after.split('\'').next().unwrap()
+}
+
+fn implementer_policy() -> ResolvedWorkflowPolicy {
+    ResolvedWorkflowPolicy {
+        role_policy: crate::workflow::WorkflowRolePolicy {
+            allowed_commands: vec!["ruff check".to_string(), "mypy".to_string()],
+            write_paths: vec![".agent-flow/implementation-result.yaml".to_string()],
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// The whole point of extracting `claude_policy_flags` is that a fresh launch
+/// and a resume of the *same* policy cannot produce different permission
+/// flags -- they now go through the identical function. This pins that down
+/// against an independently-written expected value (not by calling the
+/// extracted helper and comparing it to itself, which would not catch a bug
+/// in the helper).
+#[test]
+#[cfg(feature = "test-mocks")]
+fn claude_fresh_and_resume_grant_identical_tools_for_the_same_policy() {
+    let agent_ops = MockAgentOperations::new();
+    let policy = implementer_policy();
+
+    let fresh = build_policy_agent_command(&agent_ops, "claude", "Implement F3.3", Some(&policy));
+    let resumed = build_policy_resume_command(&agent_ops, "claude", Some(&policy));
+
+    let expected_tools =
+        "Read,Glob,Grep,Bash(ruff check *),Bash(mypy *),Edit(.agent-flow/implementation-result.yaml),Write(.agent-flow/implementation-result.yaml)";
+    assert_eq!(allowed_tools_value(&fresh), expected_tools);
+    assert_eq!(allowed_tools_value(&resumed), expected_tools);
+    assert!(fresh.contains("--permission-mode dontAsk"));
+    assert!(resumed.contains("--permission-mode dontAsk"));
+}
+
+/// The scenario from the reported incident: an implementer with `write_paths`
+/// resumed after a lost tmux window must carry `Edit`/`Write` for its result
+/// artifact and its `allowed_commands`, and must resume with `--continue`
+/// rather than a fresh prompt argument.
+#[test]
+#[cfg(feature = "test-mocks")]
+fn resumed_implementer_with_write_paths_preserves_edit_write_and_bash_entries() {
+    let agent_ops = MockAgentOperations::new();
+    let policy = implementer_policy();
+
+    let command = build_policy_resume_command(&agent_ops, "claude", Some(&policy));
+
+    assert!(command.contains("Edit(.agent-flow/implementation-result.yaml)"));
+    assert!(command.contains("Write(.agent-flow/implementation-result.yaml)"));
+    assert!(command.contains("Bash(ruff check *)"));
+    assert!(command.contains("Bash(mypy *)"));
+    assert!(command.ends_with("--continue"));
+    // A resume takes no new prompt; the fresh-launch `-- '<prompt>'` separator
+    // must not appear here.
+    assert!(!command.contains(" -- '"));
+}
+
+/// A plain (non-workflow) task's resume must be untouched by this change: no
+/// policy means no `--allowed-tools` injection, same as before this fix.
+#[test]
+#[cfg(feature = "test-mocks")]
+fn resume_without_a_policy_falls_back_to_the_plain_resume_command() {
+    let mut agent_ops = MockAgentOperations::new();
+    agent_ops
+        .expect_build_resume_command()
+        .returning(|| "claude --dangerously-skip-permissions --continue".to_string());
+
+    let command = build_policy_resume_command(&agent_ops, "claude", None);
+
+    assert_eq!(command, "claude --dangerously-skip-permissions --continue");
+}
+
+/// Codex's `resume --last` takes no `--sandbox`/`--ask-for-approval` (see the
+/// codex entry in `AGENT_SPECS`), so there is no CLI surface to reapply a
+/// role's `write_paths` to on resume. This pins that as an explicit, tested
+/// limitation rather than a gap someone silently relies on: a policy present
+/// for a non-claude agent changes nothing.
+#[test]
+#[cfg(feature = "test-mocks")]
+fn non_claude_agents_keep_their_existing_resume_behaviour_even_with_a_policy() {
+    let mut agent_ops = MockAgentOperations::new();
+    agent_ops
+        .expect_build_resume_command()
+        .returning(|| "codex resume --last".to_string());
+    let policy = implementer_policy();
+
+    let command = build_policy_resume_command(&agent_ops, "codex", Some(&policy));
+
+    assert_eq!(command, "codex resume --last");
+}
+
+/// `resolve_task_workflow_policy` must distinguish "never workflow-managed"
+/// from "workflow-managed but resolution failed" -- collapsing them into one
+/// `None` is exactly the bug this whole fix addresses. A task with no bound
+/// plugin is the first case: `Ok(None)`, not an error.
+#[test]
+fn resolve_task_workflow_policy_returns_ok_none_for_a_non_workflow_task() {
+    let task = Task {
+        plugin: None,
+        ..Task::new("Plain task", "claude", "workspace")
+    };
+
+    let result = resolve_task_workflow_policy(&task, None, "claude", None);
+
+    assert!(matches!(result, Ok(None)), "expected Ok(None), got {result:?}");
+}
+
+/// The second case: the task genuinely entered a declarative workflow state
+/// (a `workflow_task_states` row exists), but `.agtx/workflow.toml` is
+/// missing from the project. This must be `Err`, never `Ok(None)` -- an
+/// `Ok(None)` here would make `recover_task_session` fall back to a plain
+/// resume for a workflow-managed Claude session, silently reproducing the
+/// reported incident.
+#[test]
+fn resolve_task_workflow_policy_errors_rather_than_falling_back_when_workflow_toml_is_missing() {
+    let _data_dir_guard = redirect_data_dir();
+    let project = tempfile::tempdir().unwrap();
+
+    // A minimal on-disk plugin with a declarative state machine, so
+    // `load_task_plugin` succeeds and reaches the `state_machine.as_ref()?`
+    // branch -- proving the task IS workflow-managed.
+    let plugin_dir = project.path().join(".agtx/plugins/testflow");
+    std::fs::create_dir_all(&plugin_dir).unwrap();
+    std::fs::write(
+        plugin_dir.join("plugin.toml"),
+        r#"
+name = "testflow"
+[state_machine]
+initial_state = "implementing"
+[[state_machine.states]]
+id = "implementing"
+label = "Implementing"
+role = "implementer"
+[[state_machine.states]]
+id = "done"
+label = "Done"
+terminal = true
+"#,
+    )
+    .unwrap();
+
+    // Deliberately no .agtx/workflow.toml written.
+
+    let db = crate::db::Database::open_project(project.path()).unwrap();
+    let task = Task {
+        id: "wf-task-1".to_string(),
+        plugin: Some("testflow".to_string()),
+        ..Task::new("Workflow task", "claude", "workspace")
+    };
+    db.create_task(&task).unwrap();
+    db.upsert_workflow_task_state(&crate::db::WorkflowTaskState::new(
+        &task.id,
+        "implementing",
+        "feature/poc",
+    ))
+    .unwrap();
+
+    let result = resolve_task_workflow_policy(&task, Some(project.path()), "claude", Some(&db));
+
+    assert!(
+        result.is_err(),
+        "a workflow-managed task with no .agtx/workflow.toml must error, not fall back: got {result:?}"
+    );
+}
+
 #[test]
 fn archive_workflow_artifact_preserves_superseded_evidence() {
     let temp = tempfile::tempdir().unwrap();
