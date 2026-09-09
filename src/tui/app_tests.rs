@@ -26,8 +26,13 @@ fn claude_policy_command_separates_allowed_tools_from_prompt() {
         ..Default::default()
     };
 
-    let command =
-        build_policy_agent_command(&agent_ops, "claude", "Review task F3.3", Some(&policy), None);
+    let command = build_policy_agent_command(
+        &agent_ops,
+        "claude",
+        "Review task F3.3",
+        Some(&policy),
+        None,
+    );
 
     // Claude Code's live CLI grants file mutation at the tool level. A
     // `write_paths` declaration marks this as a writable role, which must
@@ -72,7 +77,8 @@ fn claude_fresh_and_resume_grant_identical_tools_for_the_same_policy() {
     let agent_ops = MockAgentOperations::new();
     let policy = implementer_policy();
 
-    let fresh = build_policy_agent_command(&agent_ops, "claude", "Implement F3.3", Some(&policy), None);
+    let fresh =
+        build_policy_agent_command(&agent_ops, "claude", "Implement F3.3", Some(&policy), None);
     let resumed = build_policy_resume_command(&agent_ops, "claude", Some(&policy), None);
 
     let expected_tools = "Read,Glob,Grep,Bash(ruff check *),Bash(mypy *),Edit,Write";
@@ -96,13 +102,8 @@ fn claude_policy_grants_edit_and_write_for_a_writable_role() {
         },
         ..Default::default()
     };
-    let fresh = build_policy_agent_command(
-        &agent_ops,
-        "claude",
-        "Implement F3.3",
-        Some(&policy),
-        None,
-    );
+    let fresh =
+        build_policy_agent_command(&agent_ops, "claude", "Implement F3.3", Some(&policy), None);
     let resumed = build_policy_resume_command(&agent_ops, "claude", Some(&policy), None);
 
     assert!(fresh.contains("Edit,Write"));
@@ -126,11 +127,14 @@ fn codex_policy_enables_network_only_when_state_declares_it() {
         ..Default::default()
     };
 
-    let isolated_command = build_policy_agent_command(
-        &agent_ops, "codex", "Review F3.3", Some(&isolated), None,
-    );
+    let isolated_command =
+        build_policy_agent_command(&agent_ops, "codex", "Review F3.3", Some(&isolated), None);
     let validation_command = build_policy_agent_command(
-        &agent_ops, "codex", "Validate F3.3", Some(&validation), None,
+        &agent_ops,
+        "codex",
+        "Validate F3.3",
+        Some(&validation),
+        None,
     );
 
     assert!(!isolated_command.contains("sandbox_workspace_write.network_access=true"));
@@ -269,13 +273,21 @@ fn build_policy_agent_command_strips_control_bytes_from_findings_before_quoting(
 
     let command = build_policy_agent_command(&agent_ops, "codex", findings, Some(&policy), None);
 
-    assert!(!command.contains('\r'), "command must not carry a raw CR: {command:?}");
-    assert!(!command.contains('\u{7}'), "command must not carry a raw BEL: {command:?}");
-    assert!(!command.contains('\u{0}'), "command must not carry a raw NUL: {command:?}");
+    assert!(
+        !command.contains('\r'),
+        "command must not carry a raw CR: {command:?}"
+    );
+    assert!(
+        !command.contains('\u{7}'),
+        "command must not carry a raw BEL: {command:?}"
+    );
+    assert!(
+        !command.contains('\u{0}'),
+        "command must not carry a raw NUL: {command:?}"
+    );
     // The structural newlines and the actual words survive the strip.
     assert!(command.contains("Findings line one.\nFindings line two.\nbellnul"));
 }
-
 
 /// Codex can resume with the same sandbox, noninteractive approval policy, and
 /// explicit state-scoped network elevation as a fresh launch. Other agents
@@ -313,7 +325,10 @@ fn resolve_task_workflow_policy_returns_ok_none_for_a_non_workflow_task() {
 
     let result = resolve_task_workflow_policy(&task, None, "claude", None);
 
-    assert!(matches!(result, Ok(None)), "expected Ok(None), got {result:?}");
+    assert!(
+        matches!(result, Ok(None)),
+        "expected Ok(None), got {result:?}"
+    );
 }
 
 /// The second case: the task genuinely entered a declarative workflow state
@@ -386,7 +401,10 @@ fn archive_workflow_artifact_preserves_superseded_evidence() {
 
     assert!(!artifact.exists());
     assert!(archived.starts_with(temp.path().join("history")));
-    assert_eq!(std::fs::read_to_string(archived).unwrap(), "verdict: approved_for_validation\n");
+    assert_eq!(
+        std::fs::read_to_string(archived).unwrap(),
+        "verdict: approved_for_validation\n"
+    );
 }
 
 #[test]
@@ -1553,7 +1571,10 @@ fn the_rate_limit_holds_against_a_paint_and_yields_to_a_keystroke() {
         typist.poke();
     });
     let start = Instant::now();
-    assert_eq!(watch.wait_out_rate_limit(Duration::from_secs(5)), Some(true));
+    assert_eq!(
+        watch.wait_out_rate_limit(Duration::from_secs(5)),
+        Some(true)
+    );
     assert!(
         start.elapsed() < Duration::from_secs(1),
         "a keystroke waited {:?}",
@@ -12347,8 +12368,7 @@ fn test_switch_agent_multiline_new_agent_cmd_uses_paste_text_not_send_keys() {
         .expect_capture_pane()
         .returning(|_| Ok(String::new()));
 
-    let new_agent_cmd =
-        "claude --model opus -- 'Review findings for task F4.1:\n\nParagraph two.'";
+    let new_agent_cmd = "claude --model opus -- 'Review findings for task F4.1:\n\nParagraph two.'";
     let expected_cmd = format!(
         "cd -- \"$AGTX_WORKTREE\" && env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT {new_agent_cmd}"
     );
@@ -12381,7 +12401,6 @@ fn test_switch_agent_multiline_new_agent_cmd_uses_paste_text_not_send_keys() {
         "paste_text must receive the complete, untruncated hand-off command"
     );
 }
-
 
 // --- wait_for_agent_ready ---
 

@@ -1,7 +1,9 @@
+use sha2::{Digest, Sha256};
+
 use agtx::db::{
     Database, DependencyState, Notification, NotificationKind, PhaseStatus, Project, Task,
     TaskExecutionEvent, TaskRuntime, TaskStatus, TaskStepReport, TransitionRequest,
-    WorkflowTaskState, WorkflowTransitionRecord,
+    WorkflowArtifact, WorkflowStepInput, WorkflowTaskState, WorkflowTransitionRecord,
 };
 
 // === TaskStatus Tests ===
@@ -1182,6 +1184,57 @@ fn execution_journal_retains_prompt_and_evidence_after_task_cleanup() {
     }));
 }
 
+#[test]
+#[cfg(feature = "test-mocks")]
+fn workflow_artifacts_are_immutable_bound_inputs() {
+    let db = Database::open_in_memory_project().unwrap();
+    let task = Task::new("F0.5", "claude", "heaves");
+    db.create_task(&task).unwrap();
+    let content = b"plan_revision: 7\n".to_vec();
+    let sha256 = format!("{:x}", Sha256::digest(&content));
+    let artifact = WorkflowArtifact {
+        id: "plan-attempt-15-revision-7".into(),
+        task_id: task.id.clone(),
+        workflow_attempt: 15,
+        state: "planning".into(),
+        kind: "step_evidence".into(),
+        source_path: "/worktree/docs/plans/F0.5.md".into(),
+        sha256: sha256.clone(),
+        content: content.clone(),
+        created_at: chrono::Utc::now(),
+    };
+
+    let stored = db.store_workflow_artifact(&artifact).unwrap();
+    assert_eq!(stored.id, artifact.id);
+    assert_eq!(stored.content, content);
+
+    let input = WorkflowStepInput {
+        task_id: task.id.clone(),
+        workflow_attempt: 16,
+        state: "plan_review".into(),
+        name: "plan".into(),
+        artifact_id: stored.id.clone(),
+        expected_sha256: sha256.clone(),
+        created_at: chrono::Utc::now(),
+    };
+    db.bind_workflow_step_input(&input).unwrap();
+    assert_eq!(
+        db.workflow_step_inputs(&task.id, 16, "plan_review")
+            .unwrap()[0]
+            .artifact_id,
+        stored.id
+    );
+
+    let mut conflicting_artifact = artifact.clone();
+    conflicting_artifact.id = "different-id".into();
+    conflicting_artifact.content = b"plan_revision: 8\n".to_vec();
+    conflicting_artifact.sha256 = format!("{:x}", Sha256::digest(&conflicting_artifact.content));
+    assert!(db.store_workflow_artifact(&conflicting_artifact).is_err());
+
+    let mut conflicting_input = input.clone();
+    conflicting_input.artifact_id = "different-id".into();
+    assert!(db.bind_workflow_step_input(&conflicting_input).is_err());
+}
 // === Dependency State Tests ===
 
 /// A task with `status`, already stored, so dependents can reference it.

@@ -116,7 +116,7 @@ fn record_step_evidence(
         content: bytes.clone(),
         created_at: chrono::Utc::now(),
     };
-    db.store_workflow_artifact(&evidence)?;
+    let evidence = db.store_workflow_artifact(&evidence)?;
     let artifact_text = String::from_utf8_lossy(&bytes);
     let mut report = TaskStepReport::new(&task.id, state.state_attempt, &state.state);
     report.agent = Some(agent.to_string());
@@ -214,6 +214,61 @@ pub fn restore_workflow_step_inputs(
         restored += 1;
     }
     Ok(restored)
+}
+/// Replay an interrupted agent-owned step without creating a new workflow
+/// attempt. The exact stored prompt and exact bound inputs are the contract;
+/// a completed artifact is never replayed.
+pub fn restart_workflow_step(
+    task: &Task,
+    db: &Database,
+    runtime: &WorkflowRuntime,
+) -> Result<WorkflowStepOutcome> {
+    let Some(state) = db.get_workflow_task_state(&task.id)? else {
+        return Ok(WorkflowStepOutcome::NoOp);
+    };
+    let reports = db.task_step_reports(&task.id)?;
+    let Some(report) = reports.into_iter().find(|report| {
+        report.workflow_attempt == state.state_attempt && report.state == state.state
+    }) else {
+        return Ok(WorkflowStepOutcome::Blocked {
+            message: "This workflow step has no persisted prompt to restart".to_string(),
+        });
+    };
+    if report.artifact_sha256.is_some() {
+        return Ok(WorkflowStepOutcome::Blocked {
+            message: "This workflow step already has durable output; submit or resolve it instead of restarting".to_string(),
+        });
+    }
+    let Some(prompt) = report.prompt_text else {
+        return Ok(WorkflowStepOutcome::Blocked {
+            message: "This workflow step has no persisted prompt to restart".to_string(),
+        });
+    };
+    let Some(target) = task.session_name.as_deref() else {
+        return Ok(WorkflowStepOutcome::Blocked {
+            message: "This workflow step has no task session to restart".to_string(),
+        });
+    };
+    if !runtime.tmux_ops.window_exists(target)? {
+        return Ok(WorkflowStepOutcome::Blocked {
+            message: "This workflow step's task session is unavailable; recover the session first"
+                .to_string(),
+        });
+    }
+    restore_workflow_step_inputs(db, task, &state)?;
+    runtime.tmux_ops.paste_text(target, &prompt)?;
+    runtime.tmux_ops.send_key(target, "Enter")?;
+
+    let mut event = TaskExecutionEvent::new(&task.id, "agent_prompt_restarted");
+    event.workflow_attempt = Some(state.state_attempt);
+    event.state = Some(state.state);
+    event.agent = task.agent.clone().into();
+    event.outcome = Some("restarted".to_string());
+    event.message = Some("Replayed persisted workflow prompt with verified inputs".to_string());
+    db.record_task_execution_event(&event)?;
+    Ok(WorkflowStepOutcome::Recovered {
+        message: "Workflow step restarted from persisted inputs".to_string(),
+    })
 }
 /// Validate and prepare a transition for a task with existing workflow state.
 ///
@@ -355,6 +410,8 @@ pub enum WorkflowStepOutcome {
     /// row and the workflow-state/transition-history rows are already
     /// committed to `db`.
     Advanced { task: Task, message: String },
+    /// Work was safely replayed without changing workflow state or attempt.
+    Recovered { message: String },
     /// A precondition was not met (missing/malformed artifact, task not in
     /// the expected state, missing worktree/session, ...). No durable write
     /// happened. `message` is the exact operator-facing text the manual
@@ -2679,9 +2736,19 @@ mod launch_tests {
             .withf(|_, cmd: &str| cmd == "/exit")
             .returning(|_, _| Ok(()));
         mock_tmux.expect_send_key().returning(|_, _| Ok(()));
-        mock_tmux
-            .expect_pane_current_command()
-            .returning(|_| Some("bash".to_string()));
+        // First poll: outgoing agent already at a shell. Every poll after
+        // that: the freshly launched agent, matching a real tmux pane once
+        // `switch_agent_in_tmux` types the new command -- its final
+        // launch-detection loop requires a *recognized* agent process name,
+        // not merely any string.
+        let pane_polls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        mock_tmux.expect_pane_current_command().returning(move |_| {
+            if pane_polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Some("bash".to_string())
+            } else {
+                Some("claude".to_string())
+            }
+        });
         mock_tmux
             .expect_capture_pane()
             .returning(|_| Ok(String::new()));
@@ -2845,9 +2912,19 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             .withf(|_, cmd: &str| cmd == "/exit")
             .returning(|_, _| Ok(()));
         mock_tmux.expect_send_key().returning(|_, _| Ok(()));
-        mock_tmux
-            .expect_pane_current_command()
-            .returning(|_| Some("bash".to_string()));
+        // First poll: outgoing agent already at a shell. Every poll after
+        // that: the freshly launched agent, matching a real tmux pane once
+        // `switch_agent_in_tmux` types the new command -- its final
+        // launch-detection loop requires a *recognized* agent process name,
+        // not merely any string.
+        let pane_polls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        mock_tmux.expect_pane_current_command().returning(move |_| {
+            if pane_polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Some("bash".to_string())
+            } else {
+                Some("claude".to_string())
+            }
+        });
         mock_tmux
             .expect_capture_pane()
             .returning(|_| Ok(String::new()));
