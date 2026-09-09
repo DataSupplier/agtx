@@ -216,7 +216,7 @@ impl GitOperations for RealGitOps {
                 if has_changes {
                     tracing::warn!(
                         worktree = %worktree_path.display(),
-                        porcelain = %String::from_utf8_lossy(&output.stdout),
+                        entries = output.stdout.lines().count(),
                         "git worktree is dirty"
                     );
                 }

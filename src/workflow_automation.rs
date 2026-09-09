@@ -149,14 +149,6 @@ pub fn run_automation_tick(
         // final validation) that this driver must never second-guess or
         // bypass.
         let decision = assess(workflow, project, plugin, &task, &state, db);
-        if state.state == "integrate_to_feature" {
-            tracing::info!(
-                task_id = %task.id,
-                state = %state.state,
-                decision = ?decision,
-                "workflow automation assessed feature integration"
-            );
-        }
         if let AutomationDecision::Advance(action) = &decision {
             let action = action.clone();
             let task_id = task.id.clone();
