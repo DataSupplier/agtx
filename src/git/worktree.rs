@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -181,12 +182,19 @@ pub fn initialize_worktree(
 ) -> Vec<String> {
     let mut warnings = Vec::new();
 
-    // Always copy agent config directories, minus AGENT_CONFIG_SKIP_FILES.
+    // Always copy agent config directories, minus AGENT_CONFIG_SKIP_FILES. A
+    // worktree is already a Git checkout: never overwrite one of its tracked
+    // files with the project root's version. That would turn unrelated agent
+    // configuration (and sometimes only its line endings) into task changes
+    // that the integration step could accidentally stage and merge.
+    let tracked_worktree_paths = tracked_worktree_paths(worktree_path);
     for dir_name in AGENT_CONFIG_DIRS {
         let src = project_path.join(dir_name);
         if src.is_dir() {
             let dst = worktree_path.join(dir_name);
-            if let Err(e) = copy_agent_config_dir(&src, &dst) {
+            if let Err(e) =
+                copy_agent_config_dir(&src, &dst, worktree_path, &tracked_worktree_paths)
+            {
                 warnings.push(format!("Failed to copy '{}' to worktree: {}", dir_name, e));
             }
         }
@@ -311,30 +319,69 @@ pub fn initialize_worktree(
     warnings
 }
 
-/// Copy an agent config directory into a worktree, skipping
-/// [`AGENT_CONFIG_SKIP_FILES`] at every depth.
+/// Copy an agent config directory into a worktree without overwriting tracked
+/// checkout files, and skipping [`AGENT_CONFIG_SKIP_FILES`] at every depth.
 ///
 /// Deliberately separate from [`copy_dir_recursive`], which stays a
 /// general-purpose helper used for plugin and user-specified directories where
 /// no permission boundary applies. The exclusion is applied here, at the copy
 /// itself, rather than by deleting the file afterwards: a permission boundary
 /// should never depend on a cleanup step that a later error path could skip.
-fn copy_agent_config_dir(src: &Path, dst: &Path) -> Result<()> {
+fn copy_agent_config_dir(
+    src: &Path,
+    dst: &Path,
+    worktree_path: &Path,
+    tracked_worktree_paths: &HashSet<String>,
+) -> Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let src_path = entry.path();
         let name = entry.file_name();
+        let dst_path = dst.join(&name);
         if src_path.is_dir() {
-            copy_agent_config_dir(&src_path, &dst.join(&name))?;
+            copy_agent_config_dir(&src_path, &dst_path, worktree_path, tracked_worktree_paths)?;
         } else if !AGENT_CONFIG_SKIP_FILES
             .iter()
             .any(|skip| name.as_os_str() == *skip)
+            && !is_tracked_worktree_path(worktree_path, &dst_path, tracked_worktree_paths)
         {
-            std::fs::copy(&src_path, dst.join(&name))?;
+            std::fs::copy(&src_path, dst_path)?;
         }
     }
     Ok(())
+}
+
+fn tracked_worktree_paths(worktree_path: &Path) -> HashSet<String> {
+    let Ok(output) = Command::new("git")
+        .current_dir(worktree_path)
+        .args(["ls-files", "-z"])
+        .output()
+    else {
+        return HashSet::new();
+    };
+    if !output.status.success() {
+        return HashSet::new();
+    }
+
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).replace('\\', "/"))
+        .collect()
+}
+
+fn is_tracked_worktree_path(
+    worktree_path: &Path,
+    destination: &Path,
+    tracked_worktree_paths: &HashSet<String>,
+) -> bool {
+    destination
+        .strip_prefix(worktree_path)
+        .ok()
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .is_some_and(|path| tracked_worktree_paths.contains(&path))
 }
 
 /// Recursively copy a directory and its contents.
@@ -468,6 +515,20 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn run_git(path: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(path)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn test_run_worktree_script_captures_output_and_env() {
         let temp_dir = TempDir::new().unwrap();
@@ -486,5 +547,57 @@ mod tests {
         let output = run_worktree_script("exit 42", temp_dir.path(), &[]).unwrap();
 
         assert!(!output.status.success());
+    }
+
+    #[test]
+    fn initialize_worktree_does_not_overwrite_tracked_agent_config() {
+        let temp_dir = TempDir::new().unwrap();
+        let project = temp_dir.path().join("project");
+        let worktree = temp_dir.path().join("task-worktree");
+        std::fs::create_dir_all(project.join(".claude")).unwrap();
+        std::fs::write(project.join(".claude/agent.md"), "task branch version\n").unwrap();
+
+        std::fs::create_dir_all(&project).unwrap();
+        run_git(&project, &["init"]);
+        run_git(&project, &["config", "user.email", "test@example.invalid"]);
+        run_git(&project, &["config", "user.name", "AGTX test"]);
+        run_git(&project, &["add", "."]);
+        run_git(&project, &["commit", "-m", "base"]);
+        run_git(
+            &project,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "task/agent-config-copy",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        let task_branch_bytes = std::fs::read(worktree.join(".claude/agent.md")).unwrap();
+
+        // This models a newer or differently-normalized config in the project
+        // root. It must not replace the task branch's tracked checkout file.
+        std::fs::write(project.join(".claude/agent.md"), "project root version\r\n").unwrap();
+        std::fs::create_dir_all(project.join(".claude/commands")).unwrap();
+        std::fs::write(project.join(".claude/commands/local.md"), "local helper\n").unwrap();
+
+        let warnings = initialize_worktree(&project, &worktree, None, None, &[]);
+
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+        assert_eq!(
+            std::fs::read(worktree.join(".claude/agent.md")).unwrap(),
+            task_branch_bytes,
+            "initialization must preserve the task checkout byte-for-byte"
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.join(".claude/commands/local.md")).unwrap(),
+            "local helper\n"
+        );
+        let status = Command::new("git")
+            .current_dir(&worktree)
+            .args(["status", "--short", "--", ".claude/agent.md"])
+            .output()
+            .unwrap();
+        assert!(status.stdout.is_empty(), "tracked config was modified");
     }
 }
