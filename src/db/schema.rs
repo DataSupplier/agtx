@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Transaction};
 use std::path::Path;
 
 use super::models::{
@@ -691,6 +691,67 @@ impl Database {
         record: &WorkflowTransitionRecord,
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
+        Self::apply_workflow_state_step(&tx, state, record)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Atomically advance durable workflow state through a chain of two or
+    /// more already-validated transitions, committing every step or none of
+    /// them.
+    ///
+    /// Some workflow steps (e.g. `submit_workflow_implementation`, which
+    /// fuses `implementation_complete` with `start_engineering_review`) fire
+    /// two transitions back to back so a task never observably rests between
+    /// them. Persisting each with its own call to [`Self::advance_workflow_state`]
+    /// would let the second call fail (e.g. the concurrent-modification guard
+    /// below firing on a race) after the first already committed, leaving the
+    /// task stranded mid-chain with only half the intended history recorded.
+    /// Sharing one transaction across every step makes the whole chain
+    /// atomic: either every state row and history entry lands together, or
+    /// the transaction rolls back and nothing changed.
+    pub fn advance_workflow_state_chain(
+        &mut self,
+        steps: &[(&WorkflowTaskState, &WorkflowTransitionRecord)],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for (state, record) in steps {
+            Self::apply_workflow_state_step(&tx, state, record)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Applies one already-validated transition's row update and history
+    /// insert within an open transaction, but only if the row is still in the
+    /// exact state `prepare_transition` validated it against. Shared by
+    /// [`Self::advance_workflow_state`] (a single transition, its own
+    /// transaction) and [`Self::advance_workflow_state_chain`] (multiple
+    /// transitions, one shared transaction) so both apply the exact same
+    /// compare-and-set semantics per step.
+    ///
+    /// `prepare_transition` reads its own snapshot of the current row,
+    /// checks the graph/guards against it, and hands the *caller* a computed
+    /// destination state to persist here -- it never re-reads the row itself.
+    /// Between that read and this write, another caller can win the same
+    /// race (a manual keypress, a queued MCP/web transition request, and an
+    /// automation tick can all observe the same "before" row before any of
+    /// them commits). Without a compare-and-set here, every one of them
+    /// would succeed, each silently overwriting the last and leaving a
+    /// duplicate, `from_state`-identical row in the transition history --
+    /// exactly the "never duplicate a transition" failure mode automation
+    /// must not introduce. The `WHERE ... AND state = ?13` clause makes the
+    /// second (or third) racing writer fail cleanly instead: zero rows
+    /// affected becomes an error, the whole transaction rolls back (no
+    /// state update AND no history row), and the caller's `?` turns that
+    /// into a `Blocked`/no-op for this tick -- the next tick re-reads the
+    /// now-current row and decides fresh, which is always safe because
+    /// nothing here is ever treated as sticky.
+    fn apply_workflow_state_step(
+        tx: &Transaction,
+        state: &WorkflowTaskState,
+        record: &WorkflowTransitionRecord,
+    ) -> Result<()> {
         let updated = tx.execute(
             r#"
             UPDATE workflow_task_states SET
@@ -726,7 +787,6 @@ impl Database {
                 record.created_at.to_rfc3339(),
             ],
         )?;
-        tx.commit()?;
         Ok(())
     }
 

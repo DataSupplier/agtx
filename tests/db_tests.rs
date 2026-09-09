@@ -978,6 +978,98 @@ fn advance_workflow_state_rejects_a_transition_from_a_stale_snapshot() {
     assert_eq!(history.len(), 1, "the rejected transition must not leave a duplicate history row");
 }
 
+/// `advance_workflow_state_chain` commits every step of a multi-hop
+/// transition (e.g. `submit_workflow_implementation`'s
+/// `implementation_complete` + `start_engineering_review` pair) as one
+/// transaction: both state rows and both history rows land together.
+#[test]
+#[cfg(feature = "test-mocks")]
+fn advance_workflow_state_chain_commits_every_step_together() {
+    let mut db = Database::open_in_memory_project().unwrap();
+    let task = Task::new("F5.1", "claude", "heaves");
+    db.create_task(&task).unwrap();
+    let state = WorkflowTaskState::new(&task.id, "running", "feature/poc");
+    db.upsert_workflow_task_state(&state).unwrap();
+
+    let mut implemented = state.clone();
+    implemented.state = "implementing_complete".into();
+    let implemented_transition = WorkflowTransitionRecord::new(
+        &task.id,
+        "implementation_complete",
+        "running",
+        "implementing_complete",
+    );
+
+    let mut review = implemented.clone();
+    review.state = "engineering_review".into();
+    let review_transition = WorkflowTransitionRecord::new(
+        &task.id,
+        "start_engineering_review",
+        "implementing_complete",
+        "engineering_review",
+    );
+
+    db.advance_workflow_state_chain(&[
+        (&implemented, &implemented_transition),
+        (&review, &review_transition),
+    ])
+    .unwrap();
+
+    assert_eq!(db.get_workflow_task_state(&task.id).unwrap().unwrap().state, "engineering_review");
+    let history = db.workflow_transition_history(&task.id).unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].action, "implementation_complete");
+    assert_eq!(history[1].action, "start_engineering_review");
+}
+
+/// If any step in a chain fails its compare-and-set (the row no longer
+/// matches that step's expected `from_state`), the whole chain must roll
+/// back -- not just the failing step. Otherwise a task could be left with
+/// the first hop committed but the second silently dropped, exactly the
+/// stranded-mid-chain failure mode `advance_workflow_state_chain` exists to
+/// prevent.
+#[test]
+#[cfg(feature = "test-mocks")]
+fn advance_workflow_state_chain_rolls_back_every_step_if_one_fails() {
+    let mut db = Database::open_in_memory_project().unwrap();
+    let task = Task::new("F5.2", "claude", "heaves");
+    db.create_task(&task).unwrap();
+    let state = WorkflowTaskState::new(&task.id, "running", "feature/poc");
+    db.upsert_workflow_task_state(&state).unwrap();
+
+    let mut implemented = state.clone();
+    implemented.state = "implementing_complete".into();
+    let implemented_transition = WorkflowTransitionRecord::new(
+        &task.id,
+        "implementation_complete",
+        "running",
+        "implementing_complete",
+    );
+
+    let mut review = implemented.clone();
+    review.state = "engineering_review".into();
+    // Wrong `from_state`: the row will actually be "implementing_complete" by
+    // the time this step runs, not "planning" -- forcing this step's
+    // compare-and-set to affect zero rows.
+    let review_transition = WorkflowTransitionRecord::new(
+        &task.id,
+        "start_engineering_review",
+        "planning",
+        "engineering_review",
+    );
+
+    let result = db.advance_workflow_state_chain(&[
+        (&implemented, &implemented_transition),
+        (&review, &review_transition),
+    ]);
+    assert!(result.is_err(), "a failing step must fail the whole chain");
+
+    // The first step's write must not have stuck around: the row is still at
+    // its pre-chain state, and no history rows were left behind.
+    assert_eq!(db.get_workflow_task_state(&task.id).unwrap().unwrap().state, "running");
+    assert_eq!(db.workflow_transition_history(&task.id).unwrap().len(), 0);
+}
+
 #[test]
 #[cfg(feature = "test-mocks")]
 fn deleting_a_task_removes_its_workflow_evidence() {

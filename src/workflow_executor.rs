@@ -429,6 +429,12 @@ pub fn start_workflow_planning(
     let policy = project_workflow.policy_for_state(workflow, &planning_state)?;
     let command = build_policy_agent_command(agent_ops.as_ref(), &planner, &prompt, policy.as_ref(), Some(Path::new(&worktree)));
 
+    if let Some(transitions) = &transitions {
+        for prepared in transitions {
+            db.advance_workflow_state(&prepared.state, &prepared.transition)?;
+        }
+    }
+
     if restarting && runtime.tmux_ops.window_exists(&target).unwrap_or(false) {
         switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command);
     } else {
@@ -442,11 +448,6 @@ pub fn start_workflow_planning(
         )?;
     }
 
-    if let Some(transitions) = transitions {
-        for prepared in &transitions {
-            db.advance_workflow_state(&prepared.state, &prepared.transition)?;
-        }
-    }
     task.status = TaskStatus::Planning;
     task.agent = planner;
     task.session_name = Some(target);
@@ -519,6 +520,7 @@ pub fn submit_workflow_plan(
         .clone()
         .ok_or_else(|| anyhow::anyhow!("Planning session is unavailable"))?;
     let previous_agent = task.agent.clone();
+    db.advance_workflow_state(&handoff.state, &handoff.transition)?;
     let policy = project_workflow.policy_for_state(workflow, &handoff.state.state)?;
     if let Some(policy) = policy.as_ref() {
         let command = build_policy_agent_command(
@@ -554,7 +556,6 @@ pub fn submit_workflow_plan(
     task.status = TaskStatus::Review;
     task.agent = reviewer;
     task.updated_at = chrono::Utc::now();
-    db.advance_workflow_state(&handoff.state, &handoff.transition)?;
     db.update_task(&task)?;
     Ok(WorkflowStepOutcome::Advanced {
         message: format!("Plan revision {revision} submitted for review"),
@@ -786,9 +787,11 @@ pub fn submit_workflow_implementation(
         policy.as_ref(),
         Some(Path::new(&worktree)),
     );
+    db.advance_workflow_state_chain(&[
+        (&implemented.state, &implemented.transition),
+        (&review.state, &review.transition),
+    ])?;
     switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command);
-    db.advance_workflow_state(&implemented.state, &implemented.transition)?;
-    db.advance_workflow_state(&review.state, &review.transition)?;
     task.status = TaskStatus::Review;
     task.agent = reviewer;
     task.updated_at = chrono::Utc::now();
@@ -854,8 +857,8 @@ pub fn submit_engineering_review(
         policy.as_ref(),
         Some(Path::new(&worktree)),
     );
-    switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command);
     db.advance_workflow_state(&transition.state, &transition.transition)?;
+    switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command);
     task.status = status;
     task.agent = next_agent;
     task.updated_at = chrono::Utc::now();
@@ -946,8 +949,8 @@ pub fn submit_final_validation(
         let review_artifact = workflow_artifact_path(&worktree, plugin.artifacts.review.as_deref(), &task.id, ".agent-flow/engineering-review.yaml");
         archive_workflow_artifact(&review_artifact, "superseded-after-validation-failure")?;
     }
-    switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command);
     db.advance_workflow_state(&transition.state, &transition.transition)?;
+    switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command);
     task.status = TaskStatus::Review;
     task.agent = next_agent;
     task.updated_at = chrono::Utc::now();
@@ -1978,5 +1981,489 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             sent.contains("Current workflow attempt: 2. Your output artifact MUST contain the line: workflow_attempt: 2"),
             "expected the destination state_attempt (2) in the launched prompt, got: {sent}"
         );
+    }
+
+    /// Opens an independent connection to the same on-disk database `path`
+    /// points at and asserts the task's durable workflow state has already
+    /// reached `expected_state`.
+    ///
+    /// Called from inside a tmux-mock closure that fires during a function's
+    /// launch step: `db` itself is exclusively borrowed by the call under
+    /// test for its whole duration, so this cannot read through that same
+    /// handle. `Database::open_project_at_path` (gated behind `test-mocks`
+    /// for exactly this "concurrency tests" purpose, see its doc comment)
+    /// opens a second, independent connection to the same file instead. If
+    /// persistence were ever moved back to *after* the launch call -- the bug
+    /// this reorder fixed -- this assertion would see the pre-transition
+    /// state and fail.
+    fn assert_state_already_persisted(path: &Path, task_id: &str, expected_state: &str) {
+        let check_db = Database::open_project_at_path(path).unwrap();
+        let state = check_db
+            .get_workflow_task_state(task_id)
+            .unwrap()
+            .expect("workflow state row must exist by the time the agent launch fires");
+        assert_eq!(
+            state.state, expected_state,
+            "durable state must already reflect '{expected_state}' by the time the agent launch \
+             fires -- persistence must happen before launch, not after"
+        );
+    }
+
+    /// `start_workflow_planning` reorder-proof: `admission_complete` and
+    /// `start_planning` are each persisted via `advance_workflow_state`
+    /// *before* the planner is launched. Forces the `admission` ->
+    /// `ready_for_planning` -> `planning` two-hop path (see the doc comment
+    /// on `start_workflow_planning` for why this case stays two separate
+    /// calls rather than one `advance_workflow_state_chain`) and checks, from
+    /// inside the `create_window` mock, that both hops already landed.
+    #[test]
+    fn start_workflow_planning_persists_before_launching_the_planner() {
+        let graph = WorkflowDefinition {
+            initial_state: "admission".into(),
+            states: vec![
+                WorkflowState { id: "admission".into(), label: "Admission".into(), role: None, terminal: false },
+                WorkflowState { id: "ready_for_planning".into(), label: "Ready for planning".into(), role: None, terminal: false },
+                WorkflowState { id: "planning".into(), label: "Planning".into(), role: Some("planner".into()), terminal: true },
+            ],
+            transitions: vec![
+                WorkflowTransition {
+                    action: "admission_complete".into(),
+                    from: "admission".into(),
+                    to: "ready_for_planning".into(),
+                    guards: vec![crate::workflow::WorkflowGuard::AdmissionRecorded],
+                },
+                WorkflowTransition {
+                    action: "start_planning".into(),
+                    from: "ready_for_planning".into(),
+                    to: "planning".into(),
+                    guards: vec![],
+                },
+            ],
+        };
+        graph.validate().unwrap();
+
+        let mut project = WorkflowProjectConfig {
+            target_branch: "main".into(),
+            role_bindings: Default::default(),
+            ..Default::default()
+        };
+        project.role_bindings.insert("planner".into(), "claude".into());
+        project.role_policies.roles.insert("planner".into(), WorkflowRolePolicy::default());
+
+        let plugin = plugin(graph.clone());
+
+        let worktree = tempfile::tempdir().unwrap();
+        let mut task = crate::db::Task::new("Plan thing", "claude", "proj");
+        task.worktree_path = Some(worktree.path().to_string_lossy().to_string());
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("wf.db");
+        let mut db = Database::open_project_at_path(&db_path).unwrap();
+        db.create_task(&task).unwrap();
+        let current = WorkflowTaskState::new(&task.id, "admission", "main");
+        let record = WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "admission");
+        db.record_workflow_admission(&task, &current, &record).unwrap();
+
+        let mut mock_tmux = MockTmuxOperations::new();
+        mock_tmux.expect_has_session().returning(|_| true);
+        let task_id_for_check = task.id.clone();
+        let db_path_for_check = db_path.clone();
+        mock_tmux.expect_create_window().returning(move |_, _, _, _, _, _| {
+            assert_state_already_persisted(&db_path_for_check, &task_id_for_check, "planning");
+            Ok(())
+        });
+
+        let mut mock_registry = MockAgentRegistry::new();
+        mock_registry.expect_get().returning(|_| Arc::new(MockAgentOperations::new()) as Arc<dyn AgentOperations>);
+
+        let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(mock_tmux);
+        let agent_registry: Arc<dyn AgentRegistry> = Arc::new(mock_registry);
+        let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
+        let config = merged_config();
+        let flags = feature_flags();
+        let runtime = WorkflowRuntime {
+            tmux_ops: &tmux_ops,
+            agent_registry: &agent_registry,
+            git_ops: &git_ops,
+            tmux_project_name: "proj",
+            project_path: Path::new("C:/work/project"),
+            config: &config,
+            flags: &flags,
+        };
+
+        let outcome = start_workflow_planning(&graph, &project, &plugin, task.clone(), &mut db, &runtime).unwrap();
+        assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
+
+        // Both hops committed for real, not just observed mid-flight.
+        assert_eq!(db.get_workflow_task_state(&task.id).unwrap().unwrap().state, "planning");
+        assert_eq!(db.workflow_transition_history(&task.id).unwrap().len(), 3);
+    }
+
+    /// `submit_workflow_plan` reorder-proof: `submit_plan` is persisted
+    /// before the plan reviewer is launched. Configures a role policy for
+    /// `plan_reviewer` so the function takes its synchronous
+    /// `switch_agent_in_tmux` path rather than the fire-and-forget
+    /// `spawn_send_to_agent` fallback, then checks -- from inside the mock's
+    /// exit-command `send_keys` call, the first thing `switch_agent_in_tmux`
+    /// does -- that the new state already landed.
+    #[test]
+    fn submit_workflow_plan_persists_before_launching_the_reviewer() {
+        let graph = WorkflowDefinition {
+            initial_state: "planning".into(),
+            states: vec![
+                WorkflowState { id: "planning".into(), label: "Planning".into(), role: Some("planner".into()), terminal: false },
+                WorkflowState { id: "plan_review".into(), label: "Plan review".into(), role: Some("plan_reviewer".into()), terminal: true },
+            ],
+            transitions: vec![WorkflowTransition {
+                action: "submit_plan".into(),
+                from: "planning".into(),
+                to: "plan_review".into(),
+                guards: vec![],
+            }],
+        };
+        graph.validate().unwrap();
+
+        let mut project = WorkflowProjectConfig {
+            target_branch: "main".into(),
+            role_bindings: Default::default(),
+            ..Default::default()
+        };
+        project.role_bindings.insert("planner".into(), "claude".into());
+        project.role_bindings.insert("plan_reviewer".into(), "claude".into());
+        project.role_policies.roles.insert("plan_reviewer".into(), WorkflowRolePolicy::default());
+
+        let mut plugin = plugin(graph.clone());
+        plugin.artifacts.planning = Some(".agent-flow/plan.yaml".into());
+
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
+        std::fs::write(
+            worktree.path().join(".agent-flow/plan.yaml"),
+            "plan_revision: 1\n",
+        )
+        .unwrap();
+
+        let mut task = crate::db::Task::new("Plan thing", "claude", "proj");
+        task.worktree_path = Some(worktree.path().to_string_lossy().to_string());
+        task.session_name = Some("proj:task-plan".into());
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("wf.db");
+        let mut db = Database::open_project_at_path(&db_path).unwrap();
+        db.create_task(&task).unwrap();
+        let current = WorkflowTaskState::new(&task.id, "planning", "main");
+        let record = WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "planning");
+        db.record_workflow_admission(&task, &current, &record).unwrap();
+
+        let mut mock_tmux = MockTmuxOperations::new();
+        let task_id_for_check = task.id.clone();
+        let db_path_for_check = db_path.clone();
+        mock_tmux.expect_send_keys().withf(|_, cmd: &str| cmd == "/exit").returning(move |_, _| {
+            assert_state_already_persisted(&db_path_for_check, &task_id_for_check, "plan_review");
+            Ok(())
+        });
+        mock_tmux.expect_send_key().returning(|_, _| Ok(()));
+        mock_tmux.expect_pane_current_command().returning(|_| Some("bash".to_string()));
+        mock_tmux.expect_capture_pane().returning(|_| Ok(String::new()));
+        mock_tmux.expect_paste_text().returning(|_, _| Ok(()));
+
+        let mut mock_registry = MockAgentRegistry::new();
+        mock_registry.expect_get().returning(|_| Arc::new(MockAgentOperations::new()) as Arc<dyn AgentOperations>);
+
+        let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(mock_tmux);
+        let agent_registry: Arc<dyn AgentRegistry> = Arc::new(mock_registry);
+        let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
+        let config = merged_config();
+        let flags = feature_flags();
+        let runtime = WorkflowRuntime {
+            tmux_ops: &tmux_ops,
+            agent_registry: &agent_registry,
+            git_ops: &git_ops,
+            tmux_project_name: "proj",
+            project_path: Path::new("C:/work/project"),
+            config: &config,
+            flags: &flags,
+        };
+
+        let outcome = submit_workflow_plan(&graph, &project, &plugin, task.clone(), &mut db, &runtime).unwrap();
+        assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
+        assert_eq!(db.get_workflow_task_state(&task.id).unwrap().unwrap().state, "plan_review");
+    }
+
+    /// `submit_workflow_implementation` reorder-proof: both chained
+    /// transitions (`implementation_complete`, `start_engineering_review`)
+    /// must already be committed -- via `advance_workflow_state_chain` in one
+    /// transaction -- before the engineering reviewer is launched.
+    #[test]
+    fn submit_workflow_implementation_persists_the_chain_before_launching_the_reviewer() {
+        let graph = WorkflowDefinition {
+            initial_state: "running".into(),
+            states: vec![
+                WorkflowState { id: "running".into(), label: "Running".into(), role: Some("implementer".into()), terminal: false },
+                WorkflowState { id: "implementing_complete".into(), label: "Implementation complete".into(), role: None, terminal: false },
+                WorkflowState { id: "engineering_review".into(), label: "Engineering review".into(), role: Some("reviewer".into()), terminal: true },
+            ],
+            transitions: vec![
+                WorkflowTransition {
+                    action: "implementation_complete".into(),
+                    from: "running".into(),
+                    to: "implementing_complete".into(),
+                    guards: vec![],
+                },
+                WorkflowTransition {
+                    action: "start_engineering_review".into(),
+                    from: "implementing_complete".into(),
+                    to: "engineering_review".into(),
+                    guards: vec![],
+                },
+            ],
+        };
+        graph.validate().unwrap();
+
+        let mut project = WorkflowProjectConfig {
+            target_branch: "main".into(),
+            role_bindings: Default::default(),
+            ..Default::default()
+        };
+        project.role_bindings.insert("implementer".into(), "claude".into());
+        project.role_bindings.insert("reviewer".into(), "claude".into());
+        project.role_policies.roles.insert("reviewer".into(), WorkflowRolePolicy::default());
+
+        let plugin = plugin(graph.clone());
+
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
+        std::fs::write(
+            worktree.path().join(".agent-flow/implementation-result.yaml"),
+            "status: done\n",
+        )
+        .unwrap();
+
+        let mut task = crate::db::Task::new("Implement thing", "claude", "proj");
+        task.worktree_path = Some(worktree.path().to_string_lossy().to_string());
+        task.session_name = Some("proj:task-impl".into());
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("wf.db");
+        let mut db = Database::open_project_at_path(&db_path).unwrap();
+        db.create_task(&task).unwrap();
+        let current = WorkflowTaskState::new(&task.id, "running", "main");
+        let record = WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "running");
+        db.record_workflow_admission(&task, &current, &record).unwrap();
+
+        let mut mock_tmux = MockTmuxOperations::new();
+        let task_id_for_check = task.id.clone();
+        let db_path_for_check = db_path.clone();
+        mock_tmux.expect_send_keys().withf(|_, cmd: &str| cmd == "/exit").returning(move |_, _| {
+            assert_state_already_persisted(&db_path_for_check, &task_id_for_check, "engineering_review");
+            Ok(())
+        });
+        mock_tmux.expect_send_key().returning(|_, _| Ok(()));
+        mock_tmux.expect_pane_current_command().returning(|_| Some("bash".to_string()));
+        mock_tmux.expect_capture_pane().returning(|_| Ok(String::new()));
+        mock_tmux.expect_paste_text().returning(|_, _| Ok(()));
+
+        let mut mock_registry = MockAgentRegistry::new();
+        mock_registry.expect_get().returning(|_| Arc::new(MockAgentOperations::new()) as Arc<dyn AgentOperations>);
+
+        let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(mock_tmux);
+        let agent_registry: Arc<dyn AgentRegistry> = Arc::new(mock_registry);
+        let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
+        let config = merged_config();
+        let flags = feature_flags();
+        let runtime = WorkflowRuntime {
+            tmux_ops: &tmux_ops,
+            agent_registry: &agent_registry,
+            git_ops: &git_ops,
+            tmux_project_name: "proj",
+            project_path: Path::new("C:/work/project"),
+            config: &config,
+            flags: &flags,
+        };
+
+        let outcome = submit_workflow_implementation(&graph, &project, &plugin, task.clone(), &mut db, &runtime).unwrap();
+        assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
+
+        // Both chained hops committed for real, in one transaction.
+        assert_eq!(db.get_workflow_task_state(&task.id).unwrap().unwrap().state, "engineering_review");
+        let history = db.workflow_transition_history(&task.id).unwrap();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[1].action, "implementation_complete");
+        assert_eq!(history[2].action, "start_engineering_review");
+    }
+
+    /// `submit_engineering_review` reorder-proof: the resolved verdict
+    /// transition is persisted before the next agent (the validator, for an
+    /// `approved_for_validation` verdict) is launched.
+    #[test]
+    fn submit_engineering_review_persists_before_launching_the_next_agent() {
+        let graph = WorkflowDefinition {
+            initial_state: "engineering_review".into(),
+            states: vec![
+                WorkflowState { id: "engineering_review".into(), label: "Engineering review".into(), role: Some("reviewer".into()), terminal: false },
+                WorkflowState { id: "final_validation".into(), label: "Final validation".into(), role: Some("validator".into()), terminal: true },
+            ],
+            transitions: vec![WorkflowTransition {
+                action: "start_final_validation".into(),
+                from: "engineering_review".into(),
+                to: "final_validation".into(),
+                guards: vec![],
+            }],
+        };
+        graph.validate().unwrap();
+
+        let mut project = WorkflowProjectConfig {
+            target_branch: "main".into(),
+            role_bindings: Default::default(),
+            ..Default::default()
+        };
+        project.role_bindings.insert("reviewer".into(), "claude".into());
+        project.role_bindings.insert("validator".into(), "claude".into());
+        project.role_policies.roles.insert("validator".into(), WorkflowRolePolicy::default());
+
+        let plugin = plugin(graph.clone());
+
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
+        std::fs::write(
+            worktree.path().join(".agent-flow/engineering-review.yaml"),
+            "verdict: approved_for_validation\n",
+        )
+        .unwrap();
+
+        let mut task = crate::db::Task::new("Review thing", "claude", "proj");
+        task.worktree_path = Some(worktree.path().to_string_lossy().to_string());
+        task.session_name = Some("proj:task-review".into());
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("wf.db");
+        let mut db = Database::open_project_at_path(&db_path).unwrap();
+        db.create_task(&task).unwrap();
+        let current = WorkflowTaskState::new(&task.id, "engineering_review", "main");
+        let record = WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "engineering_review");
+        db.record_workflow_admission(&task, &current, &record).unwrap();
+
+        let mut mock_tmux = MockTmuxOperations::new();
+        let task_id_for_check = task.id.clone();
+        let db_path_for_check = db_path.clone();
+        mock_tmux.expect_send_keys().withf(|_, cmd: &str| cmd == "/exit").returning(move |_, _| {
+            assert_state_already_persisted(&db_path_for_check, &task_id_for_check, "final_validation");
+            Ok(())
+        });
+        mock_tmux.expect_send_key().returning(|_, _| Ok(()));
+        mock_tmux.expect_pane_current_command().returning(|_| Some("bash".to_string()));
+        mock_tmux.expect_capture_pane().returning(|_| Ok(String::new()));
+        mock_tmux.expect_paste_text().returning(|_, _| Ok(()));
+
+        let mut mock_registry = MockAgentRegistry::new();
+        mock_registry.expect_get().returning(|_| Arc::new(MockAgentOperations::new()) as Arc<dyn AgentOperations>);
+
+        let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(mock_tmux);
+        let agent_registry: Arc<dyn AgentRegistry> = Arc::new(mock_registry);
+        let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
+        let config = merged_config();
+        let flags = feature_flags();
+        let runtime = WorkflowRuntime {
+            tmux_ops: &tmux_ops,
+            agent_registry: &agent_registry,
+            git_ops: &git_ops,
+            tmux_project_name: "proj",
+            project_path: Path::new("C:/work/project"),
+            config: &config,
+            flags: &flags,
+        };
+
+        let outcome = submit_engineering_review(&graph, &project, &plugin, task.clone(), &mut db, &runtime).unwrap();
+        assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
+        assert_eq!(db.get_workflow_task_state(&task.id).unwrap().unwrap().state, "final_validation");
+    }
+
+    /// `submit_final_validation` reorder-proof: a `passed` verdict's
+    /// `begin_feature_integration` transition is persisted before the next
+    /// agent is launched. `archive_workflow_artifact` only runs on the
+    /// `failed` path (see the function's own doc comment), so it is not
+    /// exercised here; this test only covers the persist/launch ordering the
+    /// plan changed.
+    #[test]
+    fn submit_final_validation_persists_before_launching_the_next_agent() {
+        let graph = WorkflowDefinition {
+            initial_state: "final_validation".into(),
+            states: vec![
+                WorkflowState { id: "final_validation".into(), label: "Final validation".into(), role: Some("validator".into()), terminal: false },
+                WorkflowState { id: "integrate_to_feature".into(), label: "Integrate to feature".into(), role: Some("integrator".into()), terminal: true },
+            ],
+            transitions: vec![WorkflowTransition {
+                action: "begin_feature_integration".into(),
+                from: "final_validation".into(),
+                to: "integrate_to_feature".into(),
+                guards: vec![crate::workflow::WorkflowGuard::FinalValidationPassed],
+            }],
+        };
+        graph.validate().unwrap();
+
+        let mut project = WorkflowProjectConfig {
+            target_branch: "main".into(),
+            role_bindings: Default::default(),
+            ..Default::default()
+        };
+        project.role_bindings.insert("validator".into(), "claude".into());
+        project.role_bindings.insert("integrator".into(), "claude".into());
+        project.role_policies.roles.insert("integrator".into(), WorkflowRolePolicy::default());
+
+        let plugin = plugin(graph.clone());
+
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
+        std::fs::write(
+            worktree.path().join(".agent-flow/final-validation.yaml"),
+            "verdict: passed\n",
+        )
+        .unwrap();
+
+        let mut task = crate::db::Task::new("Validate thing", "claude", "proj");
+        task.worktree_path = Some(worktree.path().to_string_lossy().to_string());
+        task.session_name = Some("proj:task-validate".into());
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("wf.db");
+        let mut db = Database::open_project_at_path(&db_path).unwrap();
+        db.create_task(&task).unwrap();
+        let current = WorkflowTaskState::new(&task.id, "final_validation", "main");
+        let record = WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "final_validation");
+        db.record_workflow_admission(&task, &current, &record).unwrap();
+
+        let mut mock_tmux = MockTmuxOperations::new();
+        let task_id_for_check = task.id.clone();
+        let db_path_for_check = db_path.clone();
+        mock_tmux.expect_send_keys().withf(|_, cmd: &str| cmd == "/exit").returning(move |_, _| {
+            assert_state_already_persisted(&db_path_for_check, &task_id_for_check, "integrate_to_feature");
+            Ok(())
+        });
+        mock_tmux.expect_send_key().returning(|_, _| Ok(()));
+        mock_tmux.expect_pane_current_command().returning(|_| Some("bash".to_string()));
+        mock_tmux.expect_capture_pane().returning(|_| Ok(String::new()));
+        mock_tmux.expect_paste_text().returning(|_, _| Ok(()));
+
+        let mut mock_registry = MockAgentRegistry::new();
+        mock_registry.expect_get().returning(|_| Arc::new(MockAgentOperations::new()) as Arc<dyn AgentOperations>);
+
+        let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(mock_tmux);
+        let agent_registry: Arc<dyn AgentRegistry> = Arc::new(mock_registry);
+        let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
+        let config = merged_config();
+        let flags = feature_flags();
+        let runtime = WorkflowRuntime {
+            tmux_ops: &tmux_ops,
+            agent_registry: &agent_registry,
+            git_ops: &git_ops,
+            tmux_project_name: "proj",
+            project_path: Path::new("C:/work/project"),
+            config: &config,
+            flags: &flags,
+        };
+
+        let outcome = submit_final_validation(&graph, &project, &plugin, task.clone(), &mut db, &runtime).unwrap();
+        assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
+        assert_eq!(db.get_workflow_task_state(&task.id).unwrap().unwrap().state, "integrate_to_feature");
     }
 }
