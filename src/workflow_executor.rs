@@ -20,8 +20,8 @@ use crate::tmux::TmuxOperations;
 use crate::tui::app::{
     agtx_task_env, archive_workflow_artifact, build_policy_agent_command,
     ensure_project_tmux_session, ensure_review_addresses_failed_validation, generate_task_slug,
-    plan_revision, planning_artifact_path, resolve_prompt,
-    switch_agent_in_tmux, workflow_artifact_path, workflow_artifact_sha256, workflow_artifact_value,
+    plan_revision, planning_artifact_path, resolve_prompt, switch_agent_in_tmux,
+    workflow_artifact_path, workflow_artifact_sha256, workflow_artifact_value,
 };
 use crate::workflow::{GuardContext, WorkflowDefinition, WorkflowProjectConfig};
 
@@ -63,9 +63,12 @@ pub fn prepare_transition(
         );
     }
     let edge = workflow.validate_transition(&current.state, action, guards)?;
-    let destination = workflow
-        .state(&edge.to)
-        .ok_or_else(|| anyhow::anyhow!("workflow transition '{}' has no destination state", edge.action))?;
+    let destination = workflow.state(&edge.to).ok_or_else(|| {
+        anyhow::anyhow!(
+            "workflow transition '{}' has no destination state",
+            edge.action
+        )
+    })?;
     let destination_agent = match &destination.role {
         Some(role) => Some(
             project
@@ -86,12 +89,8 @@ pub fn prepare_transition(
     // re-enters an already-visited state -- observably increments it by 1.
     state.state_attempt = current.state_attempt + 1;
     state.updated_at = chrono::Utc::now();
-    let mut transition = WorkflowTransitionRecord::new(
-        &current.task_id,
-        &edge.action,
-        &edge.from,
-        &edge.to,
-    );
+    let mut transition =
+        WorkflowTransitionRecord::new(&current.task_id, &edge.action, &edge.from, &edge.to);
     transition.actor_role = destination.role.clone();
     transition.actor_agent = destination_agent.clone();
 
@@ -209,15 +208,22 @@ pub fn admit_task(
     runtime: &WorkflowRuntime,
 ) -> Result<WorkflowStepOutcome> {
     let dependencies_resolved = db.deps_satisfied(&task);
-    let base_sha = match crate::git::resolve_commit(runtime.project_path, &project_workflow.target_branch) {
-        Ok(sha) => sha,
-        Err(error) => {
-            return Ok(WorkflowStepOutcome::Blocked {
-                message: format!("Cannot admit task: {error}"),
-            });
-        }
-    };
-    let admission = match prepare_admission(workflow, project_workflow, &task, dependencies_resolved, base_sha.clone()) {
+    let base_sha =
+        match crate::git::resolve_commit(runtime.project_path, &project_workflow.target_branch) {
+            Ok(sha) => sha,
+            Err(error) => {
+                return Ok(WorkflowStepOutcome::Blocked {
+                    message: format!("Cannot admit task: {error}"),
+                });
+            }
+        };
+    let admission = match prepare_admission(
+        workflow,
+        project_workflow,
+        &task,
+        dependencies_resolved,
+        base_sha.clone(),
+    ) {
         Ok(admission) => admission,
         Err(error) => {
             return Ok(WorkflowStepOutcome::Blocked {
@@ -268,8 +274,11 @@ pub fn admit_task(
     task.base_branch = Some(project_workflow.target_branch.clone());
     task.updated_at = chrono::Utc::now();
 
-    if let Err(error) = db.record_workflow_admission(&task, &admission.state, &admission.transition) {
-        let _ = runtime.git_ops.remove_worktree(runtime.project_path, &worktree_path);
+    if let Err(error) = db.record_workflow_admission(&task, &admission.state, &admission.transition)
+    {
+        let _ = runtime
+            .git_ops
+            .remove_worktree(runtime.project_path, &worktree_path);
         if let Some(branch) = &task.branch_name {
             let _ = runtime.git_ops.delete_branch(runtime.project_path, branch);
         }
@@ -353,7 +362,10 @@ pub fn start_workflow_planning(
 
     let restarting = current.state == "planning";
     let (planner, planning_state, planning_attempt, transitions) = if restarting {
-        let Some(role) = workflow.state("planning").and_then(|state| state.role.as_ref()) else {
+        let Some(role) = workflow
+            .state("planning")
+            .and_then(|state| state.role.as_ref())
+        else {
             return Ok(WorkflowStepOutcome::Blocked {
                 message: "Planning state has no workflow role".into(),
             });
@@ -395,7 +407,13 @@ pub fn start_workflow_planning(
             None
         };
         let before_planning = ready.as_ref().map(|ready| &ready.state).unwrap_or(&current);
-        let planning = match prepare_transition(workflow, project_workflow, before_planning, "start_planning", GuardContext::default()) {
+        let planning = match prepare_transition(
+            workflow,
+            project_workflow,
+            before_planning,
+            "start_planning",
+            GuardContext::default(),
+        ) {
             Ok(value) => value,
             Err(error) => {
                 return Ok(WorkflowStepOutcome::Blocked {
@@ -413,7 +431,12 @@ pub fn start_workflow_planning(
             transitions.push(ready);
         }
         transitions.push(planning.clone());
-        (agent, planning.state.state.clone(), planning.state.state_attempt, Some(transitions))
+        (
+            agent,
+            planning.state.state.clone(),
+            planning.state.state_attempt,
+            Some(transitions),
+        )
     };
 
     let agent_ops = runtime.agent_registry.get(&planner);
@@ -425,9 +448,19 @@ pub fn start_workflow_planning(
     let slug = generate_task_slug(&task.id, &task.title);
     let window_name = format!("task-{slug}");
     let target = format!("{}:{window_name}", runtime.tmux_project_name);
-    ensure_project_tmux_session(runtime.tmux_project_name, runtime.project_path, runtime.tmux_ops.as_ref());
+    ensure_project_tmux_session(
+        runtime.tmux_project_name,
+        runtime.project_path,
+        runtime.tmux_ops.as_ref(),
+    );
     let policy = project_workflow.policy_for_state(workflow, &planning_state)?;
-    let command = build_policy_agent_command(agent_ops.as_ref(), &planner, &prompt, policy.as_ref(), Some(Path::new(&worktree)));
+    let command = build_policy_agent_command(
+        agent_ops.as_ref(),
+        &planner,
+        &prompt,
+        policy.as_ref(),
+        Some(Path::new(&worktree)),
+    );
 
     if let Some(transitions) = &transitions {
         for prepared in transitions {
@@ -489,7 +522,8 @@ pub fn submit_workflow_plan(
         });
     }
     let path = planning_artifact_path(&worktree, plugin, &task.id)?;
-    let contents = std::fs::read(&path).map_err(|_| anyhow::anyhow!("Missing planning artifact: {}", path.display()))?;
+    let contents = std::fs::read(&path)
+        .map_err(|_| anyhow::anyhow!("Missing planning artifact: {}", path.display()))?;
     let revision = plan_revision(&contents).ok_or_else(|| {
         anyhow::anyhow!("Planning artifact must contain 'plan_revision: <positive integer>'")
     })?;
@@ -502,7 +536,13 @@ pub fn submit_workflow_plan(
     let mut evidenced = current;
     evidenced.plan_revision = revision;
     evidenced.plan_hash = Some(format!("{:x}", Sha256::digest(&contents)));
-    let handoff = prepare_transition(workflow, project_workflow, &evidenced, "submit_plan", GuardContext::default())?;
+    let handoff = prepare_transition(
+        workflow,
+        project_workflow,
+        &evidenced,
+        "submit_plan",
+        GuardContext::default(),
+    )?;
     let reviewer = handoff
         .destination_agent
         .clone()
@@ -531,7 +571,12 @@ pub fn submit_workflow_plan(
         policy.as_ref(),
         Some(Path::new(&worktree)),
     );
-    switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &previous_agent, &command)?;
+    switch_agent_in_tmux(
+        runtime.tmux_ops.as_ref(),
+        &target,
+        &previous_agent,
+        &command,
+    )?;
     db.advance_workflow_state(&handoff.state, &handoff.transition)?;
     task.status = TaskStatus::Review;
     task.agent = reviewer;
@@ -563,7 +608,11 @@ pub fn decide_workflow_plan(
     if current.state != "plan_review" {
         return Ok(WorkflowStepOutcome::NoOp);
     }
-    let action = if approve { "approve_plan" } else { "plan_changes_requested" };
+    let action = if approve {
+        "approve_plan"
+    } else {
+        "plan_changes_requested"
+    };
     if approve {
         current.approved_plan_revision = Some(current.plan_revision);
         current.approved_plan_hash = current.plan_hash.clone();
@@ -607,15 +656,18 @@ pub fn decide_workflow_plan(
             });
             let feedback_section = if let Some(findings) = artifact_findings {
                 let findings: String = findings.chars().take(12 * 1024).collect();
-                format!(
-                    "\n\nThe plan reviewer's recorded findings:\n---\n{findings}\n---"
-                )
+                format!("\n\nThe plan reviewer's recorded findings:\n---\n{findings}\n---")
             } else {
                 let review_feedback = runtime
                     .tmux_ops
                     .capture_pane(&target)
                     .ok()
-                    .map(|pane| tail_lines(&pane, 80).chars().take(12 * 1024).collect::<String>())
+                    .map(|pane| {
+                        tail_lines(&pane, 80)
+                            .chars()
+                            .take(12 * 1024)
+                            .collect::<String>()
+                    })
                     .filter(|text| !text.trim().is_empty());
                 match &review_feedback {
                     Some(text) => format!(
@@ -639,7 +691,12 @@ pub fn decide_workflow_plan(
                 policy.as_ref(),
                 task.worktree_path.as_deref().map(Path::new),
             );
-            switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &previous_agent, &command)?;
+            switch_agent_in_tmux(
+                runtime.tmux_ops.as_ref(),
+                &target,
+                &previous_agent,
+                &command,
+            )?;
         } else {
             return Ok(WorkflowStepOutcome::Blocked {
                 message: "Planning session is unavailable".into(),
@@ -681,14 +738,30 @@ pub fn submit_plan_review(
             message: "Submit plan review is only available in Plan review".into(),
         });
     }
-    let artifact = workflow_artifact_path(&worktree, plugin.artifacts.plan_review.as_deref(), &task.id, ".agent-flow/plan-review.yaml");
+    let artifact = workflow_artifact_path(
+        &worktree,
+        plugin.artifacts.plan_review.as_deref(),
+        &task.id,
+        ".agent-flow/plan-review.yaml",
+    );
     let verdict = workflow_artifact_value(&artifact, "verdict")?;
     let approve = match verdict.as_str() {
         "approved" => true,
         "changes_requested" => false,
-        _ => bail!("{} has unsupported plan-review verdict '{verdict}'", artifact.display()),
+        _ => bail!(
+            "{} has unsupported plan-review verdict '{verdict}'",
+            artifact.display()
+        ),
     };
-    decide_workflow_plan(workflow, project_workflow, plugin, task, approve, db, runtime)
+    decide_workflow_plan(
+        workflow,
+        project_workflow,
+        plugin,
+        task,
+        approve,
+        db,
+        runtime,
+    )
 }
 
 /// Extracted body of `App::start_selected_workflow_implementation`.
@@ -759,7 +832,11 @@ pub fn start_workflow_implementation(
     if session_available {
         let _ = switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command);
     } else {
-        ensure_project_tmux_session(runtime.tmux_project_name, runtime.project_path, runtime.tmux_ops.as_ref());
+        ensure_project_tmux_session(
+            runtime.tmux_project_name,
+            runtime.project_path,
+            runtime.tmux_ops.as_ref(),
+        );
         runtime.tmux_ops.create_window(
             runtime.tmux_project_name,
             &window_name,
@@ -815,7 +892,13 @@ pub fn submit_workflow_implementation(
             ..GuardContext::default()
         },
     )?;
-    let review = prepare_transition(workflow, project_workflow, &implemented.state, "start_engineering_review", GuardContext::default())?;
+    let review = prepare_transition(
+        workflow,
+        project_workflow,
+        &implemented.state,
+        "start_engineering_review",
+        GuardContext::default(),
+    )?;
     let reviewer = review
         .destination_agent
         .clone()
@@ -875,16 +958,38 @@ pub fn submit_engineering_review(
             message: "Submit engineering review is only available in Engineering review".into(),
         });
     }
-    let artifact = workflow_artifact_path(&worktree, plugin.artifacts.review.as_deref(), &task.id, ".agent-flow/engineering-review.yaml");
+    let artifact = workflow_artifact_path(
+        &worktree,
+        plugin.artifacts.review.as_deref(),
+        &task.id,
+        ".agent-flow/engineering-review.yaml",
+    );
     let verdict = workflow_artifact_value(&artifact, "verdict")?;
     ensure_review_addresses_failed_validation(&worktree, plugin, &task.id, &artifact, &verdict)?;
     let (action, phase, status) = match verdict.as_str() {
-        "corrections_required" => ("engineering_corrections_required", "running", TaskStatus::Running),
+        "corrections_required" => (
+            "engineering_corrections_required",
+            "running",
+            TaskStatus::Running,
+        ),
         "plan_issue" => ("engineering_plan_issue", "planning", TaskStatus::Planning),
-        "approved_for_validation" => ("start_final_validation", "final_validation", TaskStatus::Review),
-        _ => bail!("{} has unsupported engineering-review verdict '{verdict}'", artifact.display()),
+        "approved_for_validation" => (
+            "start_final_validation",
+            "final_validation",
+            TaskStatus::Review,
+        ),
+        _ => bail!(
+            "{} has unsupported engineering-review verdict '{verdict}'",
+            artifact.display()
+        ),
     };
-    let transition = prepare_transition(workflow, project_workflow, &current, action, GuardContext::default())?;
+    let transition = prepare_transition(
+        workflow,
+        project_workflow,
+        &current,
+        action,
+        GuardContext::default(),
+    )?;
     let next_agent = transition
         .destination_agent
         .clone()
@@ -944,12 +1049,20 @@ pub fn submit_final_validation(
             message: "Submit final validation is only available in Final validation".into(),
         });
     }
-    let artifact = workflow_artifact_path(&worktree, plugin.artifacts.final_validation.as_deref(), &task.id, ".agent-flow/final-validation.yaml");
+    let artifact = workflow_artifact_path(
+        &worktree,
+        plugin.artifacts.final_validation.as_deref(),
+        &task.id,
+        ".agent-flow/final-validation.yaml",
+    );
     let verdict = workflow_artifact_value(&artifact, "verdict")?;
     let (action, phase, passed) = match verdict.as_str() {
         "passed" => ("begin_feature_integration", "integration", true),
         "failed" => ("validation_failed", "review", false),
-        _ => bail!("{} has unsupported final-validation verdict '{verdict}'", artifact.display()),
+        _ => bail!(
+            "{} has unsupported final-validation verdict '{verdict}'",
+            artifact.display()
+        ),
     };
     if passed {
         current.validation_passed_at = Some(chrono::Utc::now());
@@ -996,7 +1109,12 @@ pub fn submit_final_validation(
         Some(Path::new(&worktree)),
     );
     if !passed {
-        let review_artifact = workflow_artifact_path(&worktree, plugin.artifacts.review.as_deref(), &task.id, ".agent-flow/engineering-review.yaml");
+        let review_artifact = workflow_artifact_path(
+            &worktree,
+            plugin.artifacts.review.as_deref(),
+            &task.id,
+            ".agent-flow/engineering-review.yaml",
+        );
         archive_workflow_artifact(&review_artifact, "superseded-after-validation-failure")?;
     }
     db.advance_workflow_state(&transition.state, &transition.transition)?;
@@ -1037,9 +1155,17 @@ pub fn complete_feature_integration(
             message: "Complete integration is only available in Integrate to feature".into(),
         });
     }
-    let artifact = workflow_artifact_path(&worktree, plugin.artifacts.integration.as_deref(), &task.id, ".agent-flow/integration-ready.yaml");
+    let artifact = workflow_artifact_path(
+        &worktree,
+        plugin.artifacts.integration.as_deref(),
+        &task.id,
+        ".agent-flow/integration-ready.yaml",
+    );
     if workflow_artifact_value(&artifact, "verdict")? != "ready_for_integration" {
-        bail!("{} must declare verdict: ready_for_integration", artifact.display());
+        bail!(
+            "{} must declare verdict: ready_for_integration",
+            artifact.display()
+        );
     }
     let policy = project_workflow
         .policy_for_state(workflow, &current.state)?
@@ -1051,7 +1177,10 @@ pub fn complete_feature_integration(
     if target_branch != current.target_branch || target_branch == "main" {
         bail!("workflow integration may only target the admitted non-main branch");
     }
-    if !(policy.role_policy.final_task_commit && policy.role_policy.push_task_branch && policy.role_policy.merge_task_into_target) {
+    if !(policy.role_policy.final_task_commit
+        && policy.role_policy.push_task_branch
+        && policy.role_policy.merge_task_into_target)
+    {
         bail!("Integration state policy does not authorize commit, push, and target merge");
     }
     if runtime.git_ops.has_changes(runtime.project_path) {
@@ -1060,17 +1189,30 @@ pub fn complete_feature_integration(
     if crate::git::current_branch(runtime.project_path)? != target_branch {
         bail!("configured target checkout is not on '{target_branch}'; integration is refused");
     }
-    let (has_conflicts, files) = crate::git::check_merge_conflicts(runtime.project_path, &target_branch, &branch)?;
+    let (has_conflicts, files) =
+        crate::git::check_merge_conflicts(runtime.project_path, &target_branch, &branch)?;
     if has_conflicts {
-        bail!("task branch conflicts with '{target_branch}': {}", files.join(", "));
+        bail!(
+            "task branch conflicts with '{target_branch}': {}",
+            files.join(", ")
+        );
     }
     if runtime.git_ops.has_changes(Path::new(&worktree)) {
         runtime.git_ops.add_all(Path::new(&worktree))?;
-        runtime.git_ops.commit(Path::new(&worktree), &format!("workflow: complete task {}", task.id))?;
+        runtime.git_ops.commit(
+            Path::new(&worktree),
+            &format!("workflow: complete task {}", task.id),
+        )?;
     }
     runtime.git_ops.push(Path::new(&worktree), &branch, true)?;
-    crate::git::merge_branch(runtime.project_path, &branch, &format!("workflow: integrate task {}", task.id))?;
-    runtime.git_ops.push(runtime.project_path, &target_branch, false)?;
+    crate::git::merge_branch(
+        runtime.project_path,
+        &branch,
+        &format!("workflow: integrate task {}", task.id),
+    )?;
+    runtime
+        .git_ops
+        .push(runtime.project_path, &target_branch, false)?;
     let integration_sha = crate::git::resolve_commit(runtime.project_path, &target_branch)?;
     let completed = prepare_transition(
         workflow,
@@ -1093,7 +1235,6 @@ pub fn complete_feature_integration(
         task,
     })
 }
-
 
 /// What automation should do next for a task, computed from durable
 /// evidence alone: the workflow graph, the project's guard-relevant facts,
@@ -1132,7 +1273,11 @@ pub fn guard_context_for(db: &Database, task: &Task, state: &WorkflowTaskState) 
     let implementation_recorded = task
         .worktree_path
         .as_deref()
-        .map(|worktree| Path::new(worktree).join(".agent-flow/implementation-result.yaml").is_file())
+        .map(|worktree| {
+            Path::new(worktree)
+                .join(".agent-flow/implementation-result.yaml")
+                .is_file()
+        })
         .unwrap_or(false);
     GuardContext {
         dependencies_resolved: db.deps_satisfied(task),
@@ -1211,6 +1356,17 @@ pub fn assess(
     state: &WorkflowTaskState,
     db: &Database,
 ) -> AutomationDecision {
+    // `IntegratedIntoTarget` is a postcondition of `complete_feature_integration`,
+    // not a precondition: the executor itself performs the merge before it records
+    // that guard as satisfied. Assess the reviewer's fresh integration evidence
+    // before asking the graph for currently available (pre-merge) transitions.
+    if state.state == "integrate_to_feature" {
+        let Some(worktree) = task.worktree_path.as_deref() else {
+            return AutomationDecision::Wait;
+        };
+        return assess_feature_integration(worktree, plugin, task, state);
+    }
+
     let guards = guard_context_for(db, task, state);
     let available = workflow.available_transitions(&state.state, guards);
     if available.is_empty() {
@@ -1228,7 +1384,10 @@ pub fn assess(
         // no guards at all (e.g. `ready_for_planning` -> `start_planning`)
         // is exclusively human-initiated and carries no automation signal
         // to act on, even though the graph trivially permits it.
-        return match available.iter().find(|transition| !transition.guards.is_empty()) {
+        return match available
+            .iter()
+            .find(|transition| !transition.guards.is_empty())
+        {
             Some(transition) => AutomationDecision::Advance(transition.action.clone()),
             None => AutomationDecision::Wait,
         };
@@ -1253,7 +1412,12 @@ pub fn assess(
 /// Mirrors `submit_workflow_plan`'s own evidence check: a plan artifact is
 /// only meaningful once its `plan_revision` has actually moved past the
 /// last recorded one.
-fn assess_planning(worktree: &str, plugin: &WorkflowPlugin, task: &Task, state: &WorkflowTaskState) -> AutomationDecision {
+fn assess_planning(
+    worktree: &str,
+    plugin: &WorkflowPlugin,
+    task: &Task,
+    state: &WorkflowTaskState,
+) -> AutomationDecision {
     let path = match planning_artifact_path(worktree, plugin, &task.id) {
         Ok(path) => path,
         Err(_) => return AutomationDecision::Wait,
@@ -1284,8 +1448,18 @@ fn assess_planning(worktree: &str, plugin: &WorkflowPlugin, task: &Task, state: 
 /// outcomes -- matching how `engineering_review`'s own rework loops
 /// (`corrections_required`/`plan_issue`) already auto-dispatch without a
 /// human gate.
-fn assess_plan_review(worktree: &str, plugin: &WorkflowPlugin, task: &Task, state: &WorkflowTaskState) -> AutomationDecision {
-    let artifact = workflow_artifact_path(worktree, plugin.artifacts.plan_review.as_deref(), &task.id, ".agent-flow/plan-review.yaml");
+fn assess_plan_review(
+    worktree: &str,
+    plugin: &WorkflowPlugin,
+    task: &Task,
+    state: &WorkflowTaskState,
+) -> AutomationDecision {
+    let artifact = workflow_artifact_path(
+        worktree,
+        plugin.artifacts.plan_review.as_deref(),
+        &task.id,
+        ".agent-flow/plan-review.yaml",
+    );
     if let Some(decision) = artifact_freshness(&artifact, state) {
         return decision;
     }
@@ -1304,8 +1478,18 @@ fn assess_plan_review(worktree: &str, plugin: &WorkflowPlugin, task: &Task, stat
 }
 
 /// Mirrors `submit_engineering_review`'s verdict-to-action match exactly.
-fn assess_engineering_review(worktree: &str, plugin: &WorkflowPlugin, task: &Task, state: &WorkflowTaskState) -> AutomationDecision {
-    let artifact = workflow_artifact_path(worktree, plugin.artifacts.review.as_deref(), &task.id, ".agent-flow/engineering-review.yaml");
+fn assess_engineering_review(
+    worktree: &str,
+    plugin: &WorkflowPlugin,
+    task: &Task,
+    state: &WorkflowTaskState,
+) -> AutomationDecision {
+    let artifact = workflow_artifact_path(
+        worktree,
+        plugin.artifacts.review.as_deref(),
+        &task.id,
+        ".agent-flow/engineering-review.yaml",
+    );
     if let Some(decision) = artifact_freshness(&artifact, state) {
         return decision;
     }
@@ -1332,8 +1516,18 @@ fn assess_engineering_review(worktree: &str, plugin: &WorkflowPlugin, task: &Tas
 /// automatic `Advance("validation_failed")`. This is a hard automation-safety
 /// rule, not a project-configurable choice -- a failed validation always
 /// needs a human look before any rework loop restarts.
-fn assess_final_validation(worktree: &str, plugin: &WorkflowPlugin, task: &Task, state: &WorkflowTaskState) -> AutomationDecision {
-    let artifact = workflow_artifact_path(worktree, plugin.artifacts.final_validation.as_deref(), &task.id, ".agent-flow/final-validation.yaml");
+fn assess_final_validation(
+    worktree: &str,
+    plugin: &WorkflowPlugin,
+    task: &Task,
+    state: &WorkflowTaskState,
+) -> AutomationDecision {
+    let artifact = workflow_artifact_path(
+        worktree,
+        plugin.artifacts.final_validation.as_deref(),
+        &task.id,
+        ".agent-flow/final-validation.yaml",
+    );
     if let Some(decision) = artifact_freshness(&artifact, state) {
         return decision;
     }
@@ -1346,6 +1540,39 @@ fn assess_final_validation(worktree: &str, plugin: &WorkflowPlugin, task: &Task,
         "failed" => AutomationDecision::HumanGate("final validation failed".to_string()),
         other => AutomationDecision::InvalidArtifact(format!(
             "{} has unsupported final-validation verdict '{other}'",
+            artifact.display()
+        )),
+    }
+}
+
+/// The integration reviewer has supplied the final required evidence. The
+/// executor now owns the push, merge into the admitted non-main target, and
+/// durable completion transition.
+fn assess_feature_integration(
+    worktree: &str,
+    plugin: &WorkflowPlugin,
+    task: &Task,
+    state: &WorkflowTaskState,
+) -> AutomationDecision {
+    let artifact = workflow_artifact_path(
+        worktree,
+        plugin.artifacts.integration.as_deref(),
+        &task.id,
+        ".agent-flow/integration-ready.yaml",
+    );
+    if let Some(decision) = artifact_freshness(&artifact, state) {
+        return decision;
+    }
+    let verdict = match workflow_artifact_value(&artifact, "verdict") {
+        Ok(verdict) => verdict,
+        Err(error) => return AutomationDecision::InvalidArtifact(error.to_string()),
+    };
+    match verdict.as_str() {
+        "ready_for_integration" => {
+            AutomationDecision::Advance("complete_feature_integration".to_string())
+        }
+        other => AutomationDecision::InvalidArtifact(format!(
+            "{} has unsupported integration verdict '{other}'",
             artifact.display()
         )),
     }
@@ -1371,9 +1598,24 @@ mod tests {
         WorkflowDefinition {
             initial_state: "backlog".into(),
             states: vec![
-                WorkflowState { id: "backlog".into(), label: "Backlog".into(), role: None, terminal: false },
-                WorkflowState { id: "admission".into(), label: "Admission".into(), role: None, terminal: false },
-                WorkflowState { id: "done".into(), label: "Done".into(), role: None, terminal: true },
+                WorkflowState {
+                    id: "backlog".into(),
+                    label: "Backlog".into(),
+                    role: None,
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "admission".into(),
+                    label: "Admission".into(),
+                    role: None,
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "done".into(),
+                    label: "Done".into(),
+                    role: None,
+                    terminal: true,
+                },
             ],
             transitions: vec![WorkflowTransition {
                 action: "admit".into(),
@@ -1422,14 +1664,19 @@ mod tests {
         let mut current = WorkflowTaskState::new("task", "backlog", "feature/poc");
         current.base_sha = Some("a1b2c3".into());
         let mut project = project();
-        project.role_bindings.insert("planner".into(), "claude".into());
+        project
+            .role_bindings
+            .insert("planner".into(), "claude".into());
 
         let transition = prepare_transition(
             &graph,
             &project,
             &current,
             "start_planning",
-            GuardContext { dependencies_resolved: true, ..GuardContext::default() },
+            GuardContext {
+                dependencies_resolved: true,
+                ..GuardContext::default()
+            },
         )
         .unwrap();
 
@@ -1468,13 +1715,54 @@ mod tests {
         WorkflowDefinition {
             initial_state: "backlog".into(),
             states: vec![
-                WorkflowState { id: "backlog".into(), label: "Backlog".into(), role: None, terminal: false },
-                WorkflowState { id: "admission".into(), label: "Admission".into(), role: None, terminal: false },
-                WorkflowState { id: "planning".into(), label: "Planning".into(), role: Some("planner".into()), terminal: false },
-                WorkflowState { id: "running".into(), label: "Running".into(), role: Some("implementer".into()), terminal: false },
-                WorkflowState { id: "engineering_review".into(), label: "Engineering review".into(), role: Some("reviewer".into()), terminal: false },
-                WorkflowState { id: "final_validation".into(), label: "Final validation".into(), role: Some("validator".into()), terminal: false },
-                WorkflowState { id: "done".into(), label: "Done".into(), role: None, terminal: true },
+                WorkflowState {
+                    id: "backlog".into(),
+                    label: "Backlog".into(),
+                    role: None,
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "admission".into(),
+                    label: "Admission".into(),
+                    role: None,
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "planning".into(),
+                    label: "Planning".into(),
+                    role: Some("planner".into()),
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "running".into(),
+                    label: "Running".into(),
+                    role: Some("implementer".into()),
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "engineering_review".into(),
+                    label: "Engineering review".into(),
+                    role: Some("reviewer".into()),
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "final_validation".into(),
+                    label: "Final validation".into(),
+                    role: Some("validator".into()),
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "integrate_to_feature".into(),
+                    label: "Integrate to feature".into(),
+                    role: Some("integrator".into()),
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "done".into(),
+                    label: "Done".into(),
+                    role: None,
+                    terminal: true,
+                },
             ],
             transitions: vec![
                 WorkflowTransition {
@@ -1504,8 +1792,14 @@ mod tests {
                 WorkflowTransition {
                     action: "begin_feature_integration".into(),
                     from: "final_validation".into(),
-                    to: "done".into(),
+                    to: "integrate_to_feature".into(),
                     guards: vec![],
+                },
+                WorkflowTransition {
+                    action: "complete_feature_integration".into(),
+                    from: "integrate_to_feature".into(),
+                    to: "done".into(),
+                    guards: vec![crate::workflow::WorkflowGuard::IntegratedIntoTarget],
                 },
                 WorkflowTransition {
                     action: "validation_failed".into(),
@@ -1565,7 +1859,10 @@ mod tests {
         let db = Database::open_in_memory_project().unwrap();
 
         let decision = assess(&graph, &project(), &plugin, &task, &state, &db);
-        assert_eq!(decision, AutomationDecision::Advance("start_final_validation".to_string()));
+        assert_eq!(
+            decision,
+            AutomationDecision::Advance("start_final_validation".to_string())
+        );
     }
 
     #[test]
@@ -1626,7 +1923,33 @@ mod tests {
         let db = Database::open_in_memory_project().unwrap();
 
         let decision = assess(&graph, &project(), &plugin, &task, &state, &db);
-        assert_eq!(decision, AutomationDecision::HumanGate("final validation failed".to_string()));
+        assert_eq!(
+            decision,
+            AutomationDecision::HumanGate("final validation failed".to_string())
+        );
+    }
+
+    #[test]
+    fn assess_advances_a_fresh_ready_integration_artifact() {
+        let graph = assess_workflow();
+        let plugin = plugin_for_tests(graph.clone());
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
+        std::fs::write(
+            worktree.path().join(".agent-flow/integration-ready.yaml"),
+            "verdict: ready_for_integration\nworkflow_attempt: 4\n",
+        )
+        .unwrap();
+        let task = admitted_task(worktree.path());
+        let mut state = WorkflowTaskState::new(&task.id, "integrate_to_feature", "feature/poc");
+        state.state_attempt = 4;
+        let db = Database::open_in_memory_project().unwrap();
+
+        let decision = assess(&graph, &project(), &plugin, &task, &state, &db);
+        assert_eq!(
+            decision,
+            AutomationDecision::Advance("complete_feature_integration".to_string())
+        );
     }
 
     /// A task re-entering `engineering_review` after a rework loop (e.g. a
@@ -1642,7 +1965,11 @@ mod tests {
         let worktree = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
         let artifact = worktree.path().join(".agent-flow/engineering-review.yaml");
-        std::fs::write(&artifact, "verdict: approved_for_validation\nworkflow_attempt: 1\n").unwrap();
+        std::fs::write(
+            &artifact,
+            "verdict: approved_for_validation\nworkflow_attempt: 1\n",
+        )
+        .unwrap();
         let task = admitted_task(worktree.path());
         let db = Database::open_in_memory_project().unwrap();
 
@@ -1672,9 +1999,24 @@ mod tests {
         WorkflowDefinition {
             initial_state: "planning".into(),
             states: vec![
-                WorkflowState { id: "planning".into(), label: "Planning".into(), role: Some("planner".into()), terminal: false },
-                WorkflowState { id: "plan_review".into(), label: "Plan review".into(), role: Some("plan_reviewer".into()), terminal: false },
-                WorkflowState { id: "plan_approved".into(), label: "Plan approved".into(), role: None, terminal: true },
+                WorkflowState {
+                    id: "planning".into(),
+                    label: "Planning".into(),
+                    role: Some("planner".into()),
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "plan_review".into(),
+                    label: "Plan review".into(),
+                    role: Some("plan_reviewer".into()),
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "plan_approved".into(),
+                    label: "Plan approved".into(),
+                    role: None,
+                    terminal: true,
+                },
             ],
             transitions: vec![
                 WorkflowTransition {
@@ -1709,7 +2051,10 @@ mod tests {
         let db = Database::open_in_memory_project().unwrap();
 
         let decision = assess(&graph, &project(), &plugin, &task, &state, &db);
-        assert_eq!(decision, AutomationDecision::Advance("approve_plan".to_string()));
+        assert_eq!(
+            decision,
+            AutomationDecision::Advance("approve_plan".to_string())
+        );
     }
 
     #[test]
@@ -1728,7 +2073,10 @@ mod tests {
         let db = Database::open_in_memory_project().unwrap();
 
         let decision = assess(&graph, &project(), &plugin, &task, &state, &db);
-        assert_eq!(decision, AutomationDecision::Advance("plan_changes_requested".to_string()));
+        assert_eq!(
+            decision,
+            AutomationDecision::Advance("plan_changes_requested".to_string())
+        );
     }
 
     #[test]
@@ -1862,8 +2210,18 @@ mod launch_tests {
         let graph = WorkflowDefinition {
             initial_state: "plan_review".into(),
             states: vec![
-                WorkflowState { id: "plan_review".into(), label: "Plan review".into(), role: None, terminal: false },
-                WorkflowState { id: "implementation".into(), label: "Implementation".into(), role: Some("implementer".into()), terminal: true },
+                WorkflowState {
+                    id: "plan_review".into(),
+                    label: "Plan review".into(),
+                    role: None,
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "implementation".into(),
+                    label: "Implementation".into(),
+                    role: Some("implementer".into()),
+                    terminal: true,
+                },
             ],
             transitions: vec![WorkflowTransition {
                 action: "start_implementation".into(),
@@ -1879,7 +2237,9 @@ mod launch_tests {
             role_bindings: Default::default(),
             ..Default::default()
         };
-        project.role_bindings.insert("implementer".into(), "claude".into());
+        project
+            .role_bindings
+            .insert("implementer".into(), "claude".into());
         project.role_policies.roles.insert(
             "implementer".into(),
             WorkflowRolePolicy {
@@ -1906,19 +2266,24 @@ mod launch_tests {
         current.approved_plan_revision = Some(2);
         current.approved_plan_hash = Some("abc123".into());
         let record = WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "plan_review");
-        db.record_workflow_admission(&task, &current, &record).unwrap();
+        db.record_workflow_admission(&task, &current, &record)
+            .unwrap();
 
         let mut mock_tmux = MockTmuxOperations::new();
         mock_tmux.expect_has_session().returning(|_| true);
         let captured = Arc::new(Mutex::new(None));
         let captured_create = captured.clone();
-        mock_tmux.expect_create_window().returning(move |_, _, _, command, _, _| {
-            *captured_create.lock().unwrap() = command;
-            Ok(())
-        });
+        mock_tmux
+            .expect_create_window()
+            .returning(move |_, _, _, command, _, _| {
+                *captured_create.lock().unwrap() = command;
+                Ok(())
+            });
 
         let mut mock_registry = MockAgentRegistry::new();
-        mock_registry.expect_get().returning(|_| Arc::new(MockAgentOperations::new()) as Arc<dyn AgentOperations>);
+        mock_registry
+            .expect_get()
+            .returning(|_| Arc::new(MockAgentOperations::new()) as Arc<dyn AgentOperations>);
 
         let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(mock_tmux);
         let agent_registry: Arc<dyn AgentRegistry> = Arc::new(mock_registry);
@@ -1935,8 +2300,20 @@ mod launch_tests {
             flags: &flags,
         };
 
-        let outcome = start_workflow_implementation(&graph, &project, &plugin, task.clone(), &mut db, &runtime).unwrap();
-        let WorkflowStepOutcome::Advanced { task: advanced, message } = outcome else {
+        let outcome = start_workflow_implementation(
+            &graph,
+            &project,
+            &plugin,
+            task.clone(),
+            &mut db,
+            &runtime,
+        )
+        .unwrap();
+        let WorkflowStepOutcome::Advanced {
+            task: advanced,
+            message,
+        } = outcome
+        else {
             panic!("expected Advanced, got a Blocked/NoOp outcome");
         };
         assert_eq!(message, "Implementation started from the approved plan");
@@ -1956,7 +2333,11 @@ mod launch_tests {
             claude_allowed_tools(&policy),
             quote_for_shell(&prompt),
         );
-        let actual = captured.lock().unwrap().clone().expect("create_window should receive a command");
+        let actual = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("create_window should receive a command");
         assert_eq!(actual, expected);
     }
 
@@ -1970,8 +2351,18 @@ mod launch_tests {
         let graph = WorkflowDefinition {
             initial_state: "engineering_review".into(),
             states: vec![
-                WorkflowState { id: "engineering_review".into(), label: "Engineering review".into(), role: Some("reviewer".into()), terminal: false },
-                WorkflowState { id: "final_validation".into(), label: "Final validation".into(), role: Some("validator".into()), terminal: true },
+                WorkflowState {
+                    id: "engineering_review".into(),
+                    label: "Engineering review".into(),
+                    role: Some("reviewer".into()),
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "final_validation".into(),
+                    label: "Final validation".into(),
+                    role: Some("validator".into()),
+                    terminal: true,
+                },
             ],
             transitions: vec![WorkflowTransition {
                 action: "start_final_validation".into(),
@@ -1987,8 +2378,12 @@ mod launch_tests {
             role_bindings: Default::default(),
             ..Default::default()
         };
-        project.role_bindings.insert("reviewer".into(), "claude".into());
-        project.role_bindings.insert("validator".into(), "claude".into());
+        project
+            .role_bindings
+            .insert("reviewer".into(), "claude".into());
+        project
+            .role_bindings
+            .insert("validator".into(), "claude".into());
         project.role_policies.roles.insert(
             "validator".into(),
             WorkflowRolePolicy {
@@ -2019,14 +2414,23 @@ mod launch_tests {
         let mut db = Database::open_in_memory_project().unwrap();
         db.create_task(&task).unwrap();
         let current = WorkflowTaskState::new(&task.id, "engineering_review", "main");
-        let record = WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "engineering_review");
-        db.record_workflow_admission(&task, &current, &record).unwrap();
+        let record =
+            WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "engineering_review");
+        db.record_workflow_admission(&task, &current, &record)
+            .unwrap();
 
         let mut mock_tmux = MockTmuxOperations::new();
-        mock_tmux.expect_send_keys().withf(|_, cmd: &str| cmd == "/exit").returning(|_, _| Ok(()));
+        mock_tmux
+            .expect_send_keys()
+            .withf(|_, cmd: &str| cmd == "/exit")
+            .returning(|_, _| Ok(()));
         mock_tmux.expect_send_key().returning(|_, _| Ok(()));
-        mock_tmux.expect_pane_current_command().returning(|_| Some("bash".to_string()));
-        mock_tmux.expect_capture_pane().returning(|_| Ok(String::new()));
+        mock_tmux
+            .expect_pane_current_command()
+            .returning(|_| Some("bash".to_string()));
+        mock_tmux
+            .expect_capture_pane()
+            .returning(|_| Ok(String::new()));
         let captured = Arc::new(Mutex::new(None));
         let captured_paste = captured.clone();
         mock_tmux.expect_paste_text().returning(move |_, text| {
@@ -2035,7 +2439,9 @@ mod launch_tests {
         });
 
         let mut mock_registry = MockAgentRegistry::new();
-        mock_registry.expect_get().returning(|_| Arc::new(MockAgentOperations::new()) as Arc<dyn AgentOperations>);
+        mock_registry
+            .expect_get()
+            .returning(|_| Arc::new(MockAgentOperations::new()) as Arc<dyn AgentOperations>);
 
         let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(mock_tmux);
         let agent_registry: Arc<dyn AgentRegistry> = Arc::new(mock_registry);
@@ -2052,11 +2458,20 @@ mod launch_tests {
             flags: &flags,
         };
 
-        let outcome = submit_engineering_review(&graph, &project, &plugin, task.clone(), &mut db, &runtime).unwrap();
-        let WorkflowStepOutcome::Advanced { task: advanced, message } = outcome else {
+        let outcome =
+            submit_engineering_review(&graph, &project, &plugin, task.clone(), &mut db, &runtime)
+                .unwrap();
+        let WorkflowStepOutcome::Advanced {
+            task: advanced,
+            message,
+        } = outcome
+        else {
             panic!("expected Advanced, got a Blocked/NoOp outcome");
         };
-        assert_eq!(message, "Engineering review recorded: approved_for_validation");
+        assert_eq!(
+            message,
+            "Engineering review recorded: approved_for_validation"
+        );
         assert_eq!(advanced.agent, "claude");
         assert_eq!(advanced.status, TaskStatus::Review);
 
@@ -2087,7 +2502,11 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         let expected = format!(
             "cd -- \"$AGTX_WORKTREE\" && env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT {inner}"
         );
-        let sent = captured.lock().unwrap().clone().expect("switch_agent_in_tmux should paste the new command");
+        let sent = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("switch_agent_in_tmux should paste the new command");
         assert_eq!(sent, expected);
     }
 
@@ -2101,8 +2520,18 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         let graph = WorkflowDefinition {
             initial_state: "engineering_review".into(),
             states: vec![
-                WorkflowState { id: "engineering_review".into(), label: "Engineering review".into(), role: Some("reviewer".into()), terminal: false },
-                WorkflowState { id: "final_validation".into(), label: "Final validation".into(), role: Some("validator".into()), terminal: true },
+                WorkflowState {
+                    id: "engineering_review".into(),
+                    label: "Engineering review".into(),
+                    role: Some("reviewer".into()),
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "final_validation".into(),
+                    label: "Final validation".into(),
+                    role: Some("validator".into()),
+                    terminal: true,
+                },
             ],
             transitions: vec![WorkflowTransition {
                 action: "start_final_validation".into(),
@@ -2118,9 +2547,16 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             role_bindings: Default::default(),
             ..Default::default()
         };
-        project.role_bindings.insert("reviewer".into(), "claude".into());
-        project.role_bindings.insert("validator".into(), "claude".into());
-        project.role_policies.roles.insert("validator".into(), WorkflowRolePolicy::default());
+        project
+            .role_bindings
+            .insert("reviewer".into(), "claude".into());
+        project
+            .role_bindings
+            .insert("validator".into(), "claude".into());
+        project
+            .role_policies
+            .roles
+            .insert("validator".into(), WorkflowRolePolicy::default());
 
         let plugin = plugin(graph.clone());
 
@@ -2144,14 +2580,23 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         // number the launched prompt must carry.
         let current = WorkflowTaskState::new(&task.id, "engineering_review", "main");
         assert_eq!(current.state_attempt, 1);
-        let record = WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "engineering_review");
-        db.record_workflow_admission(&task, &current, &record).unwrap();
+        let record =
+            WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "engineering_review");
+        db.record_workflow_admission(&task, &current, &record)
+            .unwrap();
 
         let mut mock_tmux = MockTmuxOperations::new();
-        mock_tmux.expect_send_keys().withf(|_, cmd: &str| cmd == "/exit").returning(|_, _| Ok(()));
+        mock_tmux
+            .expect_send_keys()
+            .withf(|_, cmd: &str| cmd == "/exit")
+            .returning(|_, _| Ok(()));
         mock_tmux.expect_send_key().returning(|_, _| Ok(()));
-        mock_tmux.expect_pane_current_command().returning(|_| Some("bash".to_string()));
-        mock_tmux.expect_capture_pane().returning(|_| Ok(String::new()));
+        mock_tmux
+            .expect_pane_current_command()
+            .returning(|_| Some("bash".to_string()));
+        mock_tmux
+            .expect_capture_pane()
+            .returning(|_| Ok(String::new()));
         let captured = Arc::new(Mutex::new(None));
         let captured_paste = captured.clone();
         mock_tmux.expect_paste_text().returning(move |_, text| {
@@ -2160,7 +2605,9 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         });
 
         let mut mock_registry = MockAgentRegistry::new();
-        mock_registry.expect_get().returning(|_| Arc::new(MockAgentOperations::new()) as Arc<dyn AgentOperations>);
+        mock_registry
+            .expect_get()
+            .returning(|_| Arc::new(MockAgentOperations::new()) as Arc<dyn AgentOperations>);
 
         let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(mock_tmux);
         let agent_registry: Arc<dyn AgentRegistry> = Arc::new(mock_registry);
@@ -2177,10 +2624,16 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             flags: &flags,
         };
 
-        let outcome = submit_engineering_review(&graph, &project, &plugin, task.clone(), &mut db, &runtime).unwrap();
+        let outcome =
+            submit_engineering_review(&graph, &project, &plugin, task.clone(), &mut db, &runtime)
+                .unwrap();
         assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
 
-        let sent = captured.lock().unwrap().clone().expect("switch_agent_in_tmux should paste the new command");
+        let sent = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("switch_agent_in_tmux should paste the new command");
         assert!(
             sent.contains("Current workflow attempt: 2. Your output artifact MUST contain the line: workflow_attempt: 2"),
             "expected the destination state_attempt (2) in the launched prompt, got: {sent}"
@@ -2225,9 +2678,24 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         let graph = WorkflowDefinition {
             initial_state: "admission".into(),
             states: vec![
-                WorkflowState { id: "admission".into(), label: "Admission".into(), role: None, terminal: false },
-                WorkflowState { id: "ready_for_planning".into(), label: "Ready for planning".into(), role: None, terminal: false },
-                WorkflowState { id: "planning".into(), label: "Planning".into(), role: Some("planner".into()), terminal: true },
+                WorkflowState {
+                    id: "admission".into(),
+                    label: "Admission".into(),
+                    role: None,
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "ready_for_planning".into(),
+                    label: "Ready for planning".into(),
+                    role: None,
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "planning".into(),
+                    label: "Planning".into(),
+                    role: Some("planner".into()),
+                    terminal: true,
+                },
             ],
             transitions: vec![
                 WorkflowTransition {
@@ -2251,8 +2719,13 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             role_bindings: Default::default(),
             ..Default::default()
         };
-        project.role_bindings.insert("planner".into(), "claude".into());
-        project.role_policies.roles.insert("planner".into(), WorkflowRolePolicy::default());
+        project
+            .role_bindings
+            .insert("planner".into(), "claude".into());
+        project
+            .role_policies
+            .roles
+            .insert("planner".into(), WorkflowRolePolicy::default());
 
         let plugin = plugin(graph.clone());
 
@@ -2266,19 +2739,24 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         db.create_task(&task).unwrap();
         let current = WorkflowTaskState::new(&task.id, "admission", "main");
         let record = WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "admission");
-        db.record_workflow_admission(&task, &current, &record).unwrap();
+        db.record_workflow_admission(&task, &current, &record)
+            .unwrap();
 
         let mut mock_tmux = MockTmuxOperations::new();
         mock_tmux.expect_has_session().returning(|_| true);
         let task_id_for_check = task.id.clone();
         let db_path_for_check = db_path.clone();
-        mock_tmux.expect_create_window().returning(move |_, _, _, _, _, _| {
-            assert_state_already_persisted(&db_path_for_check, &task_id_for_check, "planning");
-            Ok(())
-        });
+        mock_tmux
+            .expect_create_window()
+            .returning(move |_, _, _, _, _, _| {
+                assert_state_already_persisted(&db_path_for_check, &task_id_for_check, "planning");
+                Ok(())
+            });
 
         let mut mock_registry = MockAgentRegistry::new();
-        mock_registry.expect_get().returning(|_| Arc::new(MockAgentOperations::new()) as Arc<dyn AgentOperations>);
+        mock_registry
+            .expect_get()
+            .returning(|_| Arc::new(MockAgentOperations::new()) as Arc<dyn AgentOperations>);
 
         let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(mock_tmux);
         let agent_registry: Arc<dyn AgentRegistry> = Arc::new(mock_registry);
@@ -2295,11 +2773,16 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             flags: &flags,
         };
 
-        let outcome = start_workflow_planning(&graph, &project, &plugin, task.clone(), &mut db, &runtime).unwrap();
+        let outcome =
+            start_workflow_planning(&graph, &project, &plugin, task.clone(), &mut db, &runtime)
+                .unwrap();
         assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
 
         // Both hops committed for real, not just observed mid-flight.
-        assert_eq!(db.get_workflow_task_state(&task.id).unwrap().unwrap().state, "planning");
+        assert_eq!(
+            db.get_workflow_task_state(&task.id).unwrap().unwrap().state,
+            "planning"
+        );
         assert_eq!(db.workflow_transition_history(&task.id).unwrap().len(), 3);
     }
 
@@ -2311,8 +2794,18 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         let graph = WorkflowDefinition {
             initial_state: "planning".into(),
             states: vec![
-                WorkflowState { id: "planning".into(), label: "Planning".into(), role: Some("planner".into()), terminal: false },
-                WorkflowState { id: "plan_review".into(), label: "Plan review".into(), role: Some("plan_reviewer".into()), terminal: true },
+                WorkflowState {
+                    id: "planning".into(),
+                    label: "Planning".into(),
+                    role: Some("planner".into()),
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "plan_review".into(),
+                    label: "Plan review".into(),
+                    role: Some("plan_reviewer".into()),
+                    terminal: true,
+                },
             ],
             transitions: vec![WorkflowTransition {
                 action: "submit_plan".into(),
@@ -2328,9 +2821,16 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             role_bindings: Default::default(),
             ..Default::default()
         };
-        project.role_bindings.insert("planner".into(), "claude".into());
-        project.role_bindings.insert("plan_reviewer".into(), "claude".into());
-        project.role_policies.roles.insert("plan_reviewer".into(), WorkflowRolePolicy::default());
+        project
+            .role_bindings
+            .insert("planner".into(), "claude".into());
+        project
+            .role_bindings
+            .insert("plan_reviewer".into(), "claude".into());
+        project
+            .role_policies
+            .roles
+            .insert("plan_reviewer".into(), WorkflowRolePolicy::default());
 
         let mut plugin = plugin(graph.clone());
         plugin.artifacts.planning = Some(".agent-flow/plan.yaml".into());
@@ -2353,19 +2853,26 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         db.create_task(&task).unwrap();
         let current = WorkflowTaskState::new(&task.id, "planning", "main");
         let record = WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "planning");
-        db.record_workflow_admission(&task, &current, &record).unwrap();
+        db.record_workflow_admission(&task, &current, &record)
+            .unwrap();
 
         let mut mock_tmux = MockTmuxOperations::new();
         let task_id_for_check = task.id.clone();
         let db_path_for_check = db_path.clone();
-        mock_tmux.expect_send_keys().withf(|_, cmd: &str| cmd == "/exit").returning(move |_, _| {
-            let db = Database::open_project_at_path(&db_path_for_check).unwrap();
-            assert_eq!(
-                db.get_workflow_task_state(&task_id_for_check).unwrap().unwrap().state,
-                "planning"
-            );
-            Ok(())
-        });
+        mock_tmux
+            .expect_send_keys()
+            .withf(|_, cmd: &str| cmd == "/exit")
+            .returning(move |_, _| {
+                let db = Database::open_project_at_path(&db_path_for_check).unwrap();
+                assert_eq!(
+                    db.get_workflow_task_state(&task_id_for_check)
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    "planning"
+                );
+                Ok(())
+            });
         mock_tmux.expect_send_key().returning(|_, _| Ok(()));
         let command_checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let command_checks_for_mock = Arc::clone(&command_checks);
@@ -2376,11 +2883,15 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
                 Some("claude".to_string())
             }
         });
-        mock_tmux.expect_capture_pane().returning(|_| Ok(String::new()));
+        mock_tmux
+            .expect_capture_pane()
+            .returning(|_| Ok(String::new()));
         mock_tmux.expect_paste_text().returning(|_, _| Ok(()));
 
         let mut mock_registry = MockAgentRegistry::new();
-        mock_registry.expect_get().returning(|_| Arc::new(MockAgentOperations::new()) as Arc<dyn AgentOperations>);
+        mock_registry
+            .expect_get()
+            .returning(|_| Arc::new(MockAgentOperations::new()) as Arc<dyn AgentOperations>);
 
         let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(mock_tmux);
         let agent_registry: Arc<dyn AgentRegistry> = Arc::new(mock_registry);
@@ -2397,9 +2908,14 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             flags: &flags,
         };
 
-        let outcome = submit_workflow_plan(&graph, &project, &plugin, task.clone(), &mut db, &runtime).unwrap();
+        let outcome =
+            submit_workflow_plan(&graph, &project, &plugin, task.clone(), &mut db, &runtime)
+                .unwrap();
         assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
-        assert_eq!(db.get_workflow_task_state(&task.id).unwrap().unwrap().state, "plan_review");
+        assert_eq!(
+            db.get_workflow_task_state(&task.id).unwrap().unwrap().state,
+            "plan_review"
+        );
     }
 
     /// `submit_workflow_implementation` reorder-proof: both chained
@@ -2411,9 +2927,24 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         let graph = WorkflowDefinition {
             initial_state: "running".into(),
             states: vec![
-                WorkflowState { id: "running".into(), label: "Running".into(), role: Some("implementer".into()), terminal: false },
-                WorkflowState { id: "implementing_complete".into(), label: "Implementation complete".into(), role: None, terminal: false },
-                WorkflowState { id: "engineering_review".into(), label: "Engineering review".into(), role: Some("reviewer".into()), terminal: true },
+                WorkflowState {
+                    id: "running".into(),
+                    label: "Running".into(),
+                    role: Some("implementer".into()),
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "implementing_complete".into(),
+                    label: "Implementation complete".into(),
+                    role: None,
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "engineering_review".into(),
+                    label: "Engineering review".into(),
+                    role: Some("reviewer".into()),
+                    terminal: true,
+                },
             ],
             transitions: vec![
                 WorkflowTransition {
@@ -2437,16 +2968,25 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             role_bindings: Default::default(),
             ..Default::default()
         };
-        project.role_bindings.insert("implementer".into(), "claude".into());
-        project.role_bindings.insert("reviewer".into(), "claude".into());
-        project.role_policies.roles.insert("reviewer".into(), WorkflowRolePolicy::default());
+        project
+            .role_bindings
+            .insert("implementer".into(), "claude".into());
+        project
+            .role_bindings
+            .insert("reviewer".into(), "claude".into());
+        project
+            .role_policies
+            .roles
+            .insert("reviewer".into(), WorkflowRolePolicy::default());
 
         let plugin = plugin(graph.clone());
 
         let worktree = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
         std::fs::write(
-            worktree.path().join(".agent-flow/implementation-result.yaml"),
+            worktree
+                .path()
+                .join(".agent-flow/implementation-result.yaml"),
             "status: done\n",
         )
         .unwrap();
@@ -2461,22 +3001,36 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         db.create_task(&task).unwrap();
         let current = WorkflowTaskState::new(&task.id, "running", "main");
         let record = WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "running");
-        db.record_workflow_admission(&task, &current, &record).unwrap();
+        db.record_workflow_admission(&task, &current, &record)
+            .unwrap();
 
         let mut mock_tmux = MockTmuxOperations::new();
         let task_id_for_check = task.id.clone();
         let db_path_for_check = db_path.clone();
-        mock_tmux.expect_send_keys().withf(|_, cmd: &str| cmd == "/exit").returning(move |_, _| {
-            assert_state_already_persisted(&db_path_for_check, &task_id_for_check, "engineering_review");
-            Ok(())
-        });
+        mock_tmux
+            .expect_send_keys()
+            .withf(|_, cmd: &str| cmd == "/exit")
+            .returning(move |_, _| {
+                assert_state_already_persisted(
+                    &db_path_for_check,
+                    &task_id_for_check,
+                    "engineering_review",
+                );
+                Ok(())
+            });
         mock_tmux.expect_send_key().returning(|_, _| Ok(()));
-        mock_tmux.expect_pane_current_command().returning(|_| Some("bash".to_string()));
-        mock_tmux.expect_capture_pane().returning(|_| Ok(String::new()));
+        mock_tmux
+            .expect_pane_current_command()
+            .returning(|_| Some("bash".to_string()));
+        mock_tmux
+            .expect_capture_pane()
+            .returning(|_| Ok(String::new()));
         mock_tmux.expect_paste_text().returning(|_, _| Ok(()));
 
         let mut mock_registry = MockAgentRegistry::new();
-        mock_registry.expect_get().returning(|_| Arc::new(MockAgentOperations::new()) as Arc<dyn AgentOperations>);
+        mock_registry
+            .expect_get()
+            .returning(|_| Arc::new(MockAgentOperations::new()) as Arc<dyn AgentOperations>);
 
         let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(mock_tmux);
         let agent_registry: Arc<dyn AgentRegistry> = Arc::new(mock_registry);
@@ -2493,11 +3047,22 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             flags: &flags,
         };
 
-        let outcome = submit_workflow_implementation(&graph, &project, &plugin, task.clone(), &mut db, &runtime).unwrap();
+        let outcome = submit_workflow_implementation(
+            &graph,
+            &project,
+            &plugin,
+            task.clone(),
+            &mut db,
+            &runtime,
+        )
+        .unwrap();
         assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
 
         // Both chained hops committed for real, in one transaction.
-        assert_eq!(db.get_workflow_task_state(&task.id).unwrap().unwrap().state, "engineering_review");
+        assert_eq!(
+            db.get_workflow_task_state(&task.id).unwrap().unwrap().state,
+            "engineering_review"
+        );
         let history = db.workflow_transition_history(&task.id).unwrap();
         assert_eq!(history.len(), 3);
         assert_eq!(history[1].action, "implementation_complete");
@@ -2512,8 +3077,18 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         let graph = WorkflowDefinition {
             initial_state: "engineering_review".into(),
             states: vec![
-                WorkflowState { id: "engineering_review".into(), label: "Engineering review".into(), role: Some("reviewer".into()), terminal: false },
-                WorkflowState { id: "final_validation".into(), label: "Final validation".into(), role: Some("validator".into()), terminal: true },
+                WorkflowState {
+                    id: "engineering_review".into(),
+                    label: "Engineering review".into(),
+                    role: Some("reviewer".into()),
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "final_validation".into(),
+                    label: "Final validation".into(),
+                    role: Some("validator".into()),
+                    terminal: true,
+                },
             ],
             transitions: vec![WorkflowTransition {
                 action: "start_final_validation".into(),
@@ -2529,9 +3104,16 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             role_bindings: Default::default(),
             ..Default::default()
         };
-        project.role_bindings.insert("reviewer".into(), "claude".into());
-        project.role_bindings.insert("validator".into(), "claude".into());
-        project.role_policies.roles.insert("validator".into(), WorkflowRolePolicy::default());
+        project
+            .role_bindings
+            .insert("reviewer".into(), "claude".into());
+        project
+            .role_bindings
+            .insert("validator".into(), "claude".into());
+        project
+            .role_policies
+            .roles
+            .insert("validator".into(), WorkflowRolePolicy::default());
 
         let plugin = plugin(graph.clone());
 
@@ -2552,23 +3134,38 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         let mut db = Database::open_project_at_path(&db_path).unwrap();
         db.create_task(&task).unwrap();
         let current = WorkflowTaskState::new(&task.id, "engineering_review", "main");
-        let record = WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "engineering_review");
-        db.record_workflow_admission(&task, &current, &record).unwrap();
+        let record =
+            WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "engineering_review");
+        db.record_workflow_admission(&task, &current, &record)
+            .unwrap();
 
         let mut mock_tmux = MockTmuxOperations::new();
         let task_id_for_check = task.id.clone();
         let db_path_for_check = db_path.clone();
-        mock_tmux.expect_send_keys().withf(|_, cmd: &str| cmd == "/exit").returning(move |_, _| {
-            assert_state_already_persisted(&db_path_for_check, &task_id_for_check, "final_validation");
-            Ok(())
-        });
+        mock_tmux
+            .expect_send_keys()
+            .withf(|_, cmd: &str| cmd == "/exit")
+            .returning(move |_, _| {
+                assert_state_already_persisted(
+                    &db_path_for_check,
+                    &task_id_for_check,
+                    "final_validation",
+                );
+                Ok(())
+            });
         mock_tmux.expect_send_key().returning(|_, _| Ok(()));
-        mock_tmux.expect_pane_current_command().returning(|_| Some("bash".to_string()));
-        mock_tmux.expect_capture_pane().returning(|_| Ok(String::new()));
+        mock_tmux
+            .expect_pane_current_command()
+            .returning(|_| Some("bash".to_string()));
+        mock_tmux
+            .expect_capture_pane()
+            .returning(|_| Ok(String::new()));
         mock_tmux.expect_paste_text().returning(|_, _| Ok(()));
 
         let mut mock_registry = MockAgentRegistry::new();
-        mock_registry.expect_get().returning(|_| Arc::new(MockAgentOperations::new()) as Arc<dyn AgentOperations>);
+        mock_registry
+            .expect_get()
+            .returning(|_| Arc::new(MockAgentOperations::new()) as Arc<dyn AgentOperations>);
 
         let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(mock_tmux);
         let agent_registry: Arc<dyn AgentRegistry> = Arc::new(mock_registry);
@@ -2585,9 +3182,14 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             flags: &flags,
         };
 
-        let outcome = submit_engineering_review(&graph, &project, &plugin, task.clone(), &mut db, &runtime).unwrap();
+        let outcome =
+            submit_engineering_review(&graph, &project, &plugin, task.clone(), &mut db, &runtime)
+                .unwrap();
         assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
-        assert_eq!(db.get_workflow_task_state(&task.id).unwrap().unwrap().state, "final_validation");
+        assert_eq!(
+            db.get_workflow_task_state(&task.id).unwrap().unwrap().state,
+            "final_validation"
+        );
     }
 
     /// `submit_final_validation` reorder-proof: a `passed` verdict's
@@ -2601,8 +3203,18 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         let graph = WorkflowDefinition {
             initial_state: "final_validation".into(),
             states: vec![
-                WorkflowState { id: "final_validation".into(), label: "Final validation".into(), role: Some("validator".into()), terminal: false },
-                WorkflowState { id: "integrate_to_feature".into(), label: "Integrate to feature".into(), role: Some("integrator".into()), terminal: true },
+                WorkflowState {
+                    id: "final_validation".into(),
+                    label: "Final validation".into(),
+                    role: Some("validator".into()),
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "integrate_to_feature".into(),
+                    label: "Integrate to feature".into(),
+                    role: Some("integrator".into()),
+                    terminal: true,
+                },
             ],
             transitions: vec![WorkflowTransition {
                 action: "begin_feature_integration".into(),
@@ -2618,9 +3230,16 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             role_bindings: Default::default(),
             ..Default::default()
         };
-        project.role_bindings.insert("validator".into(), "claude".into());
-        project.role_bindings.insert("integrator".into(), "claude".into());
-        project.role_policies.roles.insert("integrator".into(), WorkflowRolePolicy::default());
+        project
+            .role_bindings
+            .insert("validator".into(), "claude".into());
+        project
+            .role_bindings
+            .insert("integrator".into(), "claude".into());
+        project
+            .role_policies
+            .roles
+            .insert("integrator".into(), WorkflowRolePolicy::default());
 
         let plugin = plugin(graph.clone());
 
@@ -2642,22 +3261,36 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         db.create_task(&task).unwrap();
         let current = WorkflowTaskState::new(&task.id, "final_validation", "main");
         let record = WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "final_validation");
-        db.record_workflow_admission(&task, &current, &record).unwrap();
+        db.record_workflow_admission(&task, &current, &record)
+            .unwrap();
 
         let mut mock_tmux = MockTmuxOperations::new();
         let task_id_for_check = task.id.clone();
         let db_path_for_check = db_path.clone();
-        mock_tmux.expect_send_keys().withf(|_, cmd: &str| cmd == "/exit").returning(move |_, _| {
-            assert_state_already_persisted(&db_path_for_check, &task_id_for_check, "integrate_to_feature");
-            Ok(())
-        });
+        mock_tmux
+            .expect_send_keys()
+            .withf(|_, cmd: &str| cmd == "/exit")
+            .returning(move |_, _| {
+                assert_state_already_persisted(
+                    &db_path_for_check,
+                    &task_id_for_check,
+                    "integrate_to_feature",
+                );
+                Ok(())
+            });
         mock_tmux.expect_send_key().returning(|_, _| Ok(()));
-        mock_tmux.expect_pane_current_command().returning(|_| Some("bash".to_string()));
-        mock_tmux.expect_capture_pane().returning(|_| Ok(String::new()));
+        mock_tmux
+            .expect_pane_current_command()
+            .returning(|_| Some("bash".to_string()));
+        mock_tmux
+            .expect_capture_pane()
+            .returning(|_| Ok(String::new()));
         mock_tmux.expect_paste_text().returning(|_, _| Ok(()));
 
         let mut mock_registry = MockAgentRegistry::new();
-        mock_registry.expect_get().returning(|_| Arc::new(MockAgentOperations::new()) as Arc<dyn AgentOperations>);
+        mock_registry
+            .expect_get()
+            .returning(|_| Arc::new(MockAgentOperations::new()) as Arc<dyn AgentOperations>);
 
         let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(mock_tmux);
         let agent_registry: Arc<dyn AgentRegistry> = Arc::new(mock_registry);
@@ -2674,9 +3307,14 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             flags: &flags,
         };
 
-        let outcome = submit_final_validation(&graph, &project, &plugin, task.clone(), &mut db, &runtime).unwrap();
+        let outcome =
+            submit_final_validation(&graph, &project, &plugin, task.clone(), &mut db, &runtime)
+                .unwrap();
         assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
-        assert_eq!(db.get_workflow_task_state(&task.id).unwrap().unwrap().state, "integrate_to_feature");
+        assert_eq!(
+            db.get_workflow_task_state(&task.id).unwrap().unwrap().state,
+            "integrate_to_feature"
+        );
     }
 
     /// `submit_plan_review` on an `approved` artifact must drive the exact
@@ -2689,8 +3327,18 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         let graph = WorkflowDefinition {
             initial_state: "plan_review".into(),
             states: vec![
-                WorkflowState { id: "plan_review".into(), label: "Plan review".into(), role: Some("plan_reviewer".into()), terminal: false },
-                WorkflowState { id: "plan_approved".into(), label: "Plan approved".into(), role: None, terminal: true },
+                WorkflowState {
+                    id: "plan_review".into(),
+                    label: "Plan review".into(),
+                    role: Some("plan_reviewer".into()),
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "plan_approved".into(),
+                    label: "Plan approved".into(),
+                    role: None,
+                    terminal: true,
+                },
             ],
             transitions: vec![WorkflowTransition {
                 action: "approve_plan".into(),
@@ -2726,7 +3374,11 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         // Artifact-driven path.
         let worktree_a = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(worktree_a.path().join(".agent-flow")).unwrap();
-        std::fs::write(worktree_a.path().join(".agent-flow/plan-review.yaml"), "verdict: approved\n").unwrap();
+        std::fs::write(
+            worktree_a.path().join(".agent-flow/plan-review.yaml"),
+            "verdict: approved\n",
+        )
+        .unwrap();
         let mut task_a = crate::db::Task::new("Review thing", "claude", "proj");
         task_a.worktree_path = Some(worktree_a.path().to_string_lossy().to_string());
         let mut db_a = Database::open_in_memory_project().unwrap();
@@ -2735,9 +3387,18 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         state_a.plan_revision = 1;
         state_a.plan_hash = Some("deadbeef".into());
         let record_a = WorkflowTransitionRecord::new(&task_a.id, "seed", "backlog", "plan_review");
-        db_a.record_workflow_admission(&task_a, &state_a, &record_a).unwrap();
+        db_a.record_workflow_admission(&task_a, &state_a, &record_a)
+            .unwrap();
 
-        let outcome_a = submit_plan_review(&graph, &project, &plugin, task_a.clone(), &mut db_a, &runtime).unwrap();
+        let outcome_a = submit_plan_review(
+            &graph,
+            &project,
+            &plugin,
+            task_a.clone(),
+            &mut db_a,
+            &runtime,
+        )
+        .unwrap();
         assert!(matches!(outcome_a, WorkflowStepOutcome::Advanced { .. }));
         let final_state_a = db_a.get_workflow_task_state(&task_a.id).unwrap().unwrap();
 
@@ -2747,16 +3408,32 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         task_b.id = task_a.id.clone();
         let mut db_b = Database::open_in_memory_project().unwrap();
         db_b.create_task(&task_b).unwrap();
-        db_b.record_workflow_admission(&task_b, &state_a, &record_a).unwrap();
+        db_b.record_workflow_admission(&task_b, &state_a, &record_a)
+            .unwrap();
 
-        let outcome_b = decide_workflow_plan(&graph, &project, &plugin, task_b.clone(), true, &mut db_b, &runtime).unwrap();
+        let outcome_b = decide_workflow_plan(
+            &graph,
+            &project,
+            &plugin,
+            task_b.clone(),
+            true,
+            &mut db_b,
+            &runtime,
+        )
+        .unwrap();
         assert!(matches!(outcome_b, WorkflowStepOutcome::Advanced { .. }));
         let final_state_b = db_b.get_workflow_task_state(&task_b.id).unwrap().unwrap();
 
         assert_eq!(final_state_a.state, "plan_approved");
         assert_eq!(final_state_a.state, final_state_b.state);
-        assert_eq!(final_state_a.approved_plan_hash, final_state_b.approved_plan_hash);
-        assert_eq!(final_state_a.approved_plan_revision, final_state_b.approved_plan_revision);
+        assert_eq!(
+            final_state_a.approved_plan_hash,
+            final_state_b.approved_plan_hash
+        );
+        assert_eq!(
+            final_state_a.approved_plan_revision,
+            final_state_b.approved_plan_revision
+        );
     }
 
     /// Graph/project/plugin shared by the `changes_requested` tests below:
@@ -2767,8 +3444,18 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         let graph = WorkflowDefinition {
             initial_state: "planning".into(),
             states: vec![
-                WorkflowState { id: "planning".into(), label: "Planning".into(), role: Some("planner".into()), terminal: true },
-                WorkflowState { id: "plan_review".into(), label: "Plan review".into(), role: Some("plan_reviewer".into()), terminal: false },
+                WorkflowState {
+                    id: "planning".into(),
+                    label: "Planning".into(),
+                    role: Some("planner".into()),
+                    terminal: true,
+                },
+                WorkflowState {
+                    id: "plan_review".into(),
+                    label: "Plan review".into(),
+                    role: Some("plan_reviewer".into()),
+                    terminal: false,
+                },
             ],
             transitions: vec![WorkflowTransition {
                 action: "plan_changes_requested".into(),
@@ -2784,7 +3471,9 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             role_bindings: Default::default(),
             ..Default::default()
         };
-        project.role_bindings.insert("planner".into(), "claude".into());
+        project
+            .role_bindings
+            .insert("planner".into(), "claude".into());
         project
             .role_policies
             .roles
@@ -2800,7 +3489,8 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         let mut mock_registry = MockAgentRegistry::new();
         mock_registry.expect_get().returning(|_| {
             let mut ops = MockAgentOperations::new();
-            ops.expect_build_interactive_command().returning(|prompt| format!("claude '{}'", prompt));
+            ops.expect_build_interactive_command()
+                .returning(|prompt| format!("claude '{}'", prompt));
             Arc::new(ops) as Arc<dyn AgentOperations>
         });
         Arc::new(mock_registry)
@@ -2811,7 +3501,11 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
     /// confirms the planner process, which is the launch acknowledgement.
     fn mock_tmux_capturing_paste(
         pane_content: &'static str,
-    ) -> (Arc<dyn TmuxOperations>, std::sync::mpsc::Receiver<()>, Arc<Mutex<Option<String>>>) {
+    ) -> (
+        Arc<dyn TmuxOperations>,
+        std::sync::mpsc::Receiver<()>,
+        Arc<Mutex<Option<String>>>,
+    ) {
         let (tx, rx) = std::sync::mpsc::channel();
         let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let captured_for_closure = captured.clone();
@@ -2829,7 +3523,9 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
                 Some("claude".to_string())
             }
         });
-        mock_tmux.expect_capture_pane().returning(move |_| Ok(pane_content.to_string()));
+        mock_tmux
+            .expect_capture_pane()
+            .returning(move |_| Ok(pane_content.to_string()));
         mock_tmux.expect_paste_text().returning(move |_, text| {
             *captured_for_closure.lock().unwrap() = Some(text.to_string());
             let _ = tx.send(());
@@ -2866,7 +3562,8 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         db.create_task(&task).unwrap();
         let current = WorkflowTaskState::new(&task.id, "plan_review", "main");
         let record = WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "plan_review");
-        db.record_workflow_admission(&task, &current, &record).unwrap();
+        db.record_workflow_admission(&task, &current, &record)
+            .unwrap();
 
         let config = merged_config();
         let flags = feature_flags();
@@ -2880,12 +3577,17 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             flags: &flags,
         };
 
-        let outcome = submit_plan_review(&graph, &project, &plugin, task.clone(), &mut db, &runtime).unwrap();
+        let outcome =
+            submit_plan_review(&graph, &project, &plugin, task.clone(), &mut db, &runtime).unwrap();
         assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
 
         rx.recv_timeout(std::time::Duration::from_secs(10))
             .expect("revise prompt should be delivered to the planner");
-        let sent = captured.lock().unwrap().clone().expect("paste_text should have captured the revise command");
+        let sent = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("paste_text should have captured the revise command");
         assert!(
             sent.contains("Add input validation for the new endpoint before revising further."),
             "expected the artifact's findings verbatim in the revise prompt, got: {sent}"
@@ -2904,8 +3606,9 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
     fn submit_plan_review_changes_requested_falls_back_to_pane_capture_when_findings_missing() {
         let (graph, project, plugin) = changes_requested_fixtures();
         let agent_registry = mock_agent_registry_for_argv_launch();
-        let (tmux_ops, rx, captured) =
-            mock_tmux_capturing_paste("Plan reviewer pane: needs better error handling on the retry path.");
+        let (tmux_ops, rx, captured) = mock_tmux_capturing_paste(
+            "Plan reviewer pane: needs better error handling on the retry path.",
+        );
         let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
 
         let worktree = tempfile::tempdir().unwrap();
@@ -2925,7 +3628,8 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         db.create_task(&task).unwrap();
         let current = WorkflowTaskState::new(&task.id, "plan_review", "main");
         let record = WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "plan_review");
-        db.record_workflow_admission(&task, &current, &record).unwrap();
+        db.record_workflow_admission(&task, &current, &record)
+            .unwrap();
 
         let config = merged_config();
         let flags = feature_flags();
@@ -2939,12 +3643,17 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             flags: &flags,
         };
 
-        let outcome = submit_plan_review(&graph, &project, &plugin, task.clone(), &mut db, &runtime).unwrap();
+        let outcome =
+            submit_plan_review(&graph, &project, &plugin, task.clone(), &mut db, &runtime).unwrap();
         assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
 
         rx.recv_timeout(std::time::Duration::from_secs(10))
             .expect("revise prompt should be delivered to the planner");
-        let sent = captured.lock().unwrap().clone().expect("paste_text should have captured the revise command");
+        let sent = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("paste_text should have captured the revise command");
         assert!(
             sent.contains("needs better error handling on the retry path"),
             "expected the captured pane content as fallback feedback, got: {sent}"
@@ -2981,7 +3690,8 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         db.create_task(&task).unwrap();
         let current = WorkflowTaskState::new(&task.id, "plan_review", "main");
         let record = WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "plan_review");
-        db.record_workflow_admission(&task, &current, &record).unwrap();
+        db.record_workflow_admission(&task, &current, &record)
+            .unwrap();
 
         let config = merged_config();
         let flags = feature_flags();
@@ -2995,13 +3705,29 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             flags: &flags,
         };
 
-        let outcome = decide_workflow_plan(&graph, &project, &plugin, task.clone(), false, &mut db, &runtime).unwrap();
+        let outcome = decide_workflow_plan(
+            &graph,
+            &project,
+            &plugin,
+            task.clone(),
+            false,
+            &mut db,
+            &runtime,
+        )
+        .unwrap();
         assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
-        assert_eq!(db.get_workflow_task_state(&task.id).unwrap().unwrap().state, "planning");
+        assert_eq!(
+            db.get_workflow_task_state(&task.id).unwrap().unwrap().state,
+            "planning"
+        );
 
         rx.recv_timeout(std::time::Duration::from_secs(10))
             .expect("revise prompt should be delivered to the planner");
-        let sent = captured.lock().unwrap().clone().expect("paste_text should have captured the revise command");
+        let sent = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("paste_text should have captured the revise command");
         assert!(
             sent.contains("tighten the retry logic"),
             "expected the captured pane content as fallback feedback (no artifact present), got: {sent}"
