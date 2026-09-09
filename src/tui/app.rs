@@ -7785,12 +7785,16 @@ impl App {
                                 &hook_task_id,
                             );
                             let new_cmd = agent_ops.build_interactive_command("");
-                            let _ = switch_agent_in_tmux(
+                            if let Err(error) = switch_agent_in_tmux(
                                 tmux_ops.as_ref(),
                                 &session_clone,
                                 &current_agent_clone,
                                 &new_cmd,
-                            );
+                            ) {
+                                eprintln!(
+                                    "Failed to switch agent for task '{hook_task_id}': {error}"
+                                );
+                            }
                         });
                     }
                 }
@@ -7894,12 +7898,16 @@ impl App {
                                 } else {
                                     ""
                                 });
-                            let _ = switch_agent_in_tmux(
+                            if let Err(error) = switch_agent_in_tmux(
                                 tmux_ops.as_ref(),
                                 &session_clone,
                                 &current_agent_clone,
                                 &new_cmd,
-                            );
+                            ) {
+                                eprintln!(
+                                    "Failed to switch agent for task '{hook_task_id}': {error}"
+                                );
+                            }
                             if !delivered_at_launch {
                                 // The *new* agent is what has to become ready.
                                 let _ = wait_for_agent_ready(
@@ -7966,12 +7974,16 @@ impl App {
                                 &hook_task_id,
                             );
                             let new_cmd = agent_ops.build_interactive_command("");
-                            let _ = switch_agent_in_tmux(
+                            if let Err(error) = switch_agent_in_tmux(
                                 tmux_ops.as_ref(),
                                 &session_clone,
                                 &current_agent_clone,
                                 &new_cmd,
-                            );
+                            ) {
+                                eprintln!(
+                                    "Failed to switch agent for task '{hook_task_id}': {error}"
+                                );
+                            }
                         });
                     }
                 }
@@ -12205,7 +12217,11 @@ pub(crate) fn spawn_send_to_agent(
             } else {
                 ""
             });
-            let _ = switch_agent_in_tmux(tmux_ops.as_ref(), &target, &current_agent, &new_cmd);
+            if let Err(error) =
+                switch_agent_in_tmux(tmux_ops.as_ref(), &target, &current_agent, &new_cmd)
+            {
+                eprintln!("Failed to switch agent for task '{task_id}': {error}");
+            }
             if !delivered_at_launch {
                 // The *new* agent is what has to become ready.
                 let _ = wait_for_agent_ready(&tmux_ops, &target, Some(&target_agent), auto_trust);
@@ -13285,18 +13301,43 @@ pub(crate) fn switch_agent_in_tmux(
     //    Without this, wait_for_agent_ready may see stale ">" from old pane content
     //    and return before the new agent has even launched.
     //    Includes `node` here so Gemini/Cursor (Node/Ink TUIs) are detected immediately.
+    //
+    //    `found_shell` gates how strictly this is read. When the exit
+    //    escalation above never confirmed the previous agent left (busy
+    //    through Ctrl+C, retry, *and* the Ctrl+D last resort), the previous
+    //    agent's own process is very often still what `pane_current_command`
+    //    reports here -- and that name is itself a member of `AGENT_COMMANDS`
+    //    (every agent's binary is), so the loose check below would read the
+    //    stuck previous agent as "the new agent started" and report success.
+    //    That is exactly a live incident this guards against: the previous
+    //    agent (codex) never exited, the hand-off command was typed into its
+    //    still-running composer instead of a shell, and nothing launched --
+    //    yet the old check declared victory because "codex" is a known agent
+    //    name. When `found_shell` is false, a pane still reporting the
+    //    previous agent's own process name does not count as launched.
+    let previous_agent_process_names: &[&str] =
+        agent::spec(current_agent).map_or(&[], |spec| spec.process_names);
     for _ in 0..10 {
         // 10s max
         std::thread::sleep(std::time::Duration::from_secs(1));
         if let Some(cmd) = tmux_ops.pane_current_command(target) {
-            let process_started =
+            let looks_like_a_known_agent =
                 AGENT_COMMANDS.iter().any(|a| cmd.contains(a)) || cmd.contains("node");
-            if process_started {
+            let still_the_previous_agent = !found_shell
+                && previous_agent_process_names.iter().any(|name| cmd.contains(name));
+            if looks_like_a_known_agent && !still_the_previous_agent {
                 return Ok(());
             }
         }
     }
-    anyhow::bail!("agent switch did not start a process in tmux pane '{target}'")
+    if found_shell {
+        anyhow::bail!("agent switch did not start a process in tmux pane '{target}'")
+    }
+    anyhow::bail!(
+        "agent switch could not confirm '{current_agent}' exited in tmux pane '{target}' \
+         (Ctrl+C, retry, and the Ctrl+D last resort all failed to reach a shell); \
+         a best-effort hand-off command was sent, but the new agent's launch cannot be verified"
+    )
 }
 
 /// Wait for an agent in a tmux pane to be ready for input.

@@ -15,8 +15,8 @@ use sha2::{Digest, Sha256};
 use crate::agent::AgentRegistry;
 use crate::config::{MergedConfig, WorkflowPlugin};
 use crate::db::{
-    Database, Task, TaskExecutionEvent, TaskStatus, TaskStepReport, WorkflowTaskState,
-    WorkflowTransitionRecord,
+    Database, Task, TaskExecutionEvent, TaskStatus, TaskStepReport, WorkflowArtifact,
+    WorkflowStepInput, WorkflowTaskState, WorkflowTransitionRecord,
 };
 use crate::git::GitOperations;
 use crate::tmux::TmuxOperations;
@@ -97,18 +97,31 @@ fn record_step_evidence(
     agent: &str,
     artifact: &Path,
     runtime: &WorkflowRuntime,
-) -> Result<()> {
+) -> Result<WorkflowArtifact> {
     let bytes = std::fs::read(artifact).map_err(|error| {
         anyhow::anyhow!(
             "Could not read workflow evidence '{}' for the execution journal: {error}",
             artifact.display()
         )
     })?;
+    let artifact_hash = format!("{:x}", Sha256::digest(&bytes));
+    let evidence = WorkflowArtifact {
+        id: uuid::Uuid::new_v4().to_string(),
+        task_id: task.id.clone(),
+        workflow_attempt: state.state_attempt,
+        state: state.state.clone(),
+        kind: "step_evidence".to_string(),
+        source_path: artifact.display().to_string(),
+        sha256: artifact_hash.clone(),
+        content: bytes.clone(),
+        created_at: chrono::Utc::now(),
+    };
+    db.store_workflow_artifact(&evidence)?;
     let artifact_text = String::from_utf8_lossy(&bytes);
     let mut report = TaskStepReport::new(&task.id, state.state_attempt, &state.state);
     report.agent = Some(agent.to_string());
     report.artifact_path = Some(artifact.display().to_string());
-    report.artifact_sha256 = Some(format!("{:x}", Sha256::digest(&bytes)));
+    report.artifact_sha256 = Some(artifact_hash);
     report.artifact_text = Some(bounded_journal_text(&artifact_text));
     report.final_report = workflow_artifact_value(artifact, "final_report")
         .ok()
@@ -130,7 +143,8 @@ fn record_step_evidence(
         "Captured durable evidence from {}",
         artifact.display()
     ));
-    db.record_task_execution_event(&event)
+    db.record_task_execution_event(&event)?;
+    Ok(evidence)
 }
 
 /// Validate and prepare a transition for a task with existing workflow state.
@@ -560,7 +574,7 @@ pub fn start_workflow_planning(
     }
 
     if restarting && runtime.tmux_ops.window_exists(&target).unwrap_or(false) {
-        let _ = switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command);
+        switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command)?;
     } else {
         runtime.tmux_ops.create_window(
             runtime.tmux_project_name,
@@ -670,7 +684,7 @@ pub fn submit_workflow_plan(
         policy.as_ref(),
         Some(Path::new(&worktree)),
     );
-    record_step_evidence(db, &task, &current, &task.agent, &path, runtime)?;
+    let plan_evidence = record_step_evidence(db, &task, &current, &task.agent, &path, runtime)?;
     switch_agent_in_tmux(
         runtime.tmux_ops.as_ref(),
         &target,
@@ -685,6 +699,15 @@ pub fn submit_workflow_plan(
         &reviewer,
         &prompt,
     )?;
+    db.bind_workflow_step_input(&WorkflowStepInput {
+        task_id: task.id.clone(),
+        workflow_attempt: handoff.state.state_attempt,
+        state: handoff.state.state.clone(),
+        name: "plan".to_string(),
+        artifact_id: plan_evidence.id.clone(),
+        expected_sha256: plan_evidence.sha256.clone(),
+        created_at: chrono::Utc::now(),
+    })?;
     db.advance_workflow_state(&handoff.state, &handoff.transition)?;
     task.status = TaskStatus::Review;
     task.agent = reviewer;
@@ -947,7 +970,7 @@ pub fn start_workflow_implementation(
         format!("{}:{window_name}", runtime.tmux_project_name)
     };
     if session_available {
-        let _ = switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command);
+        switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command)?;
     } else {
         ensure_project_tmux_session(
             runtime.tmux_project_name,
@@ -1046,11 +1069,15 @@ pub fn submit_workflow_implementation(
         Some(Path::new(&worktree)),
     );
     record_step_evidence(db, &task, &current, &task.agent, &artifact, runtime)?;
+    // The reviewer must actually be running in the shared tmux pane before the
+    // durable lane advances -- otherwise automation can observe
+    // `engineering_review` while a failed hand-off has left the pane at a bare
+    // shell (or still owned by the implementer). See `switch_agent_in_tmux`.
+    switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command)?;
     db.advance_workflow_state_chain(&[
         (&implemented.state, &implemented.transition),
         (&review.state, &review.transition),
     ])?;
-    let _ = switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command);
     record_agent_prompt(
         db,
         &task,
@@ -1147,8 +1174,11 @@ pub fn submit_engineering_review(
         Some(Path::new(&worktree)),
     );
     record_step_evidence(db, &task, &current, &task.agent, &artifact, runtime)?;
+    // The next agent must actually be running in the shared tmux pane before
+    // the durable lane advances -- see `switch_agent_in_tmux` and the
+    // analogous ordering in `submit_workflow_implementation`.
+    switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command)?;
     db.advance_workflow_state(&transition.state, &transition.transition)?;
-    let _ = switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command);
     record_agent_prompt(
         db,
         &task,
@@ -1261,8 +1291,11 @@ pub fn submit_final_validation(
         archive_workflow_artifact(&review_artifact, "superseded-after-validation-failure")?;
     }
     record_step_evidence(db, &task, &current, &task.agent, &artifact, runtime)?;
+    // The next agent must actually be running in the shared tmux pane before
+    // the durable lane advances -- see `switch_agent_in_tmux` and the
+    // analogous ordering in `submit_workflow_implementation`.
+    switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command)?;
     db.advance_workflow_state(&transition.state, &transition.transition)?;
-    let _ = switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command);
     record_agent_prompt(
         db,
         &task,

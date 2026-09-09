@@ -339,6 +339,34 @@ impl TaskStepReport {
     }
 }
 
+/// Complete, immutable evidence retained for a workflow step. This is the
+/// machine-readable source used when a later step needs to recover an exact
+/// input; [`TaskStepReport`] remains the bounded, human-facing journal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowArtifact {
+    pub id: String,
+    pub task_id: String,
+    pub workflow_attempt: i64,
+    pub state: String,
+    pub kind: String,
+    pub source_path: String,
+    pub sha256: String,
+    pub content: Vec<u8>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// An exact immutable input required to execute one workflow-state attempt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowStepInput {
+    pub task_id: String,
+    pub workflow_attempt: i64,
+    pub state: String,
+    pub name: String,
+    pub artifact_id: String,
+    pub expected_sha256: String,
+    pub created_at: DateTime<Utc>,
+}
+
 /// A project tracked by agtx
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {

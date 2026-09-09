@@ -5,7 +5,7 @@ use std::path::Path;
 use super::models::{
     DependencyState, MobileDevice, Notification, NotificationKind, PhaseStatus, Project, Task,
     TaskExecutionEvent, TaskRuntime, TaskStatus, TaskStepReport, TransitionRequest,
-    WorkflowTaskState, WorkflowTransitionRecord,
+    WorkflowArtifact, WorkflowStepInput, WorkflowTaskState, WorkflowTransitionRecord,
 };
 
 /// Database wrapper for SQLite operations
@@ -240,6 +240,33 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_task_step_reports_task
                 ON task_step_reports(task_id, created_at);
+            -- Complete immutable workflow evidence. The execution journal keeps a
+            -- bounded text snapshot; this table is the recovery-safe source.
+            CREATE TABLE IF NOT EXISTS workflow_artifacts (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                workflow_attempt INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                source_path TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                content BLOB NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(task_id, workflow_attempt, state, kind)
+            );
+            CREATE INDEX IF NOT EXISTS idx_workflow_artifacts_task
+                ON workflow_artifacts(task_id, workflow_attempt, state);
+
+            CREATE TABLE IF NOT EXISTS workflow_step_inputs (
+                task_id TEXT NOT NULL,
+                workflow_attempt INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                name TEXT NOT NULL,
+                artifact_id TEXT NOT NULL,
+                expected_sha256 TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(task_id, workflow_attempt, state, name)
+            );
             "#,
         )?;
 
@@ -683,6 +710,102 @@ impl Database {
         Ok(())
     }
 
+    /// Persist complete immutable workflow evidence. Re-recording the same
+    /// state attempt is allowed only when it names the same bytes.
+    pub fn store_workflow_artifact(&self, artifact: &WorkflowArtifact) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO workflow_artifacts (
+                id, task_id, workflow_attempt, state, kind, source_path, sha256, content, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(task_id, workflow_attempt, state, kind) DO NOTHING"#,
+            params![
+                artifact.id,
+                artifact.task_id,
+                artifact.workflow_attempt,
+                artifact.state,
+                artifact.kind,
+                artifact.source_path,
+                artifact.sha256,
+                artifact.content,
+                artifact.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Bind a later state entry to an exact artifact identity. The binding is
+    /// intentionally insert-only: changing inputs requires a new state attempt.
+    pub fn bind_workflow_step_input(&self, input: &WorkflowStepInput) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO workflow_step_inputs (
+                task_id, workflow_attempt, state, name, artifact_id, expected_sha256, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(task_id, workflow_attempt, state, name) DO NOTHING"#,
+            params![
+                input.task_id,
+                input.workflow_attempt,
+                input.state,
+                input.name,
+                input.artifact_id,
+                input.expected_sha256,
+                input.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn workflow_step_inputs(
+        &self,
+        task_id: &str,
+        workflow_attempt: i64,
+        state: &str,
+    ) -> Result<Vec<WorkflowStepInput>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM workflow_step_inputs WHERE task_id = ?1 AND workflow_attempt = ?2 AND state = ?3 ORDER BY name",
+        )?;
+        let rows = stmt.query_map(params![task_id, workflow_attempt, state], |row| {
+            let created_at =
+                chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>("created_at")?)
+                    .map(|value| value.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| chrono::Utc::now());
+            Ok(WorkflowStepInput {
+                task_id: row.get("task_id")?,
+                workflow_attempt: row.get("workflow_attempt")?,
+                state: row.get("state")?,
+                name: row.get("name")?,
+                artifact_id: row.get("artifact_id")?,
+                expected_sha256: row.get("expected_sha256")?,
+                created_at,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn workflow_artifact(&self, id: &str) -> Result<Option<WorkflowArtifact>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM workflow_artifacts WHERE id = ?1")?;
+        Ok(stmt
+            .query_row(params![id], |row| {
+                let created_at =
+                    chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>("created_at")?)
+                        .map(|value| value.with_timezone(&chrono::Utc))
+                        .unwrap_or_else(|_| chrono::Utc::now());
+                Ok(WorkflowArtifact {
+                    id: row.get("id")?,
+                    task_id: row.get("task_id")?,
+                    workflow_attempt: row.get("workflow_attempt")?,
+                    state: row.get("state")?,
+                    kind: row.get("kind")?,
+                    source_path: row.get("source_path")?,
+                    sha256: row.get("sha256")?,
+                    content: row.get("content")?,
+                    created_at,
+                })
+            })
+            .ok())
+    }
     /// Upsert one prompt/evidence snapshot for a state attempt. Callers may
     /// first persist the prompt and later add the artifact and final report.
     pub fn upsert_task_step_report(&self, report: &TaskStepReport) -> Result<()> {
