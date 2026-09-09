@@ -206,12 +206,31 @@ impl GitOperations for RealGitOps {
     }
 
     fn has_changes(&self, worktree_path: &Path) -> bool {
-        std::process::Command::new("git")
+        match std::process::Command::new("git")
             .current_dir(worktree_path)
             .args(["status", "--porcelain"])
             .output()
-            .map(|o| !o.stdout.is_empty())
-            .unwrap_or(false)
+        {
+            Ok(output) => {
+                let has_changes = !output.stdout.is_empty();
+                if has_changes {
+                    tracing::warn!(
+                        worktree = %worktree_path.display(),
+                        porcelain = %String::from_utf8_lossy(&output.stdout),
+                        "git worktree is dirty"
+                    );
+                }
+                has_changes
+            }
+            Err(error) => {
+                tracing::warn!(
+                    worktree = %worktree_path.display(),
+                    error = %error,
+                    "failed to inspect git worktree status"
+                );
+                false
+            }
+        }
     }
 
     fn commit(&self, worktree_path: &Path, message: &str) -> Result<()> {
