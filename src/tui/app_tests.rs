@@ -174,6 +174,109 @@ fn resume_without_a_policy_falls_back_to_the_plain_resume_command() {
     assert_eq!(command, "claude --dangerously-skip-permissions --continue");
 }
 
+/// Realistic shape of the reviewer-findings text that broke live hand-offs:
+/// multi-paragraph, mixed quote styles, a backtick-quoted identifier, and
+/// ordinary contractions -- exactly the free-form prose an LLM reviewer
+/// writes, with no escaping applied by whoever generated it.
+fn realistic_reviewer_findings() -> String {
+    "Review findings for task F4.1:\n\n\
+     The implementation doesn't handle the \"initializing\" state correctly. \
+     When `removeAll()` is called before the queue drains, it's possible for \
+     a stale entry to survive. The reviewer's note: \"this isn't correct \
+     behavior\" -- and it's worth double-checking the consumer's assumptions \
+     too.\n\n\
+     Second paragraph: a contraction like can't/won't/it's, and a backtick \
+     identifier `fn drain_queue()` plus nested \"double\" and 'single' quotes \
+     mixed together."
+        .to_string()
+}
+
+/// The bug this pins down: `switch_agent_in_tmux` types the command this
+/// function builds directly into an *already-running* interactive shell, so
+/// whatever the single-quote escaping produces here is parsed by a real
+/// shell exactly once. Swapping the agent binary for `printf` (keeping every
+/// flag and the quoted prompt untouched) recovers the literal argv a real
+/// `codex` invocation would have received, without needing a `codex` binary
+/// on `PATH` -- the same technique `tmux::operations::tests::dump_argv_command`
+/// uses for the double-quoted `create_window` lane.
+#[test]
+#[cfg(feature = "test-mocks")]
+fn build_policy_agent_command_codex_reviewer_findings_round_trip_through_a_real_shell() {
+    let agent_ops = MockAgentOperations::new();
+    let policy = ResolvedWorkflowPolicy {
+        role_policy: crate::workflow::WorkflowRolePolicy {
+            write_paths: vec![".agent-flow/plan-review.yaml".to_string()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let findings = realistic_reviewer_findings();
+
+    let command = build_policy_agent_command(&agent_ops, "codex", &findings, Some(&policy), None);
+    let dumper_cmd = command
+        .strip_prefix("codex")
+        .map(|rest| format!("printf '%s\u{1}'{rest}"))
+        .expect("codex command must start with the binary name");
+
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&dumper_cmd)
+        .output()
+        .expect("sh should run");
+    assert!(
+        output.status.success(),
+        "sh failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let argv: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .split('\u{1}')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+
+    assert_eq!(
+        argv.last().map(String::as_str),
+        Some(findings.as_str()),
+        "the reviewer's full findings text must reach the process as one intact \
+         argument, byte-for-byte, with no early termination; got argv: {argv:?}"
+    );
+    // No stray extra shell tokens: exactly the known flags plus the one prompt
+    // argument, nothing split off by an unescaped quote.
+    assert_eq!(
+        argv,
+        vec![
+            "--sandbox".to_string(),
+            "workspace-write".to_string(),
+            "--ask-for-approval".to_string(),
+            "never".to_string(),
+            findings.clone(),
+        ]
+    );
+}
+
+/// `build_policy_agent_command` must strip the same control bytes
+/// `compose_command`'s `normalize_prompt` strips on the fresh-launch lane --
+/// a stray `\r` from a CRLF-sourced findings capture must not reach the
+/// single-quoted argument raw. It corrupts the pasted/typed line (moving the
+/// cursor to column zero mid-paste) without ever breaking the quoting itself,
+/// so the escaping tests above cannot see it.
+#[test]
+#[cfg(feature = "test-mocks")]
+fn build_policy_agent_command_strips_control_bytes_from_findings_before_quoting() {
+    let agent_ops = MockAgentOperations::new();
+    let policy = ResolvedWorkflowPolicy::default();
+    let findings = "Findings line one.\r\nFindings line two.\r\n\u{7}bell\u{0}nul";
+
+    let command = build_policy_agent_command(&agent_ops, "codex", findings, Some(&policy), None);
+
+    assert!(!command.contains('\r'), "command must not carry a raw CR: {command:?}");
+    assert!(!command.contains('\u{7}'), "command must not carry a raw BEL: {command:?}");
+    assert!(!command.contains('\u{0}'), "command must not carry a raw NUL: {command:?}");
+    // The structural newlines and the actual words survive the strip.
+    assert!(command.contains("Findings line one.\nFindings line two.\nbellnul"));
+}
+
+
 /// Codex can resume with the same sandbox, noninteractive approval policy, and
 /// explicit state-scoped network elevation as a fresh launch. Other agents
 /// remain on their native resume command.
@@ -12209,6 +12312,76 @@ fn test_switch_agent_always_sends_new_agent_cmd() {
 
     switch_agent_in_tmux(&mock_tmux, "proj:task", "claude", "my-new-agent");
 }
+/// The bug reproduced live: a hand-off prompt is multi-paragraph reviewer
+/// findings, so the composed command line carries literal `\n`s. Typing that
+/// through `send_keys` submits the shell command at the first newline --
+/// mid single-quoted argument, splitting the rest into stray tokens -- so
+/// this path must route through `paste_text` (bracketed paste) with the
+/// complete, untruncated text and a trailing `Enter`, and the payload must
+/// never be handed to `send_keys`.
+#[test]
+#[cfg(feature = "test-mocks")]
+fn test_switch_agent_multiline_new_agent_cmd_uses_paste_text_not_send_keys() {
+    let mut mock_tmux = MockTmuxOperations::new();
+    // codex has no exit command -- C-c only.
+    mock_tmux
+        .expect_send_key()
+        .withf(|_, key: &str| key == "C-c")
+        .times(1)
+        .returning(|_, _| Ok(()));
+    // "bash" lets the initial exit-wait loop resolve on its first poll;
+    // "claude" (a known AGENT_COMMANDS entry) lets the final launch-detection
+    // loop resolve on its first poll too, keeping the test's real sleeps short.
+    let poll = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+    let poll2 = poll.clone();
+    mock_tmux.expect_pane_current_command().returning(move |_| {
+        let mut n = poll2.lock().unwrap();
+        *n += 1;
+        if *n == 1 {
+            Some("bash".to_string())
+        } else {
+            Some("claude".to_string())
+        }
+    });
+    mock_tmux
+        .expect_capture_pane()
+        .returning(|_| Ok(String::new()));
+
+    let new_agent_cmd =
+        "claude --model opus -- 'Review findings for task F4.1:\n\nParagraph two.'";
+    let expected_cmd = format!(
+        "cd -- \"$AGTX_WORKTREE\" && env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT {new_agent_cmd}"
+    );
+
+    let pasted = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let pasted2 = pasted.clone();
+    mock_tmux
+        .expect_paste_text()
+        .times(1)
+        .returning(move |_, text| {
+            *pasted2.lock().unwrap() = Some(text.to_string());
+            Ok(())
+        });
+    mock_tmux
+        .expect_send_key()
+        .withf(|_, key: &str| key == "Enter")
+        .times(1)
+        .returning(|_, _| Ok(()));
+    // The big multi-line payload must never be delivered through send_keys.
+    mock_tmux
+        .expect_send_keys()
+        .withf(|_, cmd: &str| !cmd.contains("Review findings"))
+        .returning(|_, _| Ok(()));
+
+    let _ = switch_agent_in_tmux(&mock_tmux, "proj:task", "codex", new_agent_cmd);
+
+    assert_eq!(
+        pasted.lock().unwrap().as_deref(),
+        Some(expected_cmd.as_str()),
+        "paste_text must receive the complete, untruncated hand-off command"
+    );
+}
+
 
 // --- wait_for_agent_ready ---
 

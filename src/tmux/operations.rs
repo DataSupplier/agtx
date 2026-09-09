@@ -608,4 +608,36 @@ mod tests {
         assert!(wrap_launch_command("claude", true).ends_with("; exec $SHELL"));
         assert!(!wrap_launch_command("claude", false).contains("exec $SHELL"));
     }
+
+    /// The exact shape of text that broke live hand-offs: multi-paragraph
+    /// reviewer findings with a mix of double/single quotes, a backtick
+    /// identifier, and ordinary contractions -- the free-form prose an LLM
+    /// reviewer writes, unescaped. `create_window` nests this inside two
+    /// layers of single-quoting (`compose_command` then `wrap_launch_command`),
+    /// so this proves the *double*-nested path round-trips it intact --
+    /// `a_quote_in_the_task_survives_both_quoting_layers` above only covers a
+    /// single apostrophe, not this full shape.
+    #[test]
+    fn a_reviewer_findings_prompt_survives_both_quoting_layers() {
+        let prompt = "Review findings for task F4.1:\n\n\
+            The implementation doesn't handle the \"initializing\" state correctly. \
+            When `removeAll()` is called before the queue drains, it's possible for \
+            a stale entry to survive. The reviewer's note: \"this isn't correct \
+            behavior\" -- and it's worth double-checking the consumer's assumptions \
+            too.\n\n\
+            Second paragraph: a contraction like can't/won't/it's, and a backtick \
+            identifier `fn drain_queue()` plus nested \"double\" and 'single' quotes \
+            mixed together.";
+        let cmd = dump_argv_command(&["--sandbox", "workspace-write", prompt]);
+        assert_eq!(
+            argv_delivered_by(&cmd),
+            vec![
+                "--sandbox".to_string(),
+                "workspace-write".to_string(),
+                prompt.to_string(),
+            ],
+            "the full findings text must survive both quoting layers byte-for-byte"
+        );
+    }
+
 }
