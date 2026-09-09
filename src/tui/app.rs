@@ -35,9 +35,9 @@ use crate::workflow::{ResolvedWorkflowPolicy, WorkflowProjectConfig, WorkflowRol
 use crate::workflow_automation::run_automation_tick;
 use crate::workflow_executor::{
     admit_task, complete_feature_integration, decide_workflow_plan, restart_workflow_step,
-    start_workflow_implementation, start_workflow_planning, submit_engineering_review,
-    submit_final_validation, submit_workflow_implementation, submit_workflow_plan, WorkflowRuntime,
-    WorkflowStepOutcome,
+    revoke_workflow_admission, start_workflow_implementation, start_workflow_planning,
+    submit_engineering_review, submit_final_validation, submit_workflow_implementation,
+    submit_workflow_plan, WorkflowRuntime, WorkflowStepOutcome,
 };
 use crate::AppMode;
 
@@ -80,7 +80,7 @@ fn build_footer_text(
                 // Backlog and Ready are both TaskStatus::Backlog, so they offer
                 // the same actions; the gate only lets them through from Ready.
                 match selected_column {
-                    0 | 1 => "[o] new  [Enter] edit  [d] diff  ·  [A] admit  [S] start planning  ·  [?] help  [q] quit".to_string(),
+                    0 | 1 => "[o] new  [Enter] edit  [d] diff  ·  [S] start planning  [U] revoke admission  ·  [?] help  [q] quit".to_string(),
                     2 => format!("[o] new  [Enter] open{fullscreen}  [d] diff  ·  [m] run  ·  [?] help  [q] quit"),
                     3 => format!("[o] new  [Enter] open{fullscreen}  [d] diff  ·  [r] back  [m] move  ·  [?] help  [q] quit"),
                     4 if has_cyclic_plugin => format!(
@@ -4751,6 +4751,7 @@ impl App {
             KeyCode::Char('m') => self.move_task_right()?,
             KeyCode::Char('A') => self.admit_selected_task()?,
             KeyCode::Char('S') => self.start_selected_workflow_planning()?,
+            KeyCode::Char('U') => self.revoke_selected_workflow_admission()?,
             KeyCode::Char('V') => self.submit_selected_workflow_plan()?,
             KeyCode::Char('Y') => self.decide_selected_workflow_plan(true)?,
             KeyCode::Char('N') => self.decide_selected_workflow_plan(false)?,
@@ -5955,6 +5956,16 @@ impl App {
             ));
             return Ok(());
         };
+        if project_workflow.automation.admission_policy
+            != crate::workflow::AdmissionPolicy::Prestage
+        {
+            self.state.warning_message = Some((
+                "Admission is just-in-time for this project; press Shift+S to start planning"
+                    .to_string(),
+                Instant::now(),
+            ));
+            return Ok(());
+        }
 
         let runtime = WorkflowRuntime {
             tmux_ops: &self.state.tmux_ops,
@@ -5974,6 +5985,32 @@ impl App {
         self.apply_workflow_step_outcome(outcome)
     }
 
+    /// Revoke an untouched pre-planning admission after strict executor checks.
+    fn revoke_selected_workflow_admission(&mut self) -> Result<()> {
+        let (task, project_path) = match (
+            self.state.board.selected_task().cloned(),
+            self.state.project_path.clone(),
+        ) {
+            (Some(task), Some(project_path)) => (task, project_path),
+            _ => return Ok(()),
+        };
+        let runtime = WorkflowRuntime {
+            tmux_ops: &self.state.tmux_ops,
+            agent_registry: &self.state.agent_registry,
+            git_ops: &self.state.git_ops,
+            tmux_project_name: &self.state.tmux_project_name,
+            project_path: &project_path,
+            config: &self.state.config,
+            flags: &self.state.flags,
+        };
+        let db = self
+            .state
+            .db
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
+        let outcome = revoke_workflow_admission(task, db, &runtime)?;
+        self.apply_workflow_step_outcome(outcome)
+    }
     /// Start the configured planner from an admitted task worktree.
     fn start_selected_workflow_planning(&mut self) -> Result<()> {
         let (task, project_path) = match (

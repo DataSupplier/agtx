@@ -917,7 +917,9 @@ impl WorkflowPlugin {
     fn parse(content: &str) -> Result<Self> {
         let plugin: Self = toml::from_str(content).context("Failed to parse plugin.toml")?;
         if let Some(workflow) = &plugin.state_machine {
-            workflow.validate().context("Invalid workflow state machine")?;
+            workflow
+                .validate()
+                .context("Invalid workflow state machine")?;
         }
         Ok(plugin)
     }

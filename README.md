@@ -480,6 +480,32 @@ auto_trust = false           # Answer agents' trust prompts on your behalf
 update_check = true          # Check GitHub daily for a new release (see Updating)
 ```
 
+### Admission policy
+
+A dependency-ready Backlog task is shown in the **Ready** lane without creating
+any Git resources. With the default just-in-time policy, AGTX creates the task
+branch and worktree only when an operator starts planning (`Shift+S`), freezing
+the integration target at that moment.
+
+```toml
+[automation]
+enabled = true
+admission_policy = "just_in_time" # default
+```
+
+Set `admission_policy = "prestage"` only when pre-provisioned worktrees are
+worth the cost of a potentially older base commit. In that mode AGTX preserves
+the historic behavior and admits dependency-ready tasks automatically; `Shift+A`
+can also pre-stage an individual task.
+
+An untouched pre-staged task can be returned to Ready with `Shift+U`. AGTX
+refuses revocation if a session exists, the worktree has uncommitted changes,
+or the branch contains commits beyond its frozen admission SHA. Revocation
+removes the worktree and branch while retaining an audit-history record.
+
+**Migration:** projects that previously used `[automation] enabled = true`
+without an admission policy now use just-in-time admission. Add
+`admission_policy = "prestage"` to retain eager provisioning.
 ### Worktree Base Branch
 
 agtx creates a new git worktree for each task. By default it auto-detects the base branch in this

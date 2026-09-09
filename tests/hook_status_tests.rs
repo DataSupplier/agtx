@@ -515,12 +515,9 @@ fn vocabulary(kind: HookConfigKind) -> &'static [&'static str] {
         // agy 1.1.21 — the whole vocabulary is five events. `PreToolUse` is one
         // of them and is deliberately neither mapped nor registered; see the
         // antigravity arm of `hook_events`.
-        HookConfigKind::AntigravityHooksJson => &[
-            "PreInvocation",
-            "PostInvocation",
-            "PostToolUse",
-            "Stop",
-        ],
+        HookConfigKind::AntigravityHooksJson => {
+            &["PreInvocation", "PostInvocation", "PostToolUse", "Stop"]
+        }
     }
 }
 
@@ -531,7 +528,10 @@ fn vocabulary(kind: HookConfigKind) -> &'static [&'static str] {
 #[test]
 fn vocabularies_do_not_leak_across_agents() {
     assert_eq!(map_hook_event(HookConfigKind::GeminiSettings, "Stop"), None);
-    assert_eq!(map_hook_event(HookConfigKind::CursorHooksJson, "Stop"), None);
+    assert_eq!(
+        map_hook_event(HookConfigKind::CursorHooksJson, "Stop"),
+        None
+    );
     assert_eq!(
         map_hook_event(HookConfigKind::ClaudeSettings, "stop"),
         None,

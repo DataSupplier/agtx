@@ -685,6 +685,56 @@ impl Database {
         Ok(())
     }
 
+    /// Clear an untouched admission after its worktree and branch have been
+    /// removed. History is retained, so the former frozen base remains auditable.
+    pub fn revoke_workflow_admission(
+        &mut self,
+        task: &Task,
+        former_state: &WorkflowTaskState,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE tasks SET worktree_path = NULL, branch_name = NULL, base_branch = NULL, session_name = NULL, updated_at = ?2 WHERE id = ?1",
+            params![task.id, chrono::Utc::now().to_rfc3339()],
+        )?;
+        tx.execute(
+            "DELETE FROM workflow_task_states WHERE task_id = ?1",
+            params![task.id],
+        )?;
+        let record = WorkflowTransitionRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            task_id: task.id.clone(),
+            action: "revoke_admission".to_string(),
+            from_state: former_state.state.clone(),
+            to_state: "backlog".to_string(),
+            actor_role: Some("human".to_string()),
+            actor_agent: None,
+            reason: Some(format!(
+                "Untouched admission revoked; frozen base was {}",
+                former_state.base_sha.as_deref().unwrap_or("unknown")
+            )),
+            created_at: chrono::Utc::now(),
+        };
+        tx.execute(
+            r#"INSERT INTO workflow_transition_history (
+                id, task_id, action, from_state, to_state, actor_role, actor_agent,
+                reason, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+            params![
+                record.id,
+                record.task_id,
+                record.action,
+                record.from_state,
+                record.to_state,
+                record.actor_role,
+                record.actor_agent,
+                record.reason,
+                record.created_at.to_rfc3339()
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
     /// Append an operational event without changing board or workflow state.
     /// Journal rows deliberately have no foreign key to `tasks`: they remain
     /// available for post-mortem analysis after a completed task is cleaned up.

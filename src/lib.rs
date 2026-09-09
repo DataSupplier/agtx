@@ -6,11 +6,11 @@ pub mod git;
 pub mod mcp;
 pub mod skills;
 pub mod tmux;
+pub mod tui;
+pub mod update;
 pub mod workflow;
 pub mod workflow_automation;
 pub mod workflow_executor;
-pub mod tui;
-pub mod update;
 
 /// The HTTP + WebSocket server behind `agtx serve`.
 #[cfg(feature = "serve")]

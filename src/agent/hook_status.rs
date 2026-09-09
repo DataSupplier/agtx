@@ -113,9 +113,7 @@ pub fn map_hook_event(kind: HookConfigKind, event: &str) -> Option<HookState> {
         // `BeforeAgent`/`AfterAgent` and the tool heartbeat is `BeforeTool`.
         // `Notification` fires on a ToolPermission alert and carries `message`.
         GeminiSettings => match event {
-            "SessionStart" | "BeforeAgent" | "BeforeTool" | "AfterTool" => {
-                Some(HookState::Working)
-            }
+            "SessionStart" | "BeforeAgent" | "BeforeTool" | "AfterTool" => Some(HookState::Working),
             "Notification" => Some(HookState::Blocked),
             "AfterAgent" => Some(HookState::Waiting),
             "SessionEnd" => Some(HookState::Ended),
@@ -160,7 +158,11 @@ pub fn map_hook_event(kind: HookConfigKind, event: &str) -> Option<HookState> {
 /// Lowercase and drop underscores, so one arm accepts both spellings grok uses
 /// for an event: `PreToolUse` when registered, `pre_tool_use` when reported.
 fn squash(event: &str) -> String {
-    event.chars().filter(|c| *c != '_').flat_map(char::to_lowercase).collect()
+    event
+        .chars()
+        .filter(|c| *c != '_')
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 /// The events agtx registers for one agent.

@@ -244,9 +244,9 @@ fn guard_name(guard: &WorkflowGuard) -> &'static str {
 
 fn validate_identifier(kind: &str, value: &str) -> Result<()> {
     if value.is_empty()
-        || !value
-            .chars()
-            .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_')
+        || !value.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+        })
     {
         bail!("{kind} '{value}' must use lowercase letters, digits, or underscores");
     }
@@ -374,6 +374,20 @@ pub struct ResolvedWorkflowPolicy {
     pub network: bool,
 }
 
+/// Whether automation only projects dependency readiness or also provisions
+/// task worktrees before a human starts planning.
+///
+/// Just-in-time admission is deliberately the default: a Ready card is a
+/// scheduling signal, not a stale checkout. Projects that value pre-provisioned
+/// worktrees can opt in to [`AdmissionPolicy::Prestage`].
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionPolicy {
+    #[default]
+    JustInTime,
+    Prestage,
+}
+
 /// `[automation]` in `.agtx/workflow.toml`. Absent entirely -- or present
 /// with `enabled = false`, its default -- leaves a project completely
 /// unaffected: `run_automation_tick` is only ever wired into the
@@ -384,6 +398,8 @@ pub struct ResolvedWorkflowPolicy {
 pub struct WorkflowAutomationConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub admission_policy: AdmissionPolicy,
 }
 
 /// Project-owned bindings for a declared workflow.
@@ -477,7 +493,9 @@ impl WorkflowProjectConfig {
         let state = workflow
             .state(state_id)
             .ok_or_else(|| anyhow::anyhow!("unknown workflow state '{state_id}'"))?;
-        let Some(role) = state.role.as_ref() else { return Ok(None); };
+        let Some(role) = state.role.as_ref() else {
+            return Ok(None);
+        };
         let mut resolved = ResolvedWorkflowPolicy {
             role: role.clone(),
             defaults: self.role_policies.defaults.clone(),
@@ -491,29 +509,31 @@ impl WorkflowProjectConfig {
             // artifact. A missing role entry is a workflow misconfiguration;
             // surface it here instead of degrading into an agent that looks
             // launched but cannot do its job.
-            role_policy: self
-                .role_policies
-                .roles
-                .get(role)
-                .cloned()
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "workflow role '{role}' (state '{state_id}') has no \
+            role_policy: self.role_policies.roles.get(role).cloned().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "workflow role '{role}' (state '{state_id}') has no \
                          [role_policies.{role}] entry; refusing to launch an \
                          agent with an empty permission set"
-                    )
-                })?,
+                )
+            })?,
             merge_target: None,
             network: self.role_policies.defaults.network,
         };
         if !resolved.role_policy.states.is_empty()
-            && !resolved.role_policy.states.iter().any(|state| state == state_id)
+            && !resolved
+                .role_policy
+                .states
+                .iter()
+                .any(|state| state == state_id)
         {
             bail!("role policy '{role}' does not permit workflow state '{state_id}'");
         }
         if let Some(state_policy) = self.state_policies.get(state_id) {
             if state_policy.role != *role {
-                bail!("workflow state policy '{state_id}' belongs to '{}', not '{role}'", state_policy.role);
+                bail!(
+                    "workflow state policy '{state_id}' belongs to '{}', not '{role}'",
+                    state_policy.role
+                );
             }
             resolved.role_policy.modify_source_and_tests |= state_policy.modify_source_and_tests;
             resolved.role_policy.final_task_commit |= state_policy.final_task_commit;
@@ -531,9 +551,9 @@ impl WorkflowProjectConfig {
 
 fn validate_agent_option(kind: &str, value: &str) -> anyhow::Result<()> {
     if value.is_empty()
-        || !value
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+        || !value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
     {
         bail!("workflow {kind} must contain only ASCII letters, digits, '-', '_' or '.'");
     }
@@ -559,7 +579,12 @@ fn validate_command_prefix(command: &str) -> Result<()> {
     if trimmed.is_empty() || trimmed != command {
         bail!("allowed command must be non-empty and trimmed");
     }
-    if command.chars().any(|character| matches!(character, '\n' | '\r' | '|' | ';' | '&' | '>' | '<' | '`' | '$')) {
+    if command.chars().any(|character| {
+        matches!(
+            character,
+            '\n' | '\r' | '|' | ';' | '&' | '>' | '<' | '`' | '$'
+        )
+    }) {
         bail!("allowed command '{command}' may not contain shell operators");
     }
     if command.split_whitespace().next().is_none() {
@@ -572,7 +597,14 @@ fn validate_worktree_glob(glob: &str) -> Result<()> {
     if glob.is_empty() || Path::new(glob).is_absolute() {
         bail!("write path '{glob}' must be a non-empty worktree-relative glob");
     }
-    if Path::new(glob).components().any(|component| matches!(component, std::path::Component::ParentDir | std::path::Component::RootDir | std::path::Component::Prefix(_))) {
+    if Path::new(glob).components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
         bail!("write path '{glob}' may not escape the task worktree");
     }
     Ok(())
@@ -623,7 +655,11 @@ mod tests {
     fn rejects_unknown_transition_state() {
         let mut definition = workflow();
         definition.transitions[0].to = "missing".into();
-        assert!(definition.validate().unwrap_err().to_string().contains("unknown target"));
+        assert!(definition
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("unknown target"));
     }
 
     #[test]
@@ -651,9 +687,24 @@ mod tests {
         let graph = WorkflowDefinition {
             initial_state: "planning".into(),
             states: vec![
-                WorkflowState { id: "planning".into(), label: "Planning".into(), role: Some("planner".into()), terminal: false },
-                WorkflowState { id: "integrate_to_feature".into(), label: "Integrate".into(), role: Some("engineering_reviewer".into()), terminal: false },
-                WorkflowState { id: "done".into(), label: "Done".into(), role: None, terminal: true },
+                WorkflowState {
+                    id: "planning".into(),
+                    label: "Planning".into(),
+                    role: Some("planner".into()),
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "integrate_to_feature".into(),
+                    label: "Integrate".into(),
+                    role: Some("engineering_reviewer".into()),
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "done".into(),
+                    label: "Done".into(),
+                    role: None,
+                    terminal: true,
+                },
             ],
             transitions: vec![],
         };
@@ -678,12 +729,19 @@ push_task_branch = true
 merge_task_into_target = true
 merge_target = "feature/poc"
 "#,
-        ).unwrap();
+        )
+        .unwrap();
         config.validate().unwrap();
-        let planning = config.policy_for_state(&graph, "planning").unwrap().unwrap();
+        let planning = config
+            .policy_for_state(&graph, "planning")
+            .unwrap()
+            .unwrap();
         assert!(planning.role_policy.modify_plan_artifacts);
         assert!(!planning.role_policy.final_task_commit);
-        let delivery = config.policy_for_state(&graph, "integrate_to_feature").unwrap().unwrap();
+        let delivery = config
+            .policy_for_state(&graph, "integrate_to_feature")
+            .unwrap()
+            .unwrap();
         assert!(delivery.role_policy.final_task_commit);
         assert_eq!(delivery.merge_target.as_deref(), Some("feature/poc"));
     }
@@ -812,7 +870,8 @@ write_paths = [".agtx/plans/**"]
     }
 
     #[test]
-    fn available_transitions_is_empty_when_the_only_transitions_guard_fails_but_validate_transition_still_errors() {
+    fn available_transitions_is_empty_when_the_only_transitions_guard_fails_but_validate_transition_still_errors(
+    ) {
         let definition = branching_workflow();
         let available = definition.available_transitions("planning", GuardContext::default());
         assert!(available.is_empty());

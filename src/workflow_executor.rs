@@ -602,6 +602,88 @@ pub fn complete_admission(
     })
 }
 
+/// Revoke a pre-planning admission only when no task work could be lost.
+///
+/// Git resources are removed before the database allocation is cleared. If a
+/// git operation fails, the durable admission is deliberately left intact so
+/// the operator can retry or recover it rather than being told a missing
+/// checkout is still usable.
+pub fn revoke_workflow_admission(
+    task: Task,
+    db: &mut Database,
+    runtime: &WorkflowRuntime,
+) -> Result<WorkflowStepOutcome> {
+    if task.status != TaskStatus::Backlog {
+        return Ok(WorkflowStepOutcome::Blocked {
+            message: "Only Backlog tasks can revoke admission".into(),
+        });
+    }
+    if task.session_name.is_some() {
+        return Ok(WorkflowStepOutcome::Blocked {
+            message: "Stop the active task session before revoking admission".into(),
+        });
+    }
+    let Some(worktree) = task.worktree_path.as_deref() else {
+        return Ok(WorkflowStepOutcome::Blocked {
+            message: "Task has no admission to revoke".into(),
+        });
+    };
+    let Some(branch) = task.branch_name.as_deref() else {
+        return Ok(WorkflowStepOutcome::Blocked {
+            message: "Admission has no task branch; refusing cleanup".into(),
+        });
+    };
+    let Some(state) = db.get_workflow_task_state(&task.id)? else {
+        return Ok(WorkflowStepOutcome::Blocked {
+            message: "Admission has no workflow state; refusing cleanup".into(),
+        });
+    };
+    if !matches!(state.state.as_str(), "admission" | "ready_for_planning") {
+        return Ok(WorkflowStepOutcome::Blocked {
+            message: "Only an unstarted admission can be revoked".into(),
+        });
+    }
+    let Some(base_sha) = state.base_sha.as_deref() else {
+        return Ok(WorkflowStepOutcome::Blocked {
+            message: "Admission has no frozen base; refusing cleanup".into(),
+        });
+    };
+    if runtime.git_ops.has_changes(Path::new(worktree)) {
+        return Ok(WorkflowStepOutcome::Blocked {
+            message: "Worktree has uncommitted changes; refusing to revoke admission".into(),
+        });
+    }
+    let head = match crate::git::resolve_commit(runtime.project_path, branch) {
+        Ok(head) => head,
+        Err(error) => {
+            return Ok(WorkflowStepOutcome::Blocked {
+                message: format!("Cannot verify task branch before revocation: {error}"),
+            })
+        }
+    };
+    if head != base_sha {
+        return Ok(WorkflowStepOutcome::Blocked {
+            message: "Task branch contains commits beyond its admission base; refusing to revoke"
+                .into(),
+        });
+    }
+    if let Err(error) = runtime
+        .git_ops
+        .remove_worktree(runtime.project_path, worktree)
+    {
+        return Ok(WorkflowStepOutcome::Blocked {
+            message: format!("Could not remove admitted worktree: {error}"),
+        });
+    }
+    if let Err(error) = runtime.git_ops.delete_branch(runtime.project_path, branch) {
+        return Ok(WorkflowStepOutcome::Blocked { message: format!("Worktree removed but branch cleanup failed; admission remains recorded for recovery: {error}") });
+    }
+    db.revoke_workflow_admission(&task, &state)?;
+    Ok(WorkflowStepOutcome::Advanced {
+        task,
+        message: "Admission revoked; task is Ready without an allocated worktree".into(),
+    })
+}
 /// Extracted body of `App::start_selected_workflow_planning`.
 ///
 /// Planning is deliberately restartable: a task can retain its durable
@@ -615,13 +697,31 @@ pub fn start_workflow_planning(
     db: &mut Database,
     runtime: &WorkflowRuntime,
 ) -> Result<WorkflowStepOutcome> {
+    // In just-in-time mode a dependency-ready card deliberately has no
+    // allocation yet. Admission and planning start share this one operator
+    // action so the frozen base is as current as possible.
+    if task.worktree_path.is_none() {
+        match admit_task(
+            workflow,
+            project_workflow,
+            plugin,
+            task.clone(),
+            db,
+            runtime,
+        )? {
+            WorkflowStepOutcome::Advanced { task: admitted, .. } => task = admitted,
+            outcome => return Ok(outcome),
+        }
+    }
     let Some(worktree) = task.worktree_path.clone() else {
         return Ok(WorkflowStepOutcome::Blocked {
-            message: "Admit the task before starting planning".into(),
+            message: "Could not create an admitted worktree for planning".into(),
         });
     };
     let Some(current) = db.get_workflow_task_state(&task.id)? else {
-        return Ok(WorkflowStepOutcome::NoOp);
+        return Ok(WorkflowStepOutcome::Blocked {
+            message: "Admission did not persist workflow state".into(),
+        });
     };
 
     let restarting = current.state == "planning";

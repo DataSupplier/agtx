@@ -639,5 +639,4 @@ mod tests {
             "the full findings text must survive both quoting layers byte-for-byte"
         );
     }
-
 }

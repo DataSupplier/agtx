@@ -2292,8 +2292,9 @@ fn test_footer_text_sidebar_focused() {
 #[test]
 fn test_footer_text_backlog_column() {
     let text = build_footer_text(None, false, 0, false, false);
-    assert!(text.contains("[A] admit"));
+    assert!(!text.contains("[A] admit"));
     assert!(text.contains("[S] start planning"));
+    assert!(text.contains("[U] revoke admission"));
     assert!(!text.contains("[r] move left"));
 }
 
@@ -4135,7 +4136,7 @@ fn test_switch_agent_claude_sends_exit() {
         .returning(|_| Some("bash".to_string()));
     mock.expect_capture_pane().returning(|_| Ok(String::new()));
 
-    switch_agent_in_tmux(&mock, "sess:win", "claude", "codex");
+    let _ = switch_agent_in_tmux(&mock, "sess:win", "claude", "codex");
     assert!(
         exit_sent.load(Ordering::SeqCst),
         "/exit should be sent for claude"
@@ -4170,7 +4171,7 @@ fn test_switch_agent_gemini_sends_quit() {
         .returning(|_| Some("zsh".to_string()));
     mock.expect_capture_pane().returning(|_| Ok(String::new()));
 
-    switch_agent_in_tmux(&mock, "sess:win", "gemini", "claude");
+    let _ = switch_agent_in_tmux(&mock, "sess:win", "gemini", "claude");
     assert!(
         quit_sent.load(Ordering::SeqCst),
         "/quit should be sent for gemini"
@@ -4198,7 +4199,7 @@ fn test_switch_agent_codex_sends_ctrl_c() {
         .returning(|_| Some("bash".to_string()));
     mock.expect_capture_pane().returning(|_| Ok(String::new()));
 
-    switch_agent_in_tmux(&mock, "sess:win", "codex", "claude");
+    let _ = switch_agent_in_tmux(&mock, "sess:win", "codex", "claude");
     assert!(
         ctrl_c_sent.load(Ordering::SeqCst),
         "Ctrl+C should be sent for codex"
@@ -12191,7 +12192,7 @@ fn test_switch_agent_claude_sends_exit_then_new_cmd() {
         .times(1)
         .returning(|_, _| Ok(()));
 
-    switch_agent_in_tmux(
+    let _ = switch_agent_in_tmux(
         &mock_tmux,
         "proj:task",
         "claude",
@@ -12224,7 +12225,7 @@ fn test_switch_agent_codex_sends_ctrl_c_not_exit() {
         .times(1)
         .returning(|_, _| Ok(()));
 
-    switch_agent_in_tmux(
+    let _ = switch_agent_in_tmux(
         &mock_tmux,
         "proj:task",
         "codex",
@@ -12273,7 +12274,7 @@ fn test_switch_agent_retries_with_ctrl_c_when_shell_not_found() {
         .times(1)
         .returning(|_, _| Ok(()));
 
-    switch_agent_in_tmux(&mock_tmux, "proj:task", "claude", "newagent");
+    let _ = switch_agent_in_tmux(&mock_tmux, "proj:task", "claude", "newagent");
 }
 
 #[test]
@@ -12308,7 +12309,7 @@ fn test_switch_agent_sends_ctrl_d_as_last_resort() {
         .times(1)
         .returning(|_, _| Ok(()));
 
-    switch_agent_in_tmux(&mock_tmux, "proj:task", "claude", "newagent");
+    let _ = switch_agent_in_tmux(&mock_tmux, "proj:task", "claude", "newagent");
 }
 
 #[test]
@@ -12331,7 +12332,7 @@ fn test_switch_agent_always_sends_new_agent_cmd() {
         .times(1)
         .returning(|_, _| Ok(()));
 
-    switch_agent_in_tmux(&mock_tmux, "proj:task", "claude", "my-new-agent");
+    let _ = switch_agent_in_tmux(&mock_tmux, "proj:task", "claude", "my-new-agent");
 }
 /// The bug reproduced live: a hand-off prompt is multi-paragraph reviewer
 /// findings, so the composed command line carries literal `\n`s. Typing that
@@ -12399,6 +12400,144 @@ fn test_switch_agent_multiline_new_agent_cmd_uses_paste_text_not_send_keys() {
         pasted.lock().unwrap().as_deref(),
         Some(expected_cmd.as_str()),
         "paste_text must receive the complete, untruncated hand-off command"
+    );
+}
+
+/// The live incident: a hand-off's reviewer findings are multi-paragraph
+/// text with apostrophes, nested quotes, and backticks. This drives the
+/// *full* command `switch_agent_in_tmux` types into the target pane -- the
+/// `cd -- "$AGTX_WORKTREE" && env -u ... <agent invocation>` wrapper, not just
+/// `build_policy_agent_command`'s inner piece -- through a real shell, the
+/// same way the pane itself would parse it. `codex` is swapped for `printf`
+/// (keeping every flag and the quoted prompt untouched) so no `codex` binary
+/// is needed on `PATH`, mirroring `build_policy_agent_command_codex_reviewer_findings_round_trip_through_a_real_shell`.
+#[test]
+#[cfg(feature = "test-mocks")]
+fn switch_agent_in_tmux_codex_reviewer_findings_round_trip_through_a_real_shell() {
+    let agent_ops = MockAgentOperations::new();
+    let policy = ResolvedWorkflowPolicy {
+        role_policy: crate::workflow::WorkflowRolePolicy {
+            write_paths: vec![".agent-flow/plan-review.yaml".to_string()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let findings = realistic_reviewer_findings();
+    let new_agent_cmd =
+        build_policy_agent_command(&agent_ops, "codex", &findings, Some(&policy), None);
+
+    let mut mock_tmux = MockTmuxOperations::new();
+    mock_tmux
+        .expect_send_key()
+        .withf(|_, key: &str| key == "C-c")
+        .returning(|_, _| Ok(()));
+    let poll = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+    let poll2 = poll.clone();
+    mock_tmux.expect_pane_current_command().returning(move |_| {
+        let mut n = poll2.lock().unwrap();
+        *n += 1;
+        if *n == 1 {
+            Some("bash".to_string())
+        } else {
+            Some("claude".to_string())
+        }
+    });
+    mock_tmux
+        .expect_capture_pane()
+        .returning(|_| Ok(String::new()));
+
+    let pasted = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let pasted2 = pasted.clone();
+    mock_tmux
+        .expect_paste_text()
+        .times(1)
+        .returning(move |_, text| {
+            *pasted2.lock().unwrap() = Some(text.to_string());
+            Ok(())
+        });
+    mock_tmux
+        .expect_send_key()
+        .withf(|_, key: &str| key == "Enter")
+        .returning(|_, _| Ok(()));
+    mock_tmux.expect_send_keys().returning(|_, _| Ok(()));
+
+    switch_agent_in_tmux(&mock_tmux, "proj:task", "codex", &new_agent_cmd).unwrap();
+
+    let full_cmd = pasted
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("paste_text must receive the hand-off command");
+    assert!(full_cmd.starts_with(
+        "cd -- \"$AGTX_WORKTREE\" && env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT codex"
+    ));
+
+    let dumper_cmd = full_cmd.replacen(" codex", " printf '%s\u{1}'", 1);
+    let worktree = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&dumper_cmd)
+        .env("AGTX_WORKTREE", worktree.path())
+        .output()
+        .expect("sh should run");
+    assert!(
+        output.status.success(),
+        "sh failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let argv: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .split('\u{1}')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(
+        argv.last().map(String::as_str),
+        Some(findings.as_str()),
+        "the reviewer's full findings text must reach the process as one intact \
+         argument, byte-for-byte, once the real shell parses the whole \
+         switch_agent_in_tmux command line; got argv: {argv:?}"
+    );
+}
+
+/// The other live incident: the old agent (codex) never confirms exiting --
+/// Ctrl+C, the retried exit command, and the Ctrl+D last resort all fail, so
+/// `pane_current_command` reports `codex` for the entire run, never a shell
+/// and never the new agent (`claude`). Before this fix, the final
+/// launch-detection loop would see "codex" -- itself a member of
+/// `AGENT_COMMANDS` -- and declare success on the very first poll, even
+/// though nothing new ever launched and the old agent is still sitting
+/// there. This is the exact shape of the reproduced incident: DB says
+/// `agent: claude`, but only a `codex` process is actually running.
+#[test]
+#[cfg(feature = "test-mocks")]
+fn switch_agent_in_tmux_reports_failure_when_previous_agent_never_confirmed_exited() {
+    let mut mock_tmux = MockTmuxOperations::new();
+    mock_tmux.expect_send_key().returning(|_, _| Ok(()));
+    mock_tmux.expect_send_keys().returning(|_, _| Ok(()));
+    // The old agent's own process name, forever -- it never reaches a shell,
+    // and it never becomes anything that could plausibly be the new agent.
+    mock_tmux
+        .expect_pane_current_command()
+        .returning(|_| Some("codex".to_string()));
+    mock_tmux
+        .expect_capture_pane()
+        .returning(|_| Ok(String::new()));
+
+    let result = switch_agent_in_tmux(
+        &mock_tmux,
+        "proj:task",
+        "codex",
+        "claude --dangerously-skip-permissions",
+    );
+
+    assert!(
+        result.is_err(),
+        "must not silently report success when the previous agent's exit was never confirmed"
+    );
+    let message = result.unwrap_err().to_string();
+    assert!(
+        message.contains("codex") && message.contains("could not confirm"),
+        "error must name the agent that failed to exit and explain why; got: {message}"
     );
 }
 
@@ -12760,7 +12899,7 @@ fn test_switch_agent_cursor_sends_ctrl_c_not_exit() {
         .times(1)
         .returning(|_, _| Ok(()));
 
-    switch_agent_in_tmux(&mock_tmux, "proj:task", "cursor", "agent --yolo");
+    let _ = switch_agent_in_tmux(&mock_tmux, "proj:task", "cursor", "agent --yolo");
 }
 
 #[test]
@@ -12784,7 +12923,7 @@ fn test_switch_agent_opencode_sends_exit() {
         .expect_capture_pane()
         .returning(|_| Ok(String::new()));
 
-    switch_agent_in_tmux(&mock_tmux, "proj:task", "opencode", "opencode");
+    let _ = switch_agent_in_tmux(&mock_tmux, "proj:task", "opencode", "opencode");
     assert!(
         exit_sent.load(std::sync::atomic::Ordering::SeqCst),
         "/exit should be sent for opencode"
@@ -14784,7 +14923,6 @@ fn test_agent_commands_derivation_matches_the_previous_literals() {
         // pi. Only fires on Linux — macOS fixes `p_comm` at exec, so the pane
         // reports `node` and pi's scoped indicator does the detecting there.
         // `node` itself must never join this list: it is every Ink agent's pane
-        // name, and would make any node process read as a live agent.
         "pi",
         // Not agent binaries, but a Python entry point must not read as "shell".
         "python3", "python",

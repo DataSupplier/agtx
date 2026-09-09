@@ -297,16 +297,31 @@ struct AutomationStatusView {
 
 impl AutomationStatusView {
     fn not_applicable() -> Self {
-        Self { kind: "not_applicable", reason: None }
+        Self {
+            kind: "not_applicable",
+            reason: None,
+        }
     }
 
     fn from_decision(decision: crate::workflow_executor::AutomationDecision) -> Self {
         use crate::workflow_executor::AutomationDecision;
         match decision {
-            AutomationDecision::Wait => Self { kind: "waiting", reason: None },
-            AutomationDecision::Advance(action) => Self { kind: "ready", reason: Some(action) },
-            AutomationDecision::InvalidArtifact(reason) => Self { kind: "invalid", reason: Some(reason) },
-            AutomationDecision::HumanGate(reason) => Self { kind: "human_gate", reason: Some(reason) },
+            AutomationDecision::Wait => Self {
+                kind: "waiting",
+                reason: None,
+            },
+            AutomationDecision::Advance(action) => Self {
+                kind: "ready",
+                reason: Some(action),
+            },
+            AutomationDecision::InvalidArtifact(reason) => Self {
+                kind: "invalid",
+                reason: Some(reason),
+            },
+            AutomationDecision::HumanGate(reason) => Self {
+                kind: "human_gate",
+                reason: Some(reason),
+            },
         }
     }
 }
@@ -340,7 +355,11 @@ fn workflow_context_for(project_path: &std::path::Path) -> Option<WorkflowContex
     let project = crate::workflow::WorkflowProjectConfig::load(project_path)
         .ok()
         .flatten()?;
-    Some(WorkflowContext { workflow, project, plugin })
+    Some(WorkflowContext {
+        workflow,
+        project,
+        plugin,
+    })
 }
 
 fn card(

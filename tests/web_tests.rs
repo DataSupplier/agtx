@@ -380,8 +380,18 @@ fn small_workflow() -> WorkflowDefinition {
     WorkflowDefinition {
         initial_state: "backlog".into(),
         states: vec![
-            WorkflowState { id: "backlog".into(), label: "Backlog".into(), role: None, terminal: false },
-            WorkflowState { id: "admission".into(), label: "Admission".into(), role: None, terminal: true },
+            WorkflowState {
+                id: "backlog".into(),
+                label: "Backlog".into(),
+                role: None,
+                terminal: false,
+            },
+            WorkflowState {
+                id: "admission".into(),
+                label: "Admission".into(),
+                role: None,
+                terminal: true,
+            },
         ],
         transitions: vec![WorkflowTransition {
             action: "admit".into(),
@@ -429,7 +439,11 @@ fn seed_workflow_project(f: &Fixture, plugin_name: &str, automation_enabled: boo
     let plugin = plugin_for_tests(plugin_name, small_workflow());
     let plugin_dir = agtx_dir.join("plugins").join(plugin_name);
     std::fs::create_dir_all(&plugin_dir).unwrap();
-    std::fs::write(plugin_dir.join("plugin.toml"), toml::to_string(&plugin).unwrap()).unwrap();
+    std::fs::write(
+        plugin_dir.join("plugin.toml"),
+        toml::to_string(&plugin).unwrap(),
+    )
+    .unwrap();
 
     std::fs::write(
         agtx_dir.join("workflow.toml"),
@@ -466,7 +480,10 @@ async fn workflow_actions_and_automation_status_match_direct_calls() {
     let plugin = plugin_for_tests("testflow-parity", workflow.clone());
     let project = WorkflowProjectConfig {
         target_branch: "main".into(),
-        automation: agtx::workflow::WorkflowAutomationConfig { enabled: true },
+        automation: agtx::workflow::WorkflowAutomationConfig {
+            enabled: true,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let db = Database::open_project(&f.project_path).unwrap();
@@ -477,7 +494,10 @@ async fn workflow_actions_and_automation_status_match_direct_calls() {
         .map(|t| t.action.clone())
         .collect();
     let expected_decision = assess(&workflow, &project, &plugin, &task, &state, &db);
-    assert_eq!(expected_decision, AutomationDecision::Advance("admit".to_string()));
+    assert_eq!(
+        expected_decision,
+        AutomationDecision::Advance("admit".to_string())
+    );
 
     let http_state = state_for(&f, ServeMode::Global);
     let (status, body) = get(http_state, &format!("/api/projects/{}/tasks", f.project_id)).await;
@@ -1954,7 +1974,14 @@ async fn a_pairing_survives_the_server_that_issued_it() {
         StatusCode::OK,
         "the device had to pair again after a restart"
     );
-    assert_eq!(Database::open_global().unwrap().list_mobile_devices().unwrap().len(), 1);
+    assert_eq!(
+        Database::open_global()
+            .unwrap()
+            .list_mobile_devices()
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 /// `revoke_session_devices` is scoped to one session, which is what would let a
@@ -2040,7 +2067,9 @@ async fn the_legacy_token_is_adopted_once() {
     // The file is gone, so there is exactly one credential path, and a second
     // run is a no-op rather than a duplicate row.
     assert!(!agtx::web::auth::token_path().unwrap().exists());
-    assert!(agtx::web::auth::migrate_legacy_token(None).unwrap().is_none());
+    assert!(agtx::web::auth::migrate_legacy_token(None)
+        .unwrap()
+        .is_none());
     assert_eq!(
         Database::open_global()
             .unwrap()

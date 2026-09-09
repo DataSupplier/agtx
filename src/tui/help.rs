@@ -37,7 +37,11 @@ pub const HELP: &[HelpSection] = &[
     HelpSection {
         title: "Moving tasks",
         entries: &[
-            e("A", "Admit a declarative-workflow Backlog task"),
+            e(
+                "A",
+                "Prestage a declarative-workflow Backlog task (prestage policy only)",
+            ),
+            e("U", "Revoke an untouched declarative-workflow admission"),
             e(
                 "S / V / Y / N",
                 "Plan: start / submit / approve / request changes",

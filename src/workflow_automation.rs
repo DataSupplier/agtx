@@ -7,13 +7,12 @@
 //!
 //! Two lanes, matched to the two things a human operator actually decides:
 //!
-//! 1. **Dependency admission.** A `backlog` task (or one with no persisted
-//!    workflow state yet) whose dependencies have resolved is admitted via
-//!    the existing [`admit_task`] extracted function, exactly as `Shift+A`
-//!    does. Admission only ever reaches the plugin's post-admission holding
-//!    state (whatever the workflow calls it); starting planning from there
-//!    is a deliberate, permanently human-only action (`Shift+S` /
-//!    [`start_workflow_planning`]) that this module never calls.
+//! 1. **Dependency readiness.** A dependency-ready `backlog` task remains a
+//!    non-allocating Ready card by default. Projects that explicitly select
+//!    `prestage` retain eager admission through [`admit_task`]. Starting
+//!    planning is permanently human-only (`Shift+S` /
+//!    [`start_workflow_planning`]); in the default policy that key performs
+//!    admission immediately before launching the planner.
 //! 2. **Everything from `planning` onward.** [`assess`] reads the durable
 //!    evidence for a task and reports what, if anything, is ready to fire.
 //!    An [`AutomationDecision::Advance`] is dispatched to whichever of the
@@ -38,7 +37,7 @@
 
 use crate::config::WorkflowPlugin;
 use crate::db::{Database, Task, TaskStatus};
-use crate::workflow::{WorkflowDefinition, WorkflowProjectConfig};
+use crate::workflow::{AdmissionPolicy, WorkflowDefinition, WorkflowProjectConfig};
 use crate::workflow_executor::{
     admit_task, assess, complete_admission, complete_feature_integration,
     start_workflow_implementation, submit_engineering_review, submit_final_validation,
@@ -108,6 +107,16 @@ pub fn run_automation_tick(
             // -- `admit_task` itself only records the worktree/branch and
             // the admission evidence, exactly as `Shift+A` does manually.
             if !db.deps_satisfied(&task) {
+                results.push(TaskAutomationResult {
+                    task_id: task.id.clone(),
+                    decision: AutomationDecision::Wait,
+                    outcome: None,
+                });
+                continue;
+            }
+            if project.automation.admission_policy == AdmissionPolicy::JustInTime {
+                // The board derives its Ready lane from `deps_satisfied`; do
+                // not turn a scheduling signal into an allocated checkout.
                 results.push(TaskAutomationResult {
                     task_id: task.id.clone(),
                     decision: AutomationDecision::Wait,
@@ -225,7 +234,9 @@ fn dispatch_advance(
         "implementation_complete" => {
             submit_workflow_implementation(workflow, project, plugin, task, db, runtime)
         }
-        "engineering_corrections_required" | "engineering_plan_issue" | "start_final_validation" => {
+        "engineering_corrections_required"
+        | "engineering_plan_issue"
+        | "start_final_validation" => {
             submit_engineering_review(workflow, project, plugin, task, db, runtime)
         }
         "validation_failed" | "begin_feature_integration" => {
@@ -261,16 +272,66 @@ mod tests {
         WorkflowDefinition {
             initial_state: "backlog".into(),
             states: vec![
-                WorkflowState { id: "backlog".into(), label: "Backlog".into(), role: None, terminal: false },
-                WorkflowState { id: "admission".into(), label: "Admission".into(), role: None, terminal: false },
-                WorkflowState { id: "ready_for_planning".into(), label: "Ready for planning".into(), role: None, terminal: false },
-                WorkflowState { id: "planning".into(), label: "Planning".into(), role: Some("planner".into()), terminal: false },
-                WorkflowState { id: "plan_review".into(), label: "Plan review".into(), role: Some("plan_reviewer".into()), terminal: false },
-                WorkflowState { id: "implementing".into(), label: "Implementing".into(), role: Some("implementer".into()), terminal: false },
-                WorkflowState { id: "engineering_review".into(), label: "Engineering review".into(), role: Some("reviewer".into()), terminal: false },
-                WorkflowState { id: "final_validation".into(), label: "Final validation".into(), role: Some("validator".into()), terminal: false },
-                WorkflowState { id: "integrate_to_feature".into(), label: "Integrate".into(), role: Some("reviewer".into()), terminal: false },
-                WorkflowState { id: "done".into(), label: "Done".into(), role: None, terminal: true },
+                WorkflowState {
+                    id: "backlog".into(),
+                    label: "Backlog".into(),
+                    role: None,
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "admission".into(),
+                    label: "Admission".into(),
+                    role: None,
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "ready_for_planning".into(),
+                    label: "Ready for planning".into(),
+                    role: None,
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "planning".into(),
+                    label: "Planning".into(),
+                    role: Some("planner".into()),
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "plan_review".into(),
+                    label: "Plan review".into(),
+                    role: Some("plan_reviewer".into()),
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "implementing".into(),
+                    label: "Implementing".into(),
+                    role: Some("implementer".into()),
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "engineering_review".into(),
+                    label: "Engineering review".into(),
+                    role: Some("reviewer".into()),
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "final_validation".into(),
+                    label: "Final validation".into(),
+                    role: Some("validator".into()),
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "integrate_to_feature".into(),
+                    label: "Integrate".into(),
+                    role: Some("reviewer".into()),
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "done".into(),
+                    label: "Done".into(),
+                    role: None,
+                    terminal: true,
+                },
             ],
             transitions: vec![
                 // `admit_task` lands a freshly-admitted task in `admission`
@@ -282,19 +343,84 @@ mod tests {
                 // deliberately guardless: it is the human-only
                 // `start_workflow_planning` handoff, carries no automation
                 // signal, and this driver never fires it itself.
-                WorkflowTransition { action: "admit".into(), from: "backlog".into(), to: "admission".into(), guards: vec![WorkflowGuard::DependenciesResolved] },
-                WorkflowTransition { action: "admission_complete".into(), from: "admission".into(), to: "ready_for_planning".into(), guards: vec![WorkflowGuard::AdmissionRecorded] },
-                WorkflowTransition { action: "start_planning".into(), from: "ready_for_planning".into(), to: "planning".into(), guards: vec![] },
-                WorkflowTransition { action: "submit_plan".into(), from: "planning".into(), to: "plan_review".into(), guards: vec![] },
-                WorkflowTransition { action: "approve_plan".into(), from: "plan_review".into(), to: "implementing".into(), guards: vec![WorkflowGuard::ApprovedPlan] },
-                WorkflowTransition { action: "plan_changes_requested".into(), from: "plan_review".into(), to: "planning".into(), guards: vec![] },
-                WorkflowTransition { action: "implementation_complete".into(), from: "implementing".into(), to: "engineering_review".into(), guards: vec![WorkflowGuard::ImplementationRecorded] },
-                WorkflowTransition { action: "engineering_corrections_required".into(), from: "engineering_review".into(), to: "implementing".into(), guards: vec![] },
-                WorkflowTransition { action: "engineering_plan_issue".into(), from: "engineering_review".into(), to: "planning".into(), guards: vec![] },
-                WorkflowTransition { action: "start_final_validation".into(), from: "engineering_review".into(), to: "final_validation".into(), guards: vec![] },
-                WorkflowTransition { action: "begin_feature_integration".into(), from: "final_validation".into(), to: "integrate_to_feature".into(), guards: vec![WorkflowGuard::FinalValidationPassed] },
-                WorkflowTransition { action: "validation_failed".into(), from: "final_validation".into(), to: "engineering_review".into(), guards: vec![] },
-                WorkflowTransition { action: "complete_feature_integration".into(), from: "integrate_to_feature".into(), to: "done".into(), guards: vec![WorkflowGuard::IntegratedIntoTarget] },
+                WorkflowTransition {
+                    action: "admit".into(),
+                    from: "backlog".into(),
+                    to: "admission".into(),
+                    guards: vec![WorkflowGuard::DependenciesResolved],
+                },
+                WorkflowTransition {
+                    action: "admission_complete".into(),
+                    from: "admission".into(),
+                    to: "ready_for_planning".into(),
+                    guards: vec![WorkflowGuard::AdmissionRecorded],
+                },
+                WorkflowTransition {
+                    action: "start_planning".into(),
+                    from: "ready_for_planning".into(),
+                    to: "planning".into(),
+                    guards: vec![],
+                },
+                WorkflowTransition {
+                    action: "submit_plan".into(),
+                    from: "planning".into(),
+                    to: "plan_review".into(),
+                    guards: vec![],
+                },
+                WorkflowTransition {
+                    action: "approve_plan".into(),
+                    from: "plan_review".into(),
+                    to: "implementing".into(),
+                    guards: vec![WorkflowGuard::ApprovedPlan],
+                },
+                WorkflowTransition {
+                    action: "plan_changes_requested".into(),
+                    from: "plan_review".into(),
+                    to: "planning".into(),
+                    guards: vec![],
+                },
+                WorkflowTransition {
+                    action: "implementation_complete".into(),
+                    from: "implementing".into(),
+                    to: "engineering_review".into(),
+                    guards: vec![WorkflowGuard::ImplementationRecorded],
+                },
+                WorkflowTransition {
+                    action: "engineering_corrections_required".into(),
+                    from: "engineering_review".into(),
+                    to: "implementing".into(),
+                    guards: vec![],
+                },
+                WorkflowTransition {
+                    action: "engineering_plan_issue".into(),
+                    from: "engineering_review".into(),
+                    to: "planning".into(),
+                    guards: vec![],
+                },
+                WorkflowTransition {
+                    action: "start_final_validation".into(),
+                    from: "engineering_review".into(),
+                    to: "final_validation".into(),
+                    guards: vec![],
+                },
+                WorkflowTransition {
+                    action: "begin_feature_integration".into(),
+                    from: "final_validation".into(),
+                    to: "integrate_to_feature".into(),
+                    guards: vec![WorkflowGuard::FinalValidationPassed],
+                },
+                WorkflowTransition {
+                    action: "validation_failed".into(),
+                    from: "final_validation".into(),
+                    to: "engineering_review".into(),
+                    guards: vec![],
+                },
+                WorkflowTransition {
+                    action: "complete_feature_integration".into(),
+                    from: "integrate_to_feature".into(),
+                    to: "done".into(),
+                    guards: vec![WorkflowGuard::IntegratedIntoTarget],
+                },
             ],
         }
     }
@@ -325,12 +451,28 @@ mod tests {
             role_bindings: Default::default(),
             ..Default::default()
         };
-        project.role_bindings.insert("planner".into(), "claude".into());
-        project.role_bindings.insert("implementer".into(), "claude".into());
-        project.role_bindings.insert("reviewer".into(), "claude".into());
-        project.role_bindings.insert("validator".into(), "claude".into());
-        project.role_bindings.insert("plan_reviewer".into(), "claude".into());
-        for role in ["planner", "implementer", "reviewer", "validator", "plan_reviewer"] {
+        project
+            .role_bindings
+            .insert("planner".into(), "claude".into());
+        project
+            .role_bindings
+            .insert("implementer".into(), "claude".into());
+        project
+            .role_bindings
+            .insert("reviewer".into(), "claude".into());
+        project
+            .role_bindings
+            .insert("validator".into(), "claude".into());
+        project
+            .role_bindings
+            .insert("plan_reviewer".into(), "claude".into());
+        for role in [
+            "planner",
+            "implementer",
+            "reviewer",
+            "validator",
+            "plan_reviewer",
+        ] {
             project
                 .role_policies
                 .roles
@@ -355,7 +497,8 @@ mod tests {
         let mut mock = MockTmuxOperations::new();
         mock.expect_has_session().returning(|_| true);
         mock.expect_window_exists().returning(|_| Ok(true));
-        mock.expect_create_window().returning(|_, _, _, _, _, _| Ok(()));
+        mock.expect_create_window()
+            .returning(|_, _, _, _, _, _| Ok(()));
         mock.expect_send_keys().returning(|_, _| Ok(()));
         mock.expect_send_key().returning(|_, _| Ok(()));
         // The first poll finds the outgoing agent already at a shell (exit
@@ -423,7 +566,11 @@ mod tests {
                 .current_dir(path)
                 .status()
                 .expect("git must be on PATH for this test");
-            assert!(status.success(), "git {args:?} failed in {}", path.display());
+            assert!(
+                status.success(),
+                "git {args:?} failed in {}",
+                path.display()
+            );
         };
         run(&["init", "-q"]);
         run(&["config", "user.email", "test@example.com"]);
@@ -441,7 +588,8 @@ mod tests {
     fn tick_admits_a_backlog_task_once_dependencies_resolve() {
         let graph = full_workflow();
         let plugin = plugin(graph.clone());
-        let project = project();
+        let mut project = project();
+        project.automation.admission_policy = AdmissionPolicy::Prestage;
 
         let repo = tempfile::tempdir().unwrap();
         init_git_repo_on_branch(repo.path(), "feature/poc");
@@ -451,22 +599,39 @@ mod tests {
         db.create_task(&task).unwrap();
 
         let mut mock_git = MockGitOperations::new();
-        mock_git.expect_create_worktree().returning(|_, _, _, _, _| Ok("C:/work/wt".to_string()));
-        mock_git.expect_initialize_worktree().returning(|_, _, _, _, _| Vec::new());
+        mock_git
+            .expect_create_worktree()
+            .returning(|_, _, _, _, _| Ok("C:/work/wt".to_string()));
+        mock_git
+            .expect_initialize_worktree()
+            .returning(|_, _, _, _, _| Vec::new());
 
         let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(permissive_tmux());
         let agent_registry: Arc<dyn AgentRegistry> = Arc::new(permissive_registry());
         let git_ops: Arc<dyn GitOperations> = Arc::new(mock_git);
         let config = merged_config();
         let flags = feature_flags();
-        let runtime = runtime_with(&tmux_ops, &agent_registry, &git_ops, repo.path(), &config, &flags);
+        let runtime = runtime_with(
+            &tmux_ops,
+            &agent_registry,
+            &git_ops,
+            repo.path(),
+            &config,
+            &flags,
+        );
 
         let results = run_automation_tick(&mut db, &graph, &project, &plugin, &runtime);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].task_id, task.id);
-        assert_eq!(results[0].decision, AutomationDecision::Advance("admit".to_string()));
+        assert_eq!(
+            results[0].decision,
+            AutomationDecision::Advance("admit".to_string())
+        );
         let Some(WorkflowStepOutcome::Advanced { task: advanced, .. }) = &results[0].outcome else {
-            panic!("expected admission to advance, got {:?}", results[0].outcome);
+            panic!(
+                "expected admission to advance, got {:?}",
+                results[0].outcome
+            );
         };
         // `admit_task` never touches `TaskStatus`; only the plugin workflow
         // state (recorded in `workflow_task_states`, checked below) moves --
@@ -480,8 +645,14 @@ mod tests {
         // One more tick carries it the rest of the way to `ready_for_planning`.
         let next = run_automation_tick(&mut db, &graph, &project, &plugin, &runtime);
         assert_eq!(next.len(), 1);
-        assert_eq!(next[0].decision, AutomationDecision::Advance("admission_complete".to_string()));
-        assert!(matches!(next[0].outcome, Some(WorkflowStepOutcome::Advanced { .. })));
+        assert_eq!(
+            next[0].decision,
+            AutomationDecision::Advance("admission_complete".to_string())
+        );
+        assert!(matches!(
+            next[0].outcome,
+            Some(WorkflowStepOutcome::Advanced { .. })
+        ));
         let state = db.get_workflow_task_state(&task.id).unwrap().unwrap();
         assert_eq!(state.state, "ready_for_planning");
 
@@ -490,6 +661,37 @@ mod tests {
         // below.
     }
 
+    #[test]
+    fn tick_leaves_ready_backlog_unallocated_by_default() {
+        let graph = full_workflow();
+        let plugin = plugin(graph.clone());
+        let project = project();
+        let mut db = Database::open_in_memory_project().unwrap();
+        let task = backlog_task();
+        db.create_task(&task).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(permissive_tmux());
+        let agent_registry: Arc<dyn AgentRegistry> = Arc::new(permissive_registry());
+        let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
+        let config = merged_config();
+        let flags = feature_flags();
+        let runtime = runtime_with(
+            &tmux_ops,
+            &agent_registry,
+            &git_ops,
+            project_dir.path(),
+            &config,
+            &flags,
+        );
+
+        let results = run_automation_tick(&mut db, &graph, &project, &plugin, &runtime);
+        assert!(matches!(results[0].decision, AutomationDecision::Wait));
+        assert!(results[0].outcome.is_none());
+        assert!(db.get_workflow_task_state(&task.id).unwrap().is_none());
+        let saved = db.get_task(&task.id).unwrap().unwrap();
+        assert!(saved.worktree_path.is_none());
+        assert!(saved.branch_name.is_none());
+    }
     /// Ready-lane/plugin-state boundary: once a task reaches the workflow's
     /// no-role, no-guard holding state, automation leaves it there forever
     /// -- `start_planning` is exclusively human, and `TaskStatus` never
@@ -504,10 +706,17 @@ mod tests {
         let mut task = Task::new("Seed cameras", "claude", "proj");
         task.worktree_path = Some("C:/work/wt".into());
         db.create_task(&task).unwrap();
-        let mut state = crate::db::WorkflowTaskState::new(&task.id, "ready_for_planning", "feature/poc");
+        let mut state =
+            crate::db::WorkflowTaskState::new(&task.id, "ready_for_planning", "feature/poc");
         state.base_sha = Some("a1b2c3".into());
-        let record = crate::db::WorkflowTransitionRecord::new(&task.id, "admit", "backlog", "ready_for_planning");
-        db.record_workflow_admission(&task, &state, &record).unwrap();
+        let record = crate::db::WorkflowTransitionRecord::new(
+            &task.id,
+            "admit",
+            "backlog",
+            "ready_for_planning",
+        );
+        db.record_workflow_admission(&task, &state, &record)
+            .unwrap();
         let attempt_before = state.state_attempt;
 
         let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(permissive_tmux());
@@ -516,7 +725,14 @@ mod tests {
         let config = merged_config();
         let flags = feature_flags();
         let project_dir = tempfile::tempdir().unwrap();
-        let runtime = runtime_with(&tmux_ops, &agent_registry, &git_ops, project_dir.path(), &config, &flags);
+        let runtime = runtime_with(
+            &tmux_ops,
+            &agent_registry,
+            &git_ops,
+            project_dir.path(),
+            &config,
+            &flags,
+        );
 
         // `ready_for_planning`'s only outgoing edge (`start_planning`) is
         // guardless -- it is the human-only handoff and carries no
@@ -537,7 +753,12 @@ mod tests {
 
         // Only the manual planning-start path moves `TaskStatus`.
         let outcome = crate::workflow_executor::start_workflow_planning(
-            &graph, &project, &plugin_config, task_after, &mut db, &runtime,
+            &graph,
+            &project,
+            &plugin_config,
+            task_after,
+            &mut db,
+            &runtime,
         )
         .unwrap();
         let WorkflowStepOutcome::Advanced { task: started, .. } = outcome else {
@@ -563,16 +784,30 @@ mod tests {
         task.worktree_path = Some(worktree.path().to_string_lossy().to_string());
         task.session_name = Some("proj:task-review".into());
         db.create_task(&task).unwrap();
-        let state = crate::db::WorkflowTaskState::new(&task.id, "engineering_review", "feature/poc");
-        let record = crate::db::WorkflowTransitionRecord::new(&task.id, "seed", "implementing", "engineering_review");
-        db.record_workflow_admission(&task, &state, &record).unwrap();
+        let state =
+            crate::db::WorkflowTaskState::new(&task.id, "engineering_review", "feature/poc");
+        let record = crate::db::WorkflowTransitionRecord::new(
+            &task.id,
+            "seed",
+            "implementing",
+            "engineering_review",
+        );
+        db.record_workflow_admission(&task, &state, &record)
+            .unwrap();
 
         let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(permissive_tmux());
         let agent_registry: Arc<dyn AgentRegistry> = Arc::new(permissive_registry());
         let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
         let config = merged_config();
         let flags = feature_flags();
-        let runtime = runtime_with(&tmux_ops, &agent_registry, &git_ops, worktree.path(), &config, &flags);
+        let runtime = runtime_with(
+            &tmux_ops,
+            &agent_registry,
+            &git_ops,
+            worktree.path(),
+            &config,
+            &flags,
+        );
 
         // No artifact yet: `Wait`, many times.
         for _ in 0..10 {
@@ -601,14 +836,21 @@ mod tests {
 
         // Fix it: the very next tick advances, with no special "recovery"
         // logic involved -- `assess` simply re-reads the file fresh.
-        std::fs::write(&artifact, "verdict: approved_for_validation\nworkflow_attempt: 1\n").unwrap();
+        std::fs::write(
+            &artifact,
+            "verdict: approved_for_validation\nworkflow_attempt: 1\n",
+        )
+        .unwrap();
         let results = run_automation_tick(&mut db, &graph, &project, &plugin_config, &runtime);
         assert_eq!(results.len(), 1);
         assert_eq!(
             results[0].decision,
             AutomationDecision::Advance("start_final_validation".to_string())
         );
-        assert!(matches!(results[0].outcome, Some(WorkflowStepOutcome::Advanced { .. })));
+        assert!(matches!(
+            results[0].outcome,
+            Some(WorkflowStepOutcome::Advanced { .. })
+        ));
     }
 
     /// Human-gate boundary: a `final_validation` task whose artifact says
@@ -633,15 +875,28 @@ mod tests {
         task.worktree_path = Some(worktree.path().to_string_lossy().to_string());
         db.create_task(&task).unwrap();
         let state = crate::db::WorkflowTaskState::new(&task.id, "final_validation", "feature/poc");
-        let record = crate::db::WorkflowTransitionRecord::new(&task.id, "seed", "engineering_review", "final_validation");
-        db.record_workflow_admission(&task, &state, &record).unwrap();
+        let record = crate::db::WorkflowTransitionRecord::new(
+            &task.id,
+            "seed",
+            "engineering_review",
+            "final_validation",
+        );
+        db.record_workflow_admission(&task, &state, &record)
+            .unwrap();
 
         let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(permissive_tmux());
         let agent_registry: Arc<dyn AgentRegistry> = Arc::new(permissive_registry());
         let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
         let config = merged_config();
         let flags = feature_flags();
-        let runtime = runtime_with(&tmux_ops, &agent_registry, &git_ops, worktree.path(), &config, &flags);
+        let runtime = runtime_with(
+            &tmux_ops,
+            &agent_registry,
+            &git_ops,
+            worktree.path(),
+            &config,
+            &flags,
+        );
 
         for _ in 0..50 {
             let results = run_automation_tick(&mut db, &graph, &project, &plugin_config, &runtime);
@@ -679,21 +934,42 @@ mod tests {
         task.worktree_path = Some(worktree.path().to_string_lossy().to_string());
         task.session_name = Some("proj:task-review".into());
         db.create_task(&task).unwrap();
-        let state = crate::db::WorkflowTaskState::new(&task.id, "engineering_review", "feature/poc");
-        let record = crate::db::WorkflowTransitionRecord::new(&task.id, "seed", "implementing", "engineering_review");
-        db.record_workflow_admission(&task, &state, &record).unwrap();
+        let state =
+            crate::db::WorkflowTaskState::new(&task.id, "engineering_review", "feature/poc");
+        let record = crate::db::WorkflowTransitionRecord::new(
+            &task.id,
+            "seed",
+            "implementing",
+            "engineering_review",
+        );
+        db.record_workflow_admission(&task, &state, &record)
+            .unwrap();
 
         let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(permissive_tmux());
         let agent_registry: Arc<dyn AgentRegistry> = Arc::new(permissive_registry());
         let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
         let config = merged_config();
         let flags = feature_flags();
-        let runtime = runtime_with(&tmux_ops, &agent_registry, &git_ops, worktree.path(), &config, &flags);
+        let runtime = runtime_with(
+            &tmux_ops,
+            &agent_registry,
+            &git_ops,
+            worktree.path(),
+            &config,
+            &flags,
+        );
 
         let first = run_automation_tick(&mut db, &graph, &project, &plugin_config, &runtime);
         assert_eq!(first.len(), 1);
-        assert!(matches!(first[0].outcome, Some(WorkflowStepOutcome::Advanced { .. })));
-        let history_after_first = db.get_workflow_task_state(&task.id).unwrap().unwrap().state_attempt;
+        assert!(matches!(
+            first[0].outcome,
+            Some(WorkflowStepOutcome::Advanced { .. })
+        ));
+        let history_after_first = db
+            .get_workflow_task_state(&task.id)
+            .unwrap()
+            .unwrap()
+            .state_attempt;
 
         // The artifact on disk is untouched -- still stamped `workflow_attempt: 1`,
         // which is now stale for the state the task just advanced into.
@@ -701,7 +977,11 @@ mod tests {
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].decision, AutomationDecision::Wait);
         assert!(second[0].outcome.is_none());
-        let history_after_second = db.get_workflow_task_state(&task.id).unwrap().unwrap().state_attempt;
+        let history_after_second = db
+            .get_workflow_task_state(&task.id)
+            .unwrap()
+            .unwrap()
+            .state_attempt;
         assert_eq!(history_after_first, history_after_second);
     }
 
@@ -736,8 +1016,10 @@ mod tests {
         let mut mock = MockAgentRegistry::new();
         mock.expect_get().returning(|_| {
             let mut ops = MockAgentOperations::new();
-            ops.expect_prompt_injection().returning(|| crate::agent::PromptInjection::Argv);
-            ops.expect_build_interactive_command().returning(|prompt| format!("claude '{}'", prompt));
+            ops.expect_prompt_injection()
+                .returning(|| crate::agent::PromptInjection::Argv);
+            ops.expect_build_interactive_command()
+                .returning(|prompt| format!("claude '{}'", prompt));
             Arc::new(ops) as Arc<dyn AgentOperations>
         });
         mock
@@ -770,20 +1052,35 @@ mod tests {
         let mut state = WorkflowTaskState::new(&task.id, "plan_review", "feature/poc");
         state.plan_revision = 1;
         state.plan_hash = Some("deadbeef".into());
-        let record = crate::db::WorkflowTransitionRecord::new(&task.id, "seed", "planning", "plan_review");
-        db.record_workflow_admission(&task, &state, &record).unwrap();
+        let record =
+            crate::db::WorkflowTransitionRecord::new(&task.id, "seed", "planning", "plan_review");
+        db.record_workflow_admission(&task, &state, &record)
+            .unwrap();
 
         let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(permissive_tmux());
         let agent_registry: Arc<dyn AgentRegistry> = Arc::new(permissive_registry());
         let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
         let config = merged_config();
         let flags = feature_flags();
-        let runtime = runtime_with(&tmux_ops, &agent_registry, &git_ops, worktree.path(), &config, &flags);
+        let runtime = runtime_with(
+            &tmux_ops,
+            &agent_registry,
+            &git_ops,
+            worktree.path(),
+            &config,
+            &flags,
+        );
 
         let results = run_automation_tick(&mut db, &graph, &project, &plugin_config, &runtime);
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].decision, AutomationDecision::Advance("approve_plan".to_string()));
-        assert!(matches!(results[0].outcome, Some(WorkflowStepOutcome::Advanced { .. })));
+        assert_eq!(
+            results[0].decision,
+            AutomationDecision::Advance("approve_plan".to_string())
+        );
+        assert!(matches!(
+            results[0].outcome,
+            Some(WorkflowStepOutcome::Advanced { .. })
+        ));
 
         let state_after = db.get_workflow_task_state(&task.id).unwrap().unwrap();
         assert_eq!(state_after.state, "implementing");
@@ -817,21 +1114,40 @@ mod tests {
         db.create_task(&task).unwrap();
         let mut state = WorkflowTaskState::new(&task.id, "plan_review", "feature/poc");
         state.plan_revision = 1;
-        let record = crate::db::WorkflowTransitionRecord::new(&task.id, "seed", "planning", "plan_review");
-        db.record_workflow_admission(&task, &state, &record).unwrap();
-        let attempt_before = db.get_workflow_task_state(&task.id).unwrap().unwrap().state_attempt;
+        let record =
+            crate::db::WorkflowTransitionRecord::new(&task.id, "seed", "planning", "plan_review");
+        db.record_workflow_admission(&task, &state, &record)
+            .unwrap();
+        let attempt_before = db
+            .get_workflow_task_state(&task.id)
+            .unwrap()
+            .unwrap()
+            .state_attempt;
 
         let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(permissive_tmux());
         let agent_registry: Arc<dyn AgentRegistry> = Arc::new(registry_with_argv_launch());
         let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
         let config = merged_config();
         let flags = feature_flags();
-        let runtime = runtime_with(&tmux_ops, &agent_registry, &git_ops, worktree.path(), &config, &flags);
+        let runtime = runtime_with(
+            &tmux_ops,
+            &agent_registry,
+            &git_ops,
+            worktree.path(),
+            &config,
+            &flags,
+        );
 
         let results = run_automation_tick(&mut db, &graph, &project, &plugin_config, &runtime);
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].decision, AutomationDecision::Advance("plan_changes_requested".to_string()));
-        assert!(matches!(results[0].outcome, Some(WorkflowStepOutcome::Advanced { .. })));
+        assert_eq!(
+            results[0].decision,
+            AutomationDecision::Advance("plan_changes_requested".to_string())
+        );
+        assert!(matches!(
+            results[0].outcome,
+            Some(WorkflowStepOutcome::Advanced { .. })
+        ));
 
         let state_after = db.get_workflow_task_state(&task.id).unwrap().unwrap();
         assert_eq!(state_after.state, "planning");
@@ -841,6 +1157,9 @@ mod tests {
             state_after.state_attempt
         );
         let task_after = db.get_task(&task.id).unwrap().unwrap();
-        assert_eq!(task_after.agent, "claude", "the bound planner agent must be the one relaunched");
+        assert_eq!(
+            task_after.agent, "claude",
+            "the bound planner agent must be the one relaunched"
+        );
     }
 }
