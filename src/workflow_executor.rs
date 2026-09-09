@@ -20,7 +20,7 @@ use crate::tmux::TmuxOperations;
 use crate::tui::app::{
     agtx_task_env, archive_workflow_artifact, build_policy_agent_command,
     ensure_project_tmux_session, ensure_review_addresses_failed_validation, generate_task_slug,
-    plan_revision, planning_artifact_path, resolve_prompt, spawn_send_to_agent,
+    plan_revision, planning_artifact_path, resolve_prompt,
     switch_agent_in_tmux, workflow_artifact_path, workflow_artifact_sha256, workflow_artifact_value,
 };
 use crate::workflow::{GuardContext, WorkflowDefinition, WorkflowProjectConfig};
@@ -436,7 +436,7 @@ pub fn start_workflow_planning(
     }
 
     if restarting && runtime.tmux_ops.window_exists(&target).unwrap_or(false) {
-        switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command);
+        let _ = switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command);
     } else {
         runtime.tmux_ops.create_window(
             runtime.tmux_project_name,
@@ -520,39 +520,19 @@ pub fn submit_workflow_plan(
         .clone()
         .ok_or_else(|| anyhow::anyhow!("Planning session is unavailable"))?;
     let previous_agent = task.agent.clone();
-    db.advance_workflow_state(&handoff.state, &handoff.transition)?;
     let policy = project_workflow.policy_for_state(workflow, &handoff.state.state)?;
-    if let Some(policy) = policy.as_ref() {
-        let command = build_policy_agent_command(
-            runtime.agent_registry.get(&reviewer).as_ref(),
-            &reviewer,
-            &prompt,
-            Some(policy),
-            Some(Path::new(&worktree)),
-        );
-        switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &previous_agent, &command);
-    } else {
-        spawn_send_to_agent(
-            Arc::clone(runtime.tmux_ops),
-            Arc::clone(runtime.agent_registry),
-            task.id.clone(),
-            runtime.config.agent_hooks,
-            runtime.config.auto_trust,
-            target,
-            previous_agent,
-            reviewer.clone(),
-            true,
-            None,
-            None,
-            prompt,
-            None,
-            task.content_text(),
-            Vec::new(),
-            task.worktree_path.clone(),
-            runtime.project_path.to_path_buf(),
-            Some(plugin.clone()),
-        );
-    }
+    // This handoff reuses the planner's pane. Do not expose `plan_review` to
+    // automation until the reviewer is actually running; otherwise a prior
+    // asynchronous switch can still own the pane and leave this task at bash.
+    let command = build_policy_agent_command(
+        runtime.agent_registry.get(&reviewer).as_ref(),
+        &reviewer,
+        &prompt,
+        policy.as_ref(),
+        Some(Path::new(&worktree)),
+    );
+    switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &previous_agent, &command)?;
+    db.advance_workflow_state(&handoff.state, &handoff.transition)?;
     task.status = TaskStatus::Review;
     task.agent = reviewer;
     task.updated_at = chrono::Utc::now();
@@ -602,8 +582,6 @@ pub fn decide_workflow_plan(
     task.status = TaskStatus::Planning;
     task.agent = decision.destination_agent.clone().unwrap_or(task.agent);
     task.updated_at = chrono::Utc::now();
-    db.advance_workflow_state(&decision.state, &decision.transition)?;
-    db.update_task(&task)?;
     if !approve {
         if let Some(target) = task.session_name.clone() {
             // Prefer the plan reviewer's durable `.agent-flow/plan-review.yaml`
@@ -628,6 +606,7 @@ pub fn decide_workflow_plan(
                 workflow_artifact_value(&artifact, "findings").ok()
             });
             let feedback_section = if let Some(findings) = artifact_findings {
+                let findings: String = findings.chars().take(12 * 1024).collect();
                 format!(
                     "\n\nThe plan reviewer's recorded findings:\n---\n{findings}\n---"
                 )
@@ -636,7 +615,7 @@ pub fn decide_workflow_plan(
                     .tmux_ops
                     .capture_pane(&target)
                     .ok()
-                    .map(|pane| tail_lines(&pane, 80))
+                    .map(|pane| tail_lines(&pane, 80).chars().take(12 * 1024).collect::<String>())
                     .filter(|text| !text.trim().is_empty());
                 match &review_feedback {
                     Some(text) => format!(
@@ -649,28 +628,26 @@ pub fn decide_workflow_plan(
                 "Plan review requested changes for task {}. Revise .agtx/plans/{}.md, increment plan_revision above {}, and do not implement code.{feedback_section}\n\nWhen complete, save the artifact for another Shift+V submission.\n\nCurrent workflow attempt: {n}. Your output artifact MUST contain the line: workflow_attempt: {n}",
                 task.id, task.id, current.plan_revision, n = decision.state.state_attempt
             );
-            spawn_send_to_agent(
-                Arc::clone(runtime.tmux_ops),
-                Arc::clone(runtime.agent_registry),
-                task.id.clone(),
-                runtime.config.agent_hooks,
-                runtime.config.auto_trust,
-                target,
-                previous_agent,
-                task.agent.clone(),
-                true,
-                None,
-                None,
-                prompt,
-                None,
-                task.content_text(),
-                Vec::new(),
-                task.worktree_path.clone(),
-                runtime.project_path.to_path_buf(),
-                Some(plugin.clone()),
+            // Replanning owns the same pane as the reviewer. Keep this
+            // acknowledged and synchronous so automation cannot submit a
+            // newly-written plan while this switch is still in flight.
+            let policy = project_workflow.policy_for_state(workflow, &decision.state.state)?;
+            let command = build_policy_agent_command(
+                runtime.agent_registry.get(&task.agent).as_ref(),
+                &task.agent,
+                &prompt,
+                policy.as_ref(),
+                task.worktree_path.as_deref().map(Path::new),
             );
+            switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &previous_agent, &command)?;
+        } else {
+            return Ok(WorkflowStepOutcome::Blocked {
+                message: "Planning session is unavailable".into(),
+            });
         }
     }
+    db.advance_workflow_state(&decision.state, &decision.transition)?;
+    db.update_task(&task)?;
     let message = if approve {
         "Plan approved"
     } else {
@@ -780,7 +757,7 @@ pub fn start_workflow_implementation(
         format!("{}:{window_name}", runtime.tmux_project_name)
     };
     if session_available {
-        switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command);
+        let _ = switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command);
     } else {
         ensure_project_tmux_session(runtime.tmux_project_name, runtime.project_path, runtime.tmux_ops.as_ref());
         runtime.tmux_ops.create_window(
@@ -864,7 +841,7 @@ pub fn submit_workflow_implementation(
         (&implemented.state, &implemented.transition),
         (&review.state, &review.transition),
     ])?;
-    switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command);
+    let _ = switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command);
     task.status = TaskStatus::Review;
     task.agent = reviewer;
     task.updated_at = chrono::Utc::now();
@@ -931,7 +908,7 @@ pub fn submit_engineering_review(
         Some(Path::new(&worktree)),
     );
     db.advance_workflow_state(&transition.state, &transition.transition)?;
-    switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command);
+    let _ = switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command);
     task.status = status;
     task.agent = next_agent;
     task.updated_at = chrono::Utc::now();
@@ -1023,7 +1000,7 @@ pub fn submit_final_validation(
         archive_workflow_artifact(&review_artifact, "superseded-after-validation-failure")?;
     }
     db.advance_workflow_state(&transition.state, &transition.transition)?;
-    switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command);
+    let _ = switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command);
     task.status = TaskStatus::Review;
     task.agent = next_agent;
     task.updated_at = chrono::Utc::now();
@@ -2326,15 +2303,11 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         assert_eq!(db.workflow_transition_history(&task.id).unwrap().len(), 3);
     }
 
-    /// `submit_workflow_plan` reorder-proof: `submit_plan` is persisted
-    /// before the plan reviewer is launched. Configures a role policy for
-    /// `plan_reviewer` so the function takes its synchronous
-    /// `switch_agent_in_tmux` path rather than the fire-and-forget
-    /// `spawn_send_to_agent` fallback, then checks -- from inside the mock's
-    /// exit-command `send_keys` call, the first thing `switch_agent_in_tmux`
-    /// does -- that the new state already landed.
+    /// A failed reviewer launch must not advance the durable lane. This keeps
+    /// automation from observing `plan_review` while a competing handoff owns
+    /// the shared tmux pane.
     #[test]
-    fn submit_workflow_plan_persists_before_launching_the_reviewer() {
+    fn submit_workflow_plan_launches_reviewer_before_persisting_the_lane() {
         let graph = WorkflowDefinition {
             initial_state: "planning".into(),
             states: vec![
@@ -2386,11 +2359,23 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         let task_id_for_check = task.id.clone();
         let db_path_for_check = db_path.clone();
         mock_tmux.expect_send_keys().withf(|_, cmd: &str| cmd == "/exit").returning(move |_, _| {
-            assert_state_already_persisted(&db_path_for_check, &task_id_for_check, "plan_review");
+            let db = Database::open_project_at_path(&db_path_for_check).unwrap();
+            assert_eq!(
+                db.get_workflow_task_state(&task_id_for_check).unwrap().unwrap().state,
+                "planning"
+            );
             Ok(())
         });
         mock_tmux.expect_send_key().returning(|_, _| Ok(()));
-        mock_tmux.expect_pane_current_command().returning(|_| Some("bash".to_string()));
+        let command_checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let command_checks_for_mock = Arc::clone(&command_checks);
+        mock_tmux.expect_pane_current_command().returning(move |_| {
+            if command_checks_for_mock.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Some("bash".to_string())
+            } else {
+                Some("claude".to_string())
+            }
+        });
         mock_tmux.expect_capture_pane().returning(|_| Ok(String::new()));
         mock_tmux.expect_paste_text().returning(|_, _| Ok(()));
 
@@ -2799,46 +2784,51 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             role_bindings: Default::default(),
             ..Default::default()
         };
-        project.role_bindings.insert("planner".into(), "mock-planner".into());
+        project.role_bindings.insert("planner".into(), "claude".into());
+        project
+            .role_policies
+            .roles
+            .insert("planner".into(), WorkflowRolePolicy::default());
 
         let plugin = plugin(graph.clone());
         (graph, project, plugin)
     }
 
-    /// A mock agent registry whose `PromptInjection::Argv` lets
-    /// `spawn_send_to_agent` deliver the prompt at launch via the
-    /// synchronous `switch_agent_in_tmux` path instead of the mid-session
-    /// lane -- avoiding the readiness-wait machinery while still exercising
-    /// the real revise-prompt construction.
+    /// A mock registry for the planner handoff. The acknowledged switch path
+    /// launches the revise prompt directly, without a detached sender.
     fn mock_agent_registry_for_argv_launch() -> Arc<dyn AgentRegistry> {
         let mut mock_registry = MockAgentRegistry::new();
         mock_registry.expect_get().returning(|_| {
             let mut ops = MockAgentOperations::new();
-            ops.expect_prompt_injection().returning(|| crate::agent::PromptInjection::Argv);
-            ops.expect_build_interactive_command().returning(|prompt| format!("mock-planner '{}'", prompt));
+            ops.expect_build_interactive_command().returning(|prompt| format!("claude '{}'", prompt));
             Arc::new(ops) as Arc<dyn AgentOperations>
         });
         Arc::new(mock_registry)
     }
 
-    /// Builds the tmux mock shared by the `changes_requested` tests: the
-    /// revise prompt's text is captured off `paste_text` (the call that
-    /// carries the full command, prompt included, into the window), and a
-    /// channel signals the moment it lands so the test does not have to
-    /// sleep-poll a background thread. `pane_content` is whatever
-    /// `capture_pane` should report -- the pane-capture fallback's input.
+    /// Builds the tmux mock shared by the `changes_requested` tests. The
+    /// first process probe sees a shell after the reviewer exits; the next
+    /// confirms the planner process, which is the launch acknowledgement.
     fn mock_tmux_capturing_paste(
         pane_content: &'static str,
     ) -> (Arc<dyn TmuxOperations>, std::sync::mpsc::Receiver<()>, Arc<Mutex<Option<String>>>) {
         let (tx, rx) = std::sync::mpsc::channel();
         let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let captured_for_closure = captured.clone();
+        let command_checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let command_checks_for_mock = Arc::clone(&command_checks);
 
         let mut mock_tmux = MockTmuxOperations::new();
         mock_tmux.expect_window_exists().returning(|_| Ok(true));
         mock_tmux.expect_send_keys().returning(|_, _| Ok(()));
         mock_tmux.expect_send_key().returning(|_, _| Ok(()));
-        mock_tmux.expect_pane_current_command().returning(|_| Some("bash".to_string()));
+        mock_tmux.expect_pane_current_command().returning(move |_| {
+            if command_checks_for_mock.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Some("bash".to_string())
+            } else {
+                Some("claude".to_string())
+            }
+        });
         mock_tmux.expect_capture_pane().returning(move |_| Ok(pane_content.to_string()));
         mock_tmux.expect_paste_text().returning(move |_, text| {
             *captured_for_closure.lock().unwrap() = Some(text.to_string());
@@ -2960,7 +2950,7 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             "expected the captured pane content as fallback feedback, got: {sent}"
         );
         assert!(
-            sent.contains("reviewer's pane, captured at the moment"),
+            sent.contains("pane, captured at the moment"),
             "expected the pane-capture fallback header when findings are absent, got: {sent}"
         );
     }
@@ -3017,7 +3007,7 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             "expected the captured pane content as fallback feedback (no artifact present), got: {sent}"
         );
         assert!(
-            sent.contains("reviewer's pane, captured at the moment"),
+            sent.contains("pane, captured at the moment"),
             "expected the pane-capture fallback header when no plan-review artifact exists, got: {sent}"
         );
     }

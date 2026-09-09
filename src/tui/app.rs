@@ -7785,7 +7785,7 @@ impl App {
                                 &hook_task_id,
                             );
                             let new_cmd = agent_ops.build_interactive_command("");
-                            switch_agent_in_tmux(
+                            let _ = switch_agent_in_tmux(
                                 tmux_ops.as_ref(),
                                 &session_clone,
                                 &current_agent_clone,
@@ -7894,7 +7894,7 @@ impl App {
                                 } else {
                                     ""
                                 });
-                            switch_agent_in_tmux(
+                            let _ = switch_agent_in_tmux(
                                 tmux_ops.as_ref(),
                                 &session_clone,
                                 &current_agent_clone,
@@ -7966,7 +7966,7 @@ impl App {
                                 &hook_task_id,
                             );
                             let new_cmd = agent_ops.build_interactive_command("");
-                            switch_agent_in_tmux(
+                            let _ = switch_agent_in_tmux(
                                 tmux_ops.as_ref(),
                                 &session_clone,
                                 &current_agent_clone,
@@ -11838,7 +11838,14 @@ pub(crate) fn build_policy_agent_command(
     policy: Option<&ResolvedWorkflowPolicy>,
     worktree: Option<&Path>,
 ) -> String {
-    let Some(policy) = policy else { return agent_ops.build_interactive_command(prompt); };
+    let Some(policy) = policy else { return agent_ops.build_interactive_command(&prompt); };
+    // Strip NUL/`\r`/other control bytes before quoting, same as the
+    // fresh-launch path (`compose_command`'s `normalize_prompt`). Reviewer
+    // findings text can carry CRLF or stray control bytes picked up from a
+    // pasted/captured source; left in, they corrupt the line once it's typed
+    // or bracket-pasted into the target shell even though the single-quote
+    // escaping below is untouched by them.
+    let prompt = agent::spec::normalize_prompt(prompt);
     let quoted_prompt = prompt.replace('\'', "'\"'\"'");
     let model = policy
         .role_policy
@@ -11875,7 +11882,7 @@ pub(crate) fn build_policy_agent_command(
         let flags = claude_policy_flags(&policy.role_policy, worktree);
         return format!("claude{model}{effort} {flags} -- '{quoted_prompt}'");
     }
-    agent_ops.build_interactive_command(prompt)
+    agent_ops.build_interactive_command(&prompt)
 }
 
 /// The `--permission-mode dontAsk --allowed-tools '<tools>'` fragment for a
@@ -12198,7 +12205,7 @@ pub(crate) fn spawn_send_to_agent(
             } else {
                 ""
             });
-            switch_agent_in_tmux(tmux_ops.as_ref(), &target, &current_agent, &new_cmd);
+            let _ = switch_agent_in_tmux(tmux_ops.as_ref(), &target, &current_agent, &new_cmd);
             if !delivered_at_launch {
                 // The *new* agent is what has to become ready.
                 let _ = wait_for_agent_ready(&tmux_ops, &target, Some(&target_agent), auto_trust);
@@ -13144,7 +13151,7 @@ pub(crate) fn switch_agent_in_tmux(
     target: &str,
     current_agent: &str,
     new_agent_cmd: &str,
-) {
+) -> anyhow::Result<()> {
     // 1. Send the graceful exit command for the current agent.
     // `None` means Ctrl+C is the only way out (codex, cursor). An agent agtx does
     // not know keeps the historical default of /exit.
@@ -13163,7 +13170,7 @@ pub(crate) fn switch_agent_in_tmux(
         let split_enter = agent::spec(current_agent)
             .is_some_and(|s| s.send_strategy == agent::SendStrategy::Combined);
         if split_enter {
-            let _ = tmux_ops.send_text(target, cmd);
+            tmux_ops.send_text(target, cmd)?;
             for _ in 0..20 {
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 if let Ok(content) = tmux_ops.capture_pane(target) {
@@ -13173,12 +13180,12 @@ pub(crate) fn switch_agent_in_tmux(
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(200));
-            let _ = tmux_ops.send_key(target, "Enter");
+            tmux_ops.send_key(target, "Enter")?;
         } else {
-            let _ = tmux_ops.send_keys(target, cmd);
+            tmux_ops.send_keys(target, cmd)?;
         }
     } else {
-        let _ = tmux_ops.send_key(target, "C-c");
+        tmux_ops.send_key(target, "C-c")?;
     }
 
     // 2. Poll for agent exit. If the agent was busy, the exit command
@@ -13198,12 +13205,12 @@ pub(crate) fn switch_agent_in_tmux(
 
     // 3. If still running, the agent was likely busy. Ctrl+C to cancel, then retry exit.
     if !found_shell {
-        let _ = tmux_ops.send_key(target, "C-c");
+        tmux_ops.send_key(target, "C-c")?;
         std::thread::sleep(std::time::Duration::from_millis(1000));
 
         if let Some(cmd) = exit_cmd {
             if current_agent == "gemini" {
-                let _ = tmux_ops.send_text(target, cmd);
+                tmux_ops.send_text(target, cmd)?;
                 for _ in 0..20 {
                     std::thread::sleep(std::time::Duration::from_millis(200));
                     if let Ok(content) = tmux_ops.capture_pane(target) {
@@ -13213,9 +13220,9 @@ pub(crate) fn switch_agent_in_tmux(
                     }
                 }
                 std::thread::sleep(std::time::Duration::from_millis(200));
-                let _ = tmux_ops.send_key(target, "Enter");
+                tmux_ops.send_key(target, "Enter")?;
             } else {
-                let _ = tmux_ops.send_keys(target, cmd);
+                tmux_ops.send_keys(target, cmd)?;
             }
         }
 
@@ -13232,7 +13239,7 @@ pub(crate) fn switch_agent_in_tmux(
 
     // 4. Last resort: Ctrl+D to force exit
     if !found_shell {
-        let _ = tmux_ops.send_key(target, "C-d");
+        tmux_ops.send_key(target, "C-d")?;
         for _ in 0..20 {
             // 2s
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -13267,11 +13274,11 @@ pub(crate) fn switch_agent_in_tmux(
         // shell has bracketed paste off this degrades to the typed behaviour —
         // never worse than `send_keys`, which is why the no-newline path is left
         // exactly as it was.
-        let _ = tmux_ops.paste_text(target, &cmd);
+        tmux_ops.paste_text(target, &cmd)?;
         std::thread::sleep(std::time::Duration::from_millis(300));
-        let _ = tmux_ops.send_key(target, "Enter");
+        tmux_ops.send_key(target, "Enter")?;
     } else {
-        let _ = tmux_ops.send_keys(target, &cmd);
+        tmux_ops.send_keys(target, &cmd)?;
     }
 
     // 6. Wait for the new agent process to actually start (pane_current_command != shell).
@@ -13285,10 +13292,11 @@ pub(crate) fn switch_agent_in_tmux(
             let process_started =
                 AGENT_COMMANDS.iter().any(|a| cmd.contains(a)) || cmd.contains("node");
             if process_started {
-                break;
+                return Ok(());
             }
         }
     }
+    anyhow::bail!("agent switch did not start a process in tmux pane '{target}'")
 }
 
 /// Wait for an agent in a tmux pane to be ready for input.

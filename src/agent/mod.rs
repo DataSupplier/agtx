@@ -108,7 +108,10 @@ impl Agent {
         match spec::spec(&self.name) {
             Some(s) => spec::compose_command(s, s.base_args, Some(prompt)),
             None if prompt.is_empty() => self.command.clone(),
-            None => format!("{} '{}'", self.command, prompt.replace('\'', "'\"'\"'")),
+            None => {
+                let prompt = spec::normalize_prompt(prompt);
+                format!("{} '{}'", self.command, prompt.replace('\'', "'\"'\"'"))
+            }
         }
     }
 }
