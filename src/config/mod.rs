@@ -768,6 +768,8 @@ pub struct PluginArtifacts {
     pub planning: Option<String>,
     pub running: Option<String>,
     pub review: Option<String>,
+    /// Evidence produced by the plan reviewer before the plan is approved.
+    pub plan_review: Option<String>,
     /// Evidence produced by the final validation owner before integration.
     pub final_validation: Option<String>,
     /// Explicit reviewer handoff that authorizes the workflow executor to

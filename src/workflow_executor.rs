@@ -508,7 +508,7 @@ pub fn submit_workflow_plan(
         .clone()
         .ok_or_else(|| anyhow::anyhow!("Plan review state has no bound agent"))?;
     let prompt = format!(
-        "You are the plan reviewer for task {}. Review only {} (revision {}, SHA-256 {}). Do not implement code. Check it against the task, identify concrete changes if needed, then leave your decision for the operator: approve with Shift+Y or request changes with Shift+N.\n\nCurrent workflow attempt: {n}. Your output artifact MUST contain the line: workflow_attempt: {n}",
+        "You are the plan reviewer for task {}. Review only {} (revision {}, SHA-256 {}). Do not implement code. Check it against the task, identify concrete changes if needed, then write .agent-flow/plan-review.yaml in this task worktree containing: verdict: approved or verdict: changes_requested (exactly one of these two strings), and findings: with your specific, concrete findings -- especially when requesting changes, since the planner will read this verbatim to revise the plan.\n\nCurrent workflow attempt: {n}. Your output artifact MUST contain the line: workflow_attempt: {n}",
         task.id,
         path.strip_prefix(&worktree).unwrap_or(&path).display(),
         revision,
@@ -606,24 +606,44 @@ pub fn decide_workflow_plan(
     db.update_task(&task)?;
     if !approve {
         if let Some(target) = task.session_name.clone() {
-            // `plan_review` has no persisted verdict artifact (unlike
-            // engineering/final review), so the reviewer's actual reasoning
-            // for requesting changes only ever exists in its own tmux pane.
-            // Capture it now, before the window below gets reused for the
-            // planner (which sends codex its exit sequence and starts claude
-            // in its place) -- otherwise the planner is told only "changes
-            // were requested," with zero information about what to change.
-            let review_feedback = runtime
-                .tmux_ops
-                .capture_pane(&target)
-                .ok()
-                .map(|pane| tail_lines(&pane, 80))
-                .filter(|text| !text.trim().is_empty());
-            let feedback_section = match &review_feedback {
-                Some(text) => format!(
-                    "\n\nThe plan reviewer's pane, captured at the moment changes were requested (visible screen only, may be truncated; read further review context from the session transcript if this is not enough):\n---\n{text}\n---"
-                ),
-                None => String::new(),
+            // Prefer the plan reviewer's durable `.agent-flow/plan-review.yaml`
+            // `findings:` field -- written by the artifact-driven path
+            // (`submit_plan_review`) -- as the source of the revise prompt's
+            // feedback: it is evidence the reviewer deliberately wrote down,
+            // not ephemeral scrollback. Only when that artifact/field is
+            // absent or empty (e.g. a human rejected via Shift+N before this
+            // artifact existed, or an older project without it) do we fall
+            // back to capturing the reviewer's tmux pane. Capture happens
+            // now, before the window below gets reused for the planner
+            // (which sends codex its exit sequence and starts claude in its
+            // place) -- otherwise the planner is told only "changes were
+            // requested," with zero information about what to change.
+            let artifact_findings = task.worktree_path.as_deref().and_then(|worktree| {
+                let artifact = workflow_artifact_path(
+                    worktree,
+                    plugin.artifacts.plan_review.as_deref(),
+                    &task.id,
+                    ".agent-flow/plan-review.yaml",
+                );
+                workflow_artifact_value(&artifact, "findings").ok()
+            });
+            let feedback_section = if let Some(findings) = artifact_findings {
+                format!(
+                    "\n\nThe plan reviewer's recorded findings:\n---\n{findings}\n---"
+                )
+            } else {
+                let review_feedback = runtime
+                    .tmux_ops
+                    .capture_pane(&target)
+                    .ok()
+                    .map(|pane| tail_lines(&pane, 80))
+                    .filter(|text| !text.trim().is_empty());
+                match &review_feedback {
+                    Some(text) => format!(
+                        "\n\nThe plan reviewer's pane, captured at the moment changes were requested (visible screen only, may be truncated; read further review context from the session transcript if this is not enough):\n---\n{text}\n---"
+                    ),
+                    None => String::new(),
+                }
             };
             let prompt = format!(
                 "Plan review requested changes for task {}. Revise .agtx/plans/{}.md, increment plan_revision above {}, and do not implement code.{feedback_section}\n\nWhen complete, save the artifact for another Shift+V submission.\n\nCurrent workflow attempt: {n}. Your output artifact MUST contain the line: workflow_attempt: {n}",
@@ -658,6 +678,40 @@ pub fn decide_workflow_plan(
     }
     .to_string();
     Ok(WorkflowStepOutcome::Advanced { task, message })
+}
+
+/// Artifact-driven counterpart to `decide_workflow_plan`: reads the plan
+/// reviewer's durable `.agent-flow/plan-review.yaml` verdict and dispatches
+/// to the exact same approve/reject logic a human's Shift+Y/Shift+N would
+/// invoke, rather than duplicating it. Automation acts only on durable
+/// evidence written to disk, never by scraping the reviewer's tmux pane.
+pub fn submit_plan_review(
+    workflow: &WorkflowDefinition,
+    project_workflow: &WorkflowProjectConfig,
+    plugin: &WorkflowPlugin,
+    task: Task,
+    db: &mut Database,
+    runtime: &WorkflowRuntime,
+) -> Result<WorkflowStepOutcome> {
+    let Some(worktree) = task.worktree_path.clone() else {
+        return Ok(WorkflowStepOutcome::NoOp);
+    };
+    let Some(current) = db.get_workflow_task_state(&task.id)? else {
+        return Ok(WorkflowStepOutcome::NoOp);
+    };
+    if current.state != "plan_review" {
+        return Ok(WorkflowStepOutcome::Blocked {
+            message: "Submit plan review is only available in Plan review".into(),
+        });
+    }
+    let artifact = workflow_artifact_path(&worktree, plugin.artifacts.plan_review.as_deref(), &task.id, ".agent-flow/plan-review.yaml");
+    let verdict = workflow_artifact_value(&artifact, "verdict")?;
+    let approve = match verdict.as_str() {
+        "approved" => true,
+        "changes_requested" => false,
+        _ => bail!("{} has unsupported plan-review verdict '{verdict}'", artifact.display()),
+    };
+    decide_workflow_plan(workflow, project_workflow, plugin, task, approve, db, runtime)
 }
 
 /// Extracted body of `App::start_selected_workflow_implementation`.
@@ -1209,12 +1263,12 @@ pub fn assess(
 
     match state.state.as_str() {
         "planning" => assess_planning(worktree, plugin, task, state),
+        "plan_review" => assess_plan_review(worktree, plugin, task, state),
         "engineering_review" => assess_engineering_review(worktree, plugin, task, state),
         "final_validation" => assess_final_validation(worktree, plugin, task, state),
         "implementing" | "running" => assess_implementation(worktree, state),
         // A role state this function does not yet know an artifact mapping
-        // for (e.g. `plan_review`, which is decided by an operator keybind
-        // rather than an artifact). Nothing to read, so nothing to report.
+        // for. Nothing to read, so nothing to report.
         _ => AutomationDecision::Wait,
     }
 }
@@ -1246,6 +1300,30 @@ fn assess_planning(worktree: &str, plugin: &WorkflowPlugin, task: &Task, state: 
         ));
     }
     AutomationDecision::Advance("submit_plan".to_string())
+}
+
+/// Mirrors `submit_plan_review`'s verdict-to-action match exactly. Both
+/// `approved` and `changes_requested` are legitimate, always-auto-dispatchable
+/// outcomes -- matching how `engineering_review`'s own rework loops
+/// (`corrections_required`/`plan_issue`) already auto-dispatch without a
+/// human gate.
+fn assess_plan_review(worktree: &str, plugin: &WorkflowPlugin, task: &Task, state: &WorkflowTaskState) -> AutomationDecision {
+    let artifact = workflow_artifact_path(worktree, plugin.artifacts.plan_review.as_deref(), &task.id, ".agent-flow/plan-review.yaml");
+    if let Some(decision) = artifact_freshness(&artifact, state) {
+        return decision;
+    }
+    let verdict = match workflow_artifact_value(&artifact, "verdict") {
+        Ok(verdict) => verdict,
+        Err(error) => return AutomationDecision::InvalidArtifact(error.to_string()),
+    };
+    match verdict.as_str() {
+        "approved" => AutomationDecision::Advance("approve_plan".to_string()),
+        "changes_requested" => AutomationDecision::Advance("plan_changes_requested".to_string()),
+        other => AutomationDecision::InvalidArtifact(format!(
+            "{} has unsupported plan-review verdict '{other}'",
+            artifact.display()
+        )),
+    }
 }
 
 /// Mirrors `submit_engineering_review`'s verdict-to-action match exactly.
@@ -1607,6 +1685,125 @@ mod tests {
             assess(&graph, &project(), &plugin, &task, &second_state, &db),
             AutomationDecision::Wait
         );
+    }
+
+    /// A minimal graph exercising only the `plan_review` state, mirroring
+    /// `assess_workflow`'s own style: `assess_plan_review` distinguishes its
+    /// two outcomes purely by the artifact's `verdict`, so neither transition
+    /// needs a graph guard.
+    fn assess_plan_review_workflow() -> WorkflowDefinition {
+        WorkflowDefinition {
+            initial_state: "planning".into(),
+            states: vec![
+                WorkflowState { id: "planning".into(), label: "Planning".into(), role: Some("planner".into()), terminal: false },
+                WorkflowState { id: "plan_review".into(), label: "Plan review".into(), role: Some("plan_reviewer".into()), terminal: false },
+                WorkflowState { id: "plan_approved".into(), label: "Plan approved".into(), role: None, terminal: true },
+            ],
+            transitions: vec![
+                WorkflowTransition {
+                    action: "plan_changes_requested".into(),
+                    from: "plan_review".into(),
+                    to: "planning".into(),
+                    guards: vec![],
+                },
+                WorkflowTransition {
+                    action: "approve_plan".into(),
+                    from: "plan_review".into(),
+                    to: "plan_approved".into(),
+                    guards: vec![],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn assess_plan_review_advances_on_a_fresh_approved_verdict() {
+        let graph = assess_plan_review_workflow();
+        let plugin = plugin_for_tests(graph.clone());
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
+        std::fs::write(
+            worktree.path().join(".agent-flow/plan-review.yaml"),
+            "verdict: approved\nworkflow_attempt: 1\n",
+        )
+        .unwrap();
+        let task = admitted_task(worktree.path());
+        let state = WorkflowTaskState::new(&task.id, "plan_review", "main");
+        let db = Database::open_in_memory_project().unwrap();
+
+        let decision = assess(&graph, &project(), &plugin, &task, &state, &db);
+        assert_eq!(decision, AutomationDecision::Advance("approve_plan".to_string()));
+    }
+
+    #[test]
+    fn assess_plan_review_advances_on_a_fresh_changes_requested_verdict() {
+        let graph = assess_plan_review_workflow();
+        let plugin = plugin_for_tests(graph.clone());
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
+        std::fs::write(
+            worktree.path().join(".agent-flow/plan-review.yaml"),
+            "verdict: changes_requested\nfindings: Missing tests for the new endpoint.\nworkflow_attempt: 1\n",
+        )
+        .unwrap();
+        let task = admitted_task(worktree.path());
+        let state = WorkflowTaskState::new(&task.id, "plan_review", "main");
+        let db = Database::open_in_memory_project().unwrap();
+
+        let decision = assess(&graph, &project(), &plugin, &task, &state, &db);
+        assert_eq!(decision, AutomationDecision::Advance("plan_changes_requested".to_string()));
+    }
+
+    #[test]
+    fn assess_plan_review_waits_when_the_artifact_is_missing() {
+        let graph = assess_plan_review_workflow();
+        let plugin = plugin_for_tests(graph.clone());
+        let worktree = tempfile::tempdir().unwrap();
+        let task = admitted_task(worktree.path());
+        let state = WorkflowTaskState::new(&task.id, "plan_review", "main");
+        let db = Database::open_in_memory_project().unwrap();
+
+        let decision = assess(&graph, &project(), &plugin, &task, &state, &db);
+        assert_eq!(decision, AutomationDecision::Wait);
+    }
+
+    #[test]
+    fn assess_plan_review_waits_on_an_artifact_stamped_with_a_stale_attempt() {
+        let graph = assess_plan_review_workflow();
+        let plugin = plugin_for_tests(graph.clone());
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
+        std::fs::write(
+            worktree.path().join(".agent-flow/plan-review.yaml"),
+            "verdict: approved\nworkflow_attempt: 1\n",
+        )
+        .unwrap();
+        let task = admitted_task(worktree.path());
+        let mut state = WorkflowTaskState::new(&task.id, "plan_review", "main");
+        state.state_attempt = 2;
+        let db = Database::open_in_memory_project().unwrap();
+
+        let decision = assess(&graph, &project(), &plugin, &task, &state, &db);
+        assert_eq!(decision, AutomationDecision::Wait);
+    }
+
+    #[test]
+    fn assess_plan_review_flags_an_unsupported_verdict_as_invalid() {
+        let graph = assess_plan_review_workflow();
+        let plugin = plugin_for_tests(graph.clone());
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
+        std::fs::write(
+            worktree.path().join(".agent-flow/plan-review.yaml"),
+            "verdict: looks_fine_i_guess\nworkflow_attempt: 1\n",
+        )
+        .unwrap();
+        let task = admitted_task(worktree.path());
+        let state = WorkflowTaskState::new(&task.id, "plan_review", "main");
+        let db = Database::open_in_memory_project().unwrap();
+
+        let decision = assess(&graph, &project(), &plugin, &task, &state, &db);
+        assert!(matches!(decision, AutomationDecision::InvalidArtifact(_)));
     }
 }
 
@@ -2495,5 +2692,333 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         let outcome = submit_final_validation(&graph, &project, &plugin, task.clone(), &mut db, &runtime).unwrap();
         assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
         assert_eq!(db.get_workflow_task_state(&task.id).unwrap().unwrap().state, "integrate_to_feature");
+    }
+
+    /// `submit_plan_review` on an `approved` artifact must drive the exact
+    /// same transition `decide_workflow_plan(..., true, ...)` would: it is a
+    /// thin artifact-reading wrapper, not a second implementation. No tmux or
+    /// agent launch happens on approval, so no mocks are needed for either
+    /// side of the comparison.
+    #[test]
+    fn submit_plan_review_approved_matches_decide_workflow_plan_directly() {
+        let graph = WorkflowDefinition {
+            initial_state: "plan_review".into(),
+            states: vec![
+                WorkflowState { id: "plan_review".into(), label: "Plan review".into(), role: Some("plan_reviewer".into()), terminal: false },
+                WorkflowState { id: "plan_approved".into(), label: "Plan approved".into(), role: None, terminal: true },
+            ],
+            transitions: vec![WorkflowTransition {
+                action: "approve_plan".into(),
+                from: "plan_review".into(),
+                to: "plan_approved".into(),
+                guards: vec![crate::workflow::WorkflowGuard::ApprovedPlan],
+            }],
+        };
+        graph.validate().unwrap();
+
+        let project = WorkflowProjectConfig {
+            target_branch: "main".into(),
+            role_bindings: Default::default(),
+            ..Default::default()
+        };
+        let plugin = plugin(graph.clone());
+
+        let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(MockTmuxOperations::new());
+        let agent_registry: Arc<dyn AgentRegistry> = Arc::new(MockAgentRegistry::new());
+        let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
+        let config = merged_config();
+        let flags = feature_flags();
+        let runtime = WorkflowRuntime {
+            tmux_ops: &tmux_ops,
+            agent_registry: &agent_registry,
+            git_ops: &git_ops,
+            tmux_project_name: "proj",
+            project_path: Path::new("C:/work/project"),
+            config: &config,
+            flags: &flags,
+        };
+
+        // Artifact-driven path.
+        let worktree_a = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree_a.path().join(".agent-flow")).unwrap();
+        std::fs::write(worktree_a.path().join(".agent-flow/plan-review.yaml"), "verdict: approved\n").unwrap();
+        let mut task_a = crate::db::Task::new("Review thing", "claude", "proj");
+        task_a.worktree_path = Some(worktree_a.path().to_string_lossy().to_string());
+        let mut db_a = Database::open_in_memory_project().unwrap();
+        db_a.create_task(&task_a).unwrap();
+        let mut state_a = WorkflowTaskState::new(&task_a.id, "plan_review", "main");
+        state_a.plan_revision = 1;
+        state_a.plan_hash = Some("deadbeef".into());
+        let record_a = WorkflowTransitionRecord::new(&task_a.id, "seed", "backlog", "plan_review");
+        db_a.record_workflow_admission(&task_a, &state_a, &record_a).unwrap();
+
+        let outcome_a = submit_plan_review(&graph, &project, &plugin, task_a.clone(), &mut db_a, &runtime).unwrap();
+        assert!(matches!(outcome_a, WorkflowStepOutcome::Advanced { .. }));
+        let final_state_a = db_a.get_workflow_task_state(&task_a.id).unwrap().unwrap();
+
+        // Direct manual-path call with an equivalent starting state.
+        let mut task_b = crate::db::Task::new("Review thing", "claude", "proj");
+        task_b.worktree_path = task_a.worktree_path.clone();
+        task_b.id = task_a.id.clone();
+        let mut db_b = Database::open_in_memory_project().unwrap();
+        db_b.create_task(&task_b).unwrap();
+        db_b.record_workflow_admission(&task_b, &state_a, &record_a).unwrap();
+
+        let outcome_b = decide_workflow_plan(&graph, &project, &plugin, task_b.clone(), true, &mut db_b, &runtime).unwrap();
+        assert!(matches!(outcome_b, WorkflowStepOutcome::Advanced { .. }));
+        let final_state_b = db_b.get_workflow_task_state(&task_b.id).unwrap().unwrap();
+
+        assert_eq!(final_state_a.state, "plan_approved");
+        assert_eq!(final_state_a.state, final_state_b.state);
+        assert_eq!(final_state_a.approved_plan_hash, final_state_b.approved_plan_hash);
+        assert_eq!(final_state_a.approved_plan_revision, final_state_b.approved_plan_revision);
+    }
+
+    /// Graph/project/plugin shared by the `changes_requested` tests below:
+    /// the destination (`planning`) role is bound to a mock agent so
+    /// `decide_workflow_plan`'s reject branch has somewhere to send the
+    /// revise prompt.
+    fn changes_requested_fixtures() -> (WorkflowDefinition, WorkflowProjectConfig, WorkflowPlugin) {
+        let graph = WorkflowDefinition {
+            initial_state: "planning".into(),
+            states: vec![
+                WorkflowState { id: "planning".into(), label: "Planning".into(), role: Some("planner".into()), terminal: true },
+                WorkflowState { id: "plan_review".into(), label: "Plan review".into(), role: Some("plan_reviewer".into()), terminal: false },
+            ],
+            transitions: vec![WorkflowTransition {
+                action: "plan_changes_requested".into(),
+                from: "plan_review".into(),
+                to: "planning".into(),
+                guards: vec![],
+            }],
+        };
+        graph.validate().unwrap();
+
+        let mut project = WorkflowProjectConfig {
+            target_branch: "main".into(),
+            role_bindings: Default::default(),
+            ..Default::default()
+        };
+        project.role_bindings.insert("planner".into(), "mock-planner".into());
+
+        let plugin = plugin(graph.clone());
+        (graph, project, plugin)
+    }
+
+    /// A mock agent registry whose `PromptInjection::Argv` lets
+    /// `spawn_send_to_agent` deliver the prompt at launch via the
+    /// synchronous `switch_agent_in_tmux` path instead of the mid-session
+    /// lane -- avoiding the readiness-wait machinery while still exercising
+    /// the real revise-prompt construction.
+    fn mock_agent_registry_for_argv_launch() -> Arc<dyn AgentRegistry> {
+        let mut mock_registry = MockAgentRegistry::new();
+        mock_registry.expect_get().returning(|_| {
+            let mut ops = MockAgentOperations::new();
+            ops.expect_prompt_injection().returning(|| crate::agent::PromptInjection::Argv);
+            ops.expect_build_interactive_command().returning(|prompt| format!("mock-planner '{}'", prompt));
+            Arc::new(ops) as Arc<dyn AgentOperations>
+        });
+        Arc::new(mock_registry)
+    }
+
+    /// Builds the tmux mock shared by the `changes_requested` tests: the
+    /// revise prompt's text is captured off `paste_text` (the call that
+    /// carries the full command, prompt included, into the window), and a
+    /// channel signals the moment it lands so the test does not have to
+    /// sleep-poll a background thread. `pane_content` is whatever
+    /// `capture_pane` should report -- the pane-capture fallback's input.
+    fn mock_tmux_capturing_paste(
+        pane_content: &'static str,
+    ) -> (Arc<dyn TmuxOperations>, std::sync::mpsc::Receiver<()>, Arc<Mutex<Option<String>>>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let captured_for_closure = captured.clone();
+
+        let mut mock_tmux = MockTmuxOperations::new();
+        mock_tmux.expect_window_exists().returning(|_| Ok(true));
+        mock_tmux.expect_send_keys().returning(|_, _| Ok(()));
+        mock_tmux.expect_send_key().returning(|_, _| Ok(()));
+        mock_tmux.expect_pane_current_command().returning(|_| Some("bash".to_string()));
+        mock_tmux.expect_capture_pane().returning(move |_| Ok(pane_content.to_string()));
+        mock_tmux.expect_paste_text().returning(move |_, text| {
+            *captured_for_closure.lock().unwrap() = Some(text.to_string());
+            let _ = tx.send(());
+            Ok(())
+        });
+
+        (Arc::new(mock_tmux), rx, captured)
+    }
+
+    #[test]
+    fn submit_plan_review_changes_requested_uses_artifact_findings_not_pane_capture() {
+        let (graph, project, plugin) = changes_requested_fixtures();
+        let agent_registry = mock_agent_registry_for_argv_launch();
+        // If the artifact's findings were ignored, this is what a pane-scrape
+        // would have produced instead -- distinct text so the assertions can
+        // tell which source actually won.
+        let (tmux_ops, rx, captured) =
+            mock_tmux_capturing_paste("Plan reviewer pane: please also check the retry path.");
+        let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
+
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
+        std::fs::write(
+            worktree.path().join(".agent-flow/plan-review.yaml"),
+            "verdict: changes_requested\nfindings: Add input validation for the new endpoint before revising further.\nworkflow_attempt: 1\n",
+        )
+        .unwrap();
+
+        let mut task = crate::db::Task::new("Review thing", "claude", "proj");
+        task.worktree_path = Some(worktree.path().to_string_lossy().to_string());
+        task.session_name = Some("proj:task-review".into());
+
+        let mut db = Database::open_in_memory_project().unwrap();
+        db.create_task(&task).unwrap();
+        let current = WorkflowTaskState::new(&task.id, "plan_review", "main");
+        let record = WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "plan_review");
+        db.record_workflow_admission(&task, &current, &record).unwrap();
+
+        let config = merged_config();
+        let flags = feature_flags();
+        let runtime = WorkflowRuntime {
+            tmux_ops: &tmux_ops,
+            agent_registry: &agent_registry,
+            git_ops: &git_ops,
+            tmux_project_name: "proj",
+            project_path: Path::new("C:/work/project"),
+            config: &config,
+            flags: &flags,
+        };
+
+        let outcome = submit_plan_review(&graph, &project, &plugin, task.clone(), &mut db, &runtime).unwrap();
+        assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
+
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("revise prompt should be delivered to the planner");
+        let sent = captured.lock().unwrap().clone().expect("paste_text should have captured the revise command");
+        assert!(
+            sent.contains("Add input validation for the new endpoint before revising further."),
+            "expected the artifact's findings verbatim in the revise prompt, got: {sent}"
+        );
+        assert!(
+            !sent.contains("reviewer's pane, captured at the moment"),
+            "findings were present on the artifact; the pane-capture fallback header must not appear, got: {sent}"
+        );
+        assert!(
+            !sent.contains("please also check the retry path"),
+            "the stubbed pane content must be ignored when the artifact has findings, got: {sent}"
+        );
+    }
+
+    #[test]
+    fn submit_plan_review_changes_requested_falls_back_to_pane_capture_when_findings_missing() {
+        let (graph, project, plugin) = changes_requested_fixtures();
+        let agent_registry = mock_agent_registry_for_argv_launch();
+        let (tmux_ops, rx, captured) =
+            mock_tmux_capturing_paste("Plan reviewer pane: needs better error handling on the retry path.");
+        let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
+
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
+        // `verdict` present, no `findings:` line at all.
+        std::fs::write(
+            worktree.path().join(".agent-flow/plan-review.yaml"),
+            "verdict: changes_requested\nworkflow_attempt: 1\n",
+        )
+        .unwrap();
+
+        let mut task = crate::db::Task::new("Review thing", "claude", "proj");
+        task.worktree_path = Some(worktree.path().to_string_lossy().to_string());
+        task.session_name = Some("proj:task-review".into());
+
+        let mut db = Database::open_in_memory_project().unwrap();
+        db.create_task(&task).unwrap();
+        let current = WorkflowTaskState::new(&task.id, "plan_review", "main");
+        let record = WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "plan_review");
+        db.record_workflow_admission(&task, &current, &record).unwrap();
+
+        let config = merged_config();
+        let flags = feature_flags();
+        let runtime = WorkflowRuntime {
+            tmux_ops: &tmux_ops,
+            agent_registry: &agent_registry,
+            git_ops: &git_ops,
+            tmux_project_name: "proj",
+            project_path: Path::new("C:/work/project"),
+            config: &config,
+            flags: &flags,
+        };
+
+        let outcome = submit_plan_review(&graph, &project, &plugin, task.clone(), &mut db, &runtime).unwrap();
+        assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
+
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("revise prompt should be delivered to the planner");
+        let sent = captured.lock().unwrap().clone().expect("paste_text should have captured the revise command");
+        assert!(
+            sent.contains("needs better error handling on the retry path"),
+            "expected the captured pane content as fallback feedback, got: {sent}"
+        );
+        assert!(
+            sent.contains("reviewer's pane, captured at the moment"),
+            "expected the pane-capture fallback header when findings are absent, got: {sent}"
+        );
+    }
+
+    /// Full manual-path regression: `decide_workflow_plan` invoked directly
+    /// with an explicit bool -- exactly how the TUI's Shift+Y/Shift+N
+    /// handlers already call it -- is unaffected by the new artifact-driven
+    /// layer. With no `.agent-flow/plan-review.yaml` on disk at all (e.g. an
+    /// older project, or a human rejecting before this artifact ever
+    /// existed), the reject path must fall back to pane-capture exactly as
+    /// it did before this task.
+    #[test]
+    fn decide_workflow_plan_manual_path_unaffected_by_artifact_driven_layer() {
+        let (graph, project, plugin) = changes_requested_fixtures();
+        let agent_registry = mock_agent_registry_for_argv_launch();
+        let (tmux_ops, rx, captured) =
+            mock_tmux_capturing_paste("Manual reviewer pane: tighten the retry logic.");
+        let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
+
+        // No `.agent-flow/plan-review.yaml` written at all.
+        let worktree = tempfile::tempdir().unwrap();
+
+        let mut task = crate::db::Task::new("Review thing", "claude", "proj");
+        task.worktree_path = Some(worktree.path().to_string_lossy().to_string());
+        task.session_name = Some("proj:task-review".into());
+
+        let mut db = Database::open_in_memory_project().unwrap();
+        db.create_task(&task).unwrap();
+        let current = WorkflowTaskState::new(&task.id, "plan_review", "main");
+        let record = WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "plan_review");
+        db.record_workflow_admission(&task, &current, &record).unwrap();
+
+        let config = merged_config();
+        let flags = feature_flags();
+        let runtime = WorkflowRuntime {
+            tmux_ops: &tmux_ops,
+            agent_registry: &agent_registry,
+            git_ops: &git_ops,
+            tmux_project_name: "proj",
+            project_path: Path::new("C:/work/project"),
+            config: &config,
+            flags: &flags,
+        };
+
+        let outcome = decide_workflow_plan(&graph, &project, &plugin, task.clone(), false, &mut db, &runtime).unwrap();
+        assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
+        assert_eq!(db.get_workflow_task_state(&task.id).unwrap().unwrap().state, "planning");
+
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("revise prompt should be delivered to the planner");
+        let sent = captured.lock().unwrap().clone().expect("paste_text should have captured the revise command");
+        assert!(
+            sent.contains("tighten the retry logic"),
+            "expected the captured pane content as fallback feedback (no artifact present), got: {sent}"
+        );
+        assert!(
+            sent.contains("reviewer's pane, captured at the moment"),
+            "expected the pane-capture fallback header when no plan-review artifact exists, got: {sent}"
+        );
     }
 }

@@ -40,10 +40,10 @@ use crate::config::WorkflowPlugin;
 use crate::db::{Database, Task, TaskStatus};
 use crate::workflow::{WorkflowDefinition, WorkflowProjectConfig};
 use crate::workflow_executor::{
-    admit_task, assess, complete_admission, complete_feature_integration, decide_workflow_plan,
+    admit_task, assess, complete_admission, complete_feature_integration,
     start_workflow_implementation, submit_engineering_review, submit_final_validation,
-    submit_workflow_implementation, submit_workflow_plan, AutomationDecision, WorkflowRuntime,
-    WorkflowStepOutcome,
+    submit_plan_review, submit_workflow_implementation, submit_workflow_plan, AutomationDecision,
+    WorkflowRuntime, WorkflowStepOutcome,
 };
 
 /// What automation did (or considered, and declined to do) for one task
@@ -208,9 +208,8 @@ fn dispatch_advance(
     match action {
         "admission_complete" => complete_admission(workflow, project, task, db),
         "submit_plan" => submit_workflow_plan(workflow, project, plugin, task, db, runtime),
-        "approve_plan" => decide_workflow_plan(workflow, project, plugin, task, true, db, runtime),
-        "plan_changes_requested" => {
-            decide_workflow_plan(workflow, project, plugin, task, false, db, runtime)
+        "approve_plan" | "plan_changes_requested" => {
+            submit_plan_review(workflow, project, plugin, task, db, runtime)
         }
         "start_implementation" => {
             start_workflow_implementation(workflow, project, plugin, task, db, runtime)
@@ -258,7 +257,7 @@ mod tests {
                 WorkflowState { id: "admission".into(), label: "Admission".into(), role: None, terminal: false },
                 WorkflowState { id: "ready_for_planning".into(), label: "Ready for planning".into(), role: None, terminal: false },
                 WorkflowState { id: "planning".into(), label: "Planning".into(), role: Some("planner".into()), terminal: false },
-                WorkflowState { id: "plan_review".into(), label: "Plan review".into(), role: None, terminal: false },
+                WorkflowState { id: "plan_review".into(), label: "Plan review".into(), role: Some("plan_reviewer".into()), terminal: false },
                 WorkflowState { id: "implementing".into(), label: "Implementing".into(), role: Some("implementer".into()), terminal: false },
                 WorkflowState { id: "engineering_review".into(), label: "Engineering review".into(), role: Some("reviewer".into()), terminal: false },
                 WorkflowState { id: "final_validation".into(), label: "Final validation".into(), role: Some("validator".into()), terminal: false },
@@ -322,7 +321,8 @@ mod tests {
         project.role_bindings.insert("implementer".into(), "claude".into());
         project.role_bindings.insert("reviewer".into(), "claude".into());
         project.role_bindings.insert("validator".into(), "claude".into());
-        for role in ["planner", "implementer", "reviewer", "validator"] {
+        project.role_bindings.insert("plan_reviewer".into(), "claude".into());
+        for role in ["planner", "implementer", "reviewer", "validator", "plan_reviewer"] {
             project
                 .role_policies
                 .roles
@@ -701,5 +701,122 @@ mod tests {
         assert!(!source.contains(&forbidden_flag));
         assert!(!source.contains(&forbidden_field));
         assert!(!source.contains(&forbidden_branch));
+    }
+
+    /// An agent registry whose `PromptInjection::Argv` lets `decide_workflow_plan`'s
+    /// reject branch (always `spawn_send_to_agent`, regardless of policy)
+    /// deliver its revise prompt via the synchronous launch-argv path rather
+    /// than the mid-session lane, avoiding readiness-wait machinery in a tick
+    /// test.
+    fn registry_with_argv_launch() -> MockAgentRegistry {
+        let mut mock = MockAgentRegistry::new();
+        mock.expect_get().returning(|_| {
+            let mut ops = MockAgentOperations::new();
+            ops.expect_prompt_injection().returning(|| crate::agent::PromptInjection::Argv);
+            ops.expect_build_interactive_command().returning(|prompt| format!("claude '{}'", prompt));
+            Arc::new(ops) as Arc<dyn AgentOperations>
+        });
+        mock
+    }
+
+    /// End-to-end: a `plan_review` task with a fresh `verdict: approved`
+    /// artifact is advanced all the way to `implementing` (this graph's real
+    /// `approve_plan` destination) by a single automation tick -- no
+    /// Shift+Y keypress at all, matching `submit_plan_review`'s wiring into
+    /// `dispatch_advance`.
+    #[test]
+    fn tick_auto_approves_plan_review_and_advances_past_it() {
+        let graph = full_workflow();
+        let plugin_config = plugin(graph.clone());
+        let project = project();
+
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
+        std::fs::write(
+            worktree.path().join(".agent-flow/plan-review.yaml"),
+            "verdict: approved\nworkflow_attempt: 1\n",
+        )
+        .unwrap();
+
+        let mut db = Database::open_in_memory_project().unwrap();
+        let mut task = Task::new("Plan thing", "claude", "proj");
+        task.worktree_path = Some(worktree.path().to_string_lossy().to_string());
+        task.session_name = Some("proj:task-plan".into());
+        db.create_task(&task).unwrap();
+        let mut state = WorkflowTaskState::new(&task.id, "plan_review", "feature/poc");
+        state.plan_revision = 1;
+        state.plan_hash = Some("deadbeef".into());
+        let record = crate::db::WorkflowTransitionRecord::new(&task.id, "seed", "planning", "plan_review");
+        db.record_workflow_admission(&task, &state, &record).unwrap();
+
+        let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(permissive_tmux());
+        let agent_registry: Arc<dyn AgentRegistry> = Arc::new(permissive_registry());
+        let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
+        let config = merged_config();
+        let flags = feature_flags();
+        let runtime = runtime_with(&tmux_ops, &agent_registry, &git_ops, worktree.path(), &config, &flags);
+
+        let results = run_automation_tick(&mut db, &graph, &project, &plugin_config, &runtime);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].decision, AutomationDecision::Advance("approve_plan".to_string()));
+        assert!(matches!(results[0].outcome, Some(WorkflowStepOutcome::Advanced { .. })));
+
+        let state_after = db.get_workflow_task_state(&task.id).unwrap().unwrap();
+        assert_eq!(state_after.state, "implementing");
+        assert_eq!(state_after.approved_plan_revision, Some(1));
+        assert_eq!(state_after.approved_plan_hash.as_deref(), Some("deadbeef"));
+    }
+
+    /// End-to-end rework cycle: a `plan_review` task with a fresh
+    /// `verdict: changes_requested` artifact is driven straight back to
+    /// `planning` by a single automation tick, with the same `state_attempt`
+    /// bump and agent relaunch the other rework-loop states already get
+    /// from `assess`/`dispatch_advance` -- no Shift+N keypress at all.
+    #[test]
+    fn tick_auto_requests_plan_changes_and_returns_to_planning() {
+        let graph = full_workflow();
+        let plugin_config = plugin(graph.clone());
+        let project = project();
+
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
+        std::fs::write(
+            worktree.path().join(".agent-flow/plan-review.yaml"),
+            "verdict: changes_requested\nfindings: Add a rollback step for the migration.\nworkflow_attempt: 1\n",
+        )
+        .unwrap();
+
+        let mut db = Database::open_in_memory_project().unwrap();
+        let mut task = Task::new("Plan thing", "claude", "proj");
+        task.worktree_path = Some(worktree.path().to_string_lossy().to_string());
+        task.session_name = Some("proj:task-plan".into());
+        db.create_task(&task).unwrap();
+        let mut state = WorkflowTaskState::new(&task.id, "plan_review", "feature/poc");
+        state.plan_revision = 1;
+        let record = crate::db::WorkflowTransitionRecord::new(&task.id, "seed", "planning", "plan_review");
+        db.record_workflow_admission(&task, &state, &record).unwrap();
+        let attempt_before = db.get_workflow_task_state(&task.id).unwrap().unwrap().state_attempt;
+
+        let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(permissive_tmux());
+        let agent_registry: Arc<dyn AgentRegistry> = Arc::new(registry_with_argv_launch());
+        let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
+        let config = merged_config();
+        let flags = feature_flags();
+        let runtime = runtime_with(&tmux_ops, &agent_registry, &git_ops, worktree.path(), &config, &flags);
+
+        let results = run_automation_tick(&mut db, &graph, &project, &plugin_config, &runtime);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].decision, AutomationDecision::Advance("plan_changes_requested".to_string()));
+        assert!(matches!(results[0].outcome, Some(WorkflowStepOutcome::Advanced { .. })));
+
+        let state_after = db.get_workflow_task_state(&task.id).unwrap().unwrap();
+        assert_eq!(state_after.state, "planning");
+        assert!(
+            state_after.state_attempt > attempt_before,
+            "re-entering planning must bump state_attempt (was {attempt_before}, now {})",
+            state_after.state_attempt
+        );
+        let task_after = db.get_task(&task.id).unwrap().unwrap();
+        assert_eq!(task_after.agent, "claude", "the bound planner agent must be the one relaunched");
     }
 }
