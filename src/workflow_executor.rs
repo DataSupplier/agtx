@@ -147,6 +147,74 @@ fn record_step_evidence(
     Ok(evidence)
 }
 
+/// Restore the immutable inputs bound to the current workflow-state attempt.
+///
+/// This is deliberately strict: a current worktree file is left untouched when
+/// it already matches the expected digest, but a conflicting file is a
+/// recoverable error rather than something AGTX silently overwrites. Callers
+/// can therefore replay an interrupted prompt without accidentally reviewing a
+/// newer plan or an older verdict.
+pub fn restore_workflow_step_inputs(
+    db: &Database,
+    task: &Task,
+    state: &WorkflowTaskState,
+) -> Result<usize> {
+    let worktree = task
+        .worktree_path
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Workflow recovery requires an admitted worktree"))?;
+    let worktree = Path::new(worktree);
+    let inputs = db.workflow_step_inputs(&task.id, state.state_attempt, &state.state)?;
+    let mut restored = 0;
+
+    for input in inputs {
+        let artifact = db
+            .workflow_artifact(&input.artifact_id)?
+            .ok_or_else(|| anyhow::anyhow!("Missing immutable artifact {}", input.artifact_id))?;
+        if artifact.task_id != task.id
+            || artifact.workflow_attempt >= state.state_attempt
+            || artifact.sha256 != input.expected_sha256
+        {
+            anyhow::bail!(
+                "Workflow input '{}' does not match its persisted binding",
+                input.name
+            );
+        }
+        let actual = format!("{:x}", Sha256::digest(&artifact.content));
+        if actual != input.expected_sha256 {
+            anyhow::bail!(
+                "Workflow input '{}' failed its content digest check",
+                input.name
+            );
+        }
+        let source = Path::new(&artifact.source_path);
+        let relative = source.strip_prefix(worktree).map_err(|_| {
+            anyhow::anyhow!(
+                "Workflow input '{}' is outside its task worktree",
+                input.name
+            )
+        })?;
+        let destination = worktree.join(relative);
+        if destination.is_file() {
+            let existing = std::fs::read(&destination)?;
+            let existing_hash = format!("{:x}", Sha256::digest(&existing));
+            if existing_hash != input.expected_sha256 {
+                anyhow::bail!(
+                    "Workflow input '{}' conflicts with {}",
+                    input.name,
+                    destination.display()
+                );
+            }
+            continue;
+        }
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&destination, &artifact.content)?;
+        restored += 1;
+    }
+    Ok(restored)
+}
 /// Validate and prepare a transition for a task with existing workflow state.
 ///
 /// No agent name or phase name is hard-coded here: the destination state's
@@ -3104,12 +3172,13 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         );
     }
 
-    /// `submit_workflow_implementation` reorder-proof: both chained
-    /// transitions (`implementation_complete`, `start_engineering_review`)
-    /// must already be committed -- via `advance_workflow_state_chain` in one
-    /// transaction -- before the engineering reviewer is launched.
+    /// A failed reviewer launch must not advance the durable lane: both
+    /// chained transitions (`implementation_complete`,
+    /// `start_engineering_review`) are committed via
+    /// `advance_workflow_state_chain` only after `switch_agent_in_tmux`
+    /// confirms the engineering reviewer actually launched.
     #[test]
-    fn submit_workflow_implementation_persists_the_chain_before_launching_the_reviewer() {
+    fn submit_workflow_implementation_launches_the_reviewer_before_persisting_the_chain() {
         let graph = WorkflowDefinition {
             initial_state: "running".into(),
             states: vec![
@@ -3197,17 +3266,28 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             .expect_send_keys()
             .withf(|_, cmd: &str| cmd == "/exit")
             .returning(move |_, _| {
-                assert_state_already_persisted(
-                    &db_path_for_check,
-                    &task_id_for_check,
-                    "engineering_review",
+                let db = Database::open_project_at_path(&db_path_for_check).unwrap();
+                assert_eq!(
+                    db.get_workflow_task_state(&task_id_for_check)
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    "running",
+                    "durable state must not advance to 'engineering_review' until \
+                     switch_agent_in_tmux confirms the reviewer launched"
                 );
                 Ok(())
             });
         mock_tmux.expect_send_key().returning(|_, _| Ok(()));
-        mock_tmux
-            .expect_pane_current_command()
-            .returning(|_| Some("bash".to_string()));
+        let command_checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let command_checks_for_mock = Arc::clone(&command_checks);
+        mock_tmux.expect_pane_current_command().returning(move |_| {
+            if command_checks_for_mock.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Some("bash".to_string())
+            } else {
+                Some("claude".to_string())
+            }
+        });
         mock_tmux
             .expect_capture_pane()
             .returning(|_| Ok(String::new()));
@@ -3255,11 +3335,12 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         assert_eq!(history[2].action, "start_engineering_review");
     }
 
-    /// `submit_engineering_review` reorder-proof: the resolved verdict
-    /// transition is persisted before the next agent (the validator, for an
-    /// `approved_for_validation` verdict) is launched.
+    /// A failed next-agent launch must not advance the durable lane: the
+    /// resolved verdict transition (here, `approved_for_validation` to the
+    /// validator) is committed only after `switch_agent_in_tmux` confirms
+    /// the next agent actually launched.
     #[test]
-    fn submit_engineering_review_persists_before_launching_the_next_agent() {
+    fn submit_engineering_review_launches_the_next_agent_before_persisting_the_verdict() {
         let graph = WorkflowDefinition {
             initial_state: "engineering_review".into(),
             states: vec![
@@ -3332,17 +3413,28 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             .expect_send_keys()
             .withf(|_, cmd: &str| cmd == "/exit")
             .returning(move |_, _| {
-                assert_state_already_persisted(
-                    &db_path_for_check,
-                    &task_id_for_check,
-                    "final_validation",
+                let db = Database::open_project_at_path(&db_path_for_check).unwrap();
+                assert_eq!(
+                    db.get_workflow_task_state(&task_id_for_check)
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    "engineering_review",
+                    "durable state must not advance to 'final_validation' until \
+                     switch_agent_in_tmux confirms the next agent launched"
                 );
                 Ok(())
             });
         mock_tmux.expect_send_key().returning(|_, _| Ok(()));
-        mock_tmux
-            .expect_pane_current_command()
-            .returning(|_| Some("bash".to_string()));
+        let command_checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let command_checks_for_mock = Arc::clone(&command_checks);
+        mock_tmux.expect_pane_current_command().returning(move |_| {
+            if command_checks_for_mock.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Some("bash".to_string())
+            } else {
+                Some("claude".to_string())
+            }
+        });
         mock_tmux
             .expect_capture_pane()
             .returning(|_| Ok(String::new()));
@@ -3378,14 +3470,14 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         );
     }
 
-    /// `submit_final_validation` reorder-proof: a `passed` verdict's
-    /// `begin_feature_integration` transition is persisted before the next
-    /// agent is launched. `archive_workflow_artifact` only runs on the
+    /// A failed next-agent launch must not advance the durable lane: a
+    /// `passed` verdict's `begin_feature_integration` transition is
+    /// committed only after `switch_agent_in_tmux` confirms the next agent
+    /// actually launched. `archive_workflow_artifact` only runs on the
     /// `failed` path (see the function's own doc comment), so it is not
-    /// exercised here; this test only covers the persist/launch ordering the
-    /// plan changed.
+    /// exercised here; this test only covers the launch/persist ordering.
     #[test]
-    fn submit_final_validation_persists_before_launching_the_next_agent() {
+    fn submit_final_validation_launches_the_next_agent_before_persisting_the_verdict() {
         let graph = WorkflowDefinition {
             initial_state: "final_validation".into(),
             states: vec![
@@ -3457,17 +3549,28 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             .expect_send_keys()
             .withf(|_, cmd: &str| cmd == "/exit")
             .returning(move |_, _| {
-                assert_state_already_persisted(
-                    &db_path_for_check,
-                    &task_id_for_check,
-                    "integrate_to_feature",
+                let db = Database::open_project_at_path(&db_path_for_check).unwrap();
+                assert_eq!(
+                    db.get_workflow_task_state(&task_id_for_check)
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    "final_validation",
+                    "durable state must not advance to 'integrate_to_feature' until \
+                     switch_agent_in_tmux confirms the next agent launched"
                 );
                 Ok(())
             });
         mock_tmux.expect_send_key().returning(|_, _| Ok(()));
-        mock_tmux
-            .expect_pane_current_command()
-            .returning(|_| Some("bash".to_string()));
+        let command_checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let command_checks_for_mock = Arc::clone(&command_checks);
+        mock_tmux.expect_pane_current_command().returning(move |_| {
+            if command_checks_for_mock.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Some("bash".to_string())
+            } else {
+                Some("claude".to_string())
+            }
+        });
         mock_tmux
             .expect_capture_pane()
             .returning(|_| Ok(String::new()));

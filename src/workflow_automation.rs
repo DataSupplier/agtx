@@ -358,7 +358,23 @@ mod tests {
         mock.expect_create_window().returning(|_, _, _, _, _, _| Ok(()));
         mock.expect_send_keys().returning(|_, _| Ok(()));
         mock.expect_send_key().returning(|_, _| Ok(()));
-        mock.expect_pane_current_command().returning(|_| Some("bash".to_string()));
+        // The first poll finds the outgoing agent already at a shell (exit
+        // confirmed immediately); every poll after that reports the freshly
+        // launched agent, matching what a real tmux pane shows once
+        // `switch_agent_in_tmux` types the new command. Its final
+        // launch-detection loop requires seeing a *recognized* agent process
+        // (see `AGENT_COMMANDS` in `src/tui/app.rs`), not merely any string --
+        // a mock that always reports "bash" makes that loop time out and
+        // `switch_agent_in_tmux` return `Err`, which every caller now
+        // propagates instead of silently discarding.
+        let pane_polls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        mock.expect_pane_current_command().returning(move |_| {
+            if pane_polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Some("bash".to_string())
+            } else {
+                Some("claude".to_string())
+            }
+        });
         mock.expect_capture_pane().returning(|_| Ok(String::new()));
         mock.expect_paste_text().returning(|_, _| Ok(()));
         mock
