@@ -665,20 +665,40 @@ impl Database {
     /// Callers prepare and guard the transition before calling this method; the
     /// transaction guarantees observers cannot see the new state without its
     /// corresponding history entry.
+    /// Applies an already-validated transition, but only if the row is still
+    /// in the exact state `prepare_transition` validated it against.
+    ///
+    /// `prepare_transition` reads its own snapshot of the current row,
+    /// checks the graph/guards against it, and hands the *caller* a computed
+    /// destination state to persist here -- it never re-reads the row itself.
+    /// Between that read and this write, another caller can win the same
+    /// race (a manual keypress, a queued MCP/web transition request, and an
+    /// automation tick can all observe the same "before" row before any of
+    /// them commits). Without a compare-and-set here, every one of them
+    /// would succeed, each silently overwriting the last and leaving a
+    /// duplicate, `from_state`-identical row in the transition history --
+    /// exactly the "never duplicate a transition" failure mode automation
+    /// must not introduce. The `WHERE ... AND state = ?13` clause makes the
+    /// second (or third) racing writer fail cleanly instead: zero rows
+    /// affected becomes an error, the whole transaction rolls back (no
+    /// state update AND no history row), and the caller's `?` turns that
+    /// into a `Blocked`/no-op for this tick -- the next tick re-reads the
+    /// now-current row and decides fresh, which is always safe because
+    /// nothing here is ever treated as sticky.
     pub fn advance_workflow_state(
         &mut self,
         state: &WorkflowTaskState,
         record: &WorkflowTransitionRecord,
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
-        tx.execute(
+        let updated = tx.execute(
             r#"
             UPDATE workflow_task_states SET
                 state = ?2, state_attempt = ?3, target_branch = ?4, base_sha = ?5,
                 plan_revision = ?6, plan_hash = ?7,
                 approved_plan_revision = ?8, approved_plan_hash = ?9,
                 validation_passed_at = ?10, integration_sha = ?11, updated_at = ?12
-            WHERE task_id = ?1
+            WHERE task_id = ?1 AND state = ?13
             "#,
             params![
                 state.task_id, state.state, state.state_attempt, state.target_branch, state.base_sha,
@@ -686,8 +706,15 @@ impl Database {
                 state.approved_plan_hash,
                 state.validation_passed_at.map(|value| value.to_rfc3339()),
                 state.integration_sha, state.updated_at.to_rfc3339(),
+                record.from_state,
             ],
         )?;
+        if updated == 0 {
+            anyhow::bail!(
+                "workflow state for task '{}' changed concurrently (expected '{}'); transition '{}' aborted",
+                state.task_id, record.from_state, record.action
+            );
+        }
         tx.execute(
             r#"INSERT INTO workflow_transition_history (
                 id, task_id, action, from_state, to_state, actor_role, actor_agent,

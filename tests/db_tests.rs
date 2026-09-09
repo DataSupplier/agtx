@@ -942,6 +942,42 @@ fn transition_advancement_updates_state_and_history_together() {
     assert_eq!(db.workflow_transition_history(&task.id).unwrap()[0].action, "admission_complete");
 }
 
+/// Two racing callers (e.g. a queued MCP transition request and an
+/// automation tick) can each read the same "before" row and validate a
+/// transition against it before either commits. `advance_workflow_state`
+/// must let only the first one through: the second's `from_state` no longer
+/// matches the live row, so it must be rejected -- with no state update and
+/// no duplicate history row -- rather than silently overwriting the winner.
+#[test]
+#[cfg(feature = "test-mocks")]
+fn advance_workflow_state_rejects_a_transition_from_a_stale_snapshot() {
+    let mut db = Database::open_in_memory_project().unwrap();
+    let task = Task::new("F4.1", "claude", "heaves");
+    db.create_task(&task).unwrap();
+    let state = WorkflowTaskState::new(&task.id, "planning", "feature/poc");
+    db.upsert_workflow_task_state(&state).unwrap();
+
+    // Both racing callers read the same "planning" snapshot before either
+    // writes -- exactly what happened live: one path (already applied
+    // below) submits the plan, and this second one is a second, later
+    // caller that validated against the same stale "planning" state.
+    let mut winner = state.clone();
+    winner.state = "plan_review".into();
+    let winner_transition = WorkflowTransitionRecord::new(&task.id, "submit_plan", "planning", "plan_review");
+    db.advance_workflow_state(&winner, &winner_transition).unwrap();
+
+    let mut loser = state.clone();
+    loser.state = "plan_review".into();
+    let loser_transition = WorkflowTransitionRecord::new(&task.id, "submit_plan", "planning", "plan_review");
+    let result = db.advance_workflow_state(&loser, &loser_transition);
+    assert!(result.is_err(), "the second, now-stale transition must be rejected");
+
+    // The winner's write stands; there is exactly one history row, not two.
+    assert_eq!(db.get_workflow_task_state(&task.id).unwrap().unwrap().state, "plan_review");
+    let history = db.workflow_transition_history(&task.id).unwrap();
+    assert_eq!(history.len(), 1, "the rejected transition must not leave a duplicate history row");
+}
+
 #[test]
 #[cfg(feature = "test-mocks")]
 fn deleting_a_task_removes_its_workflow_evidence() {
