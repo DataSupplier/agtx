@@ -365,24 +365,37 @@ pub fn start_workflow_planning(
         };
         (agent, current.state.clone(), current.state_attempt, None)
     } else {
-        let ready = match prepare_transition(
-            workflow,
-            project_workflow,
-            &current,
-            "admission_complete",
-            GuardContext {
-                admission_recorded: true,
-                ..GuardContext::default()
-            },
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                return Ok(WorkflowStepOutcome::Blocked {
-                    message: format!("Cannot start planning: {error}"),
-                });
+        // `current.state` is normally `ready_for_planning` here: automation
+        // (or a prior manual `Shift+S`) has already driven `admission ->
+        // ready_for_planning` on its own via `complete_admission`. A task
+        // can still be found sitting in `admission` itself (automation
+        // disabled, or this call races a not-yet-run automation tick), so
+        // both starting points are handled by chaining only the transitions
+        // actually needed from wherever the task currently is — never
+        // assuming `admission` unconditionally.
+        let ready = if current.state == "admission" {
+            match prepare_transition(
+                workflow,
+                project_workflow,
+                &current,
+                "admission_complete",
+                GuardContext {
+                    admission_recorded: true,
+                    ..GuardContext::default()
+                },
+            ) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    return Ok(WorkflowStepOutcome::Blocked {
+                        message: format!("Cannot start planning: {error}"),
+                    });
+                }
             }
+        } else {
+            None
         };
-        let planning = match prepare_transition(workflow, project_workflow, &ready.state, "start_planning", GuardContext::default()) {
+        let before_planning = ready.as_ref().map(|ready| &ready.state).unwrap_or(&current);
+        let planning = match prepare_transition(workflow, project_workflow, before_planning, "start_planning", GuardContext::default()) {
             Ok(value) => value,
             Err(error) => {
                 return Ok(WorkflowStepOutcome::Blocked {
@@ -395,7 +408,12 @@ pub fn start_workflow_planning(
                 message: "Planning state has no bound agent".into(),
             });
         };
-        (agent, planning.state.state.clone(), planning.state.state_attempt, Some((ready, planning)))
+        let mut transitions = Vec::with_capacity(2);
+        if let Some(ready) = ready {
+            transitions.push(ready);
+        }
+        transitions.push(planning.clone());
+        (agent, planning.state.state.clone(), planning.state.state_attempt, Some(transitions))
     };
 
     let agent_ops = runtime.agent_registry.get(&planner);
@@ -424,9 +442,10 @@ pub fn start_workflow_planning(
         )?;
     }
 
-    if let Some((ready, planning)) = transitions {
-        db.advance_workflow_state(&ready.state, &ready.transition)?;
-        db.advance_workflow_state(&planning.state, &planning.transition)?;
+    if let Some(transitions) = transitions {
+        for prepared in &transitions {
+            db.advance_workflow_state(&prepared.state, &prepared.transition)?;
+        }
     }
     task.status = TaskStatus::Planning;
     task.agent = planner;

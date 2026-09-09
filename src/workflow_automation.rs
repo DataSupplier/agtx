@@ -255,8 +255,8 @@ mod tests {
             initial_state: "backlog".into(),
             states: vec![
                 WorkflowState { id: "backlog".into(), label: "Backlog".into(), role: None, terminal: false },
+                WorkflowState { id: "admission".into(), label: "Admission".into(), role: None, terminal: false },
                 WorkflowState { id: "ready_for_planning".into(), label: "Ready for planning".into(), role: None, terminal: false },
-                WorkflowState { id: "planning_setup".into(), label: "Planning setup".into(), role: None, terminal: false },
                 WorkflowState { id: "planning".into(), label: "Planning".into(), role: Some("planner".into()), terminal: false },
                 WorkflowState { id: "plan_review".into(), label: "Plan review".into(), role: None, terminal: false },
                 WorkflowState { id: "implementing".into(), label: "Implementing".into(), role: Some("implementer".into()), terminal: false },
@@ -266,16 +266,18 @@ mod tests {
                 WorkflowState { id: "done".into(), label: "Done".into(), role: None, terminal: true },
             ],
             transitions: vec![
-                // `admit_task` lands a freshly-admitted task directly in
-                // `ready_for_planning`. That state's only outgoing edge
-                // (`admission_complete`) is deliberately guardless, exactly
-                // like `start_planning` below it: both legs of the
-                // human-only `start_workflow_planning` handoff carry no
-                // automation signal, so `assess` reports `Wait` for either
-                // hop and this driver never fires them itself.
-                WorkflowTransition { action: "admit".into(), from: "backlog".into(), to: "ready_for_planning".into(), guards: vec![WorkflowGuard::DependenciesResolved] },
-                WorkflowTransition { action: "admission_complete".into(), from: "ready_for_planning".into(), to: "planning_setup".into(), guards: vec![] },
-                WorkflowTransition { action: "start_planning".into(), from: "planning_setup".into(), to: "planning".into(), guards: vec![] },
+                // `admit_task` lands a freshly-admitted task in `admission`
+                // (real worktree/branch, no artifact, no agent). One more
+                // guard-gated hop (`admission_complete`, mirroring the real
+                // `admission_recorded` guard) carries it on to
+                // `ready_for_planning`, automatically, since it too has no
+                // artifact and no launch. `start_planning` past that point is
+                // deliberately guardless: it is the human-only
+                // `start_workflow_planning` handoff, carries no automation
+                // signal, and this driver never fires it itself.
+                WorkflowTransition { action: "admit".into(), from: "backlog".into(), to: "admission".into(), guards: vec![WorkflowGuard::DependenciesResolved] },
+                WorkflowTransition { action: "admission_complete".into(), from: "admission".into(), to: "ready_for_planning".into(), guards: vec![WorkflowGuard::AdmissionRecorded] },
+                WorkflowTransition { action: "start_planning".into(), from: "ready_for_planning".into(), to: "planning".into(), guards: vec![] },
                 WorkflowTransition { action: "submit_plan".into(), from: "planning".into(), to: "plan_review".into(), guards: vec![] },
                 WorkflowTransition { action: "approve_plan".into(), from: "plan_review".into(), to: "implementing".into(), guards: vec![WorkflowGuard::ApprovedPlan] },
                 WorkflowTransition { action: "plan_changes_requested".into(), from: "plan_review".into(), to: "planning".into(), guards: vec![] },
@@ -443,8 +445,19 @@ mod tests {
             panic!("expected admission to advance, got {:?}", results[0].outcome);
         };
         // `admit_task` never touches `TaskStatus`; only the plugin workflow
-        // state (recorded in `workflow_task_states`, checked below) moves.
+        // state (recorded in `workflow_task_states`, checked below) moves --
+        // and only as far as `admission`. Reaching `ready_for_planning` is a
+        // second, separately-guarded hop (`admission_complete`), fired by a
+        // later tick once `admission_recorded` is true, not by this same one.
         assert_eq!(advanced.status, TaskStatus::Backlog);
+        let state = db.get_workflow_task_state(&task.id).unwrap().unwrap();
+        assert_eq!(state.state, "admission");
+
+        // One more tick carries it the rest of the way to `ready_for_planning`.
+        let next = run_automation_tick(&mut db, &graph, &project, &plugin, &runtime);
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].decision, AutomationDecision::Advance("admission_complete".to_string()));
+        assert!(matches!(next[0].outcome, Some(WorkflowStepOutcome::Advanced { .. })));
         let state = db.get_workflow_task_state(&task.id).unwrap().unwrap();
         assert_eq!(state.state, "ready_for_planning");
 
@@ -481,11 +494,11 @@ mod tests {
         let project_dir = tempfile::tempdir().unwrap();
         let runtime = runtime_with(&tmux_ops, &agent_registry, &git_ops, project_dir.path(), &config, &flags);
 
-        // `ready_for_planning`'s only outgoing edge (`admission_complete`)
-        // is guardless, exactly like `start_planning` past it -- both legs
-        // of the human-only handoff carry no automation signal, so `assess`
-        // reports `Wait` for 100 straight ticks; neither `TaskStatus` nor
-        // `state_attempt` ever move without the human call.
+        // `ready_for_planning`'s only outgoing edge (`start_planning`) is
+        // guardless -- it is the human-only handoff and carries no
+        // automation signal, so `assess` reports `Wait` for 100 straight
+        // ticks; neither `TaskStatus` nor `state_attempt` ever move without
+        // the human call.
         for _ in 0..100 {
             let results = run_automation_tick(&mut db, &graph, &project, &plugin_config, &runtime);
             assert_eq!(results.len(), 1);
