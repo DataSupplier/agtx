@@ -203,7 +203,11 @@ pub struct WorkflowTaskState {
 }
 
 impl WorkflowTaskState {
-    pub fn new(task_id: impl Into<String>, state: impl Into<String>, target_branch: impl Into<String>) -> Self {
+    pub fn new(
+        task_id: impl Into<String>,
+        state: impl Into<String>,
+        target_branch: impl Into<String>,
+    ) -> Self {
         Self {
             task_id: task_id.into(),
             state: state.into(),
@@ -252,6 +256,85 @@ impl WorkflowTransitionRecord {
             actor_agent: None,
             reason: None,
             created_at: Utc::now(),
+        }
+    }
+}
+
+/// Append-only operational evidence for one task workflow run. Unlike board
+/// state, these rows are intentionally retained after a task card is deleted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskExecutionEvent {
+    pub id: String,
+    pub task_id: String,
+    pub workflow_attempt: Option<i64>,
+    pub state: Option<String>,
+    pub event_type: String,
+    pub agent: Option<String>,
+    pub outcome: Option<String>,
+    pub message: Option<String>,
+    pub metadata_json: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl TaskExecutionEvent {
+    pub fn new(task_id: impl Into<String>, event_type: impl Into<String>) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            task_id: task_id.into(),
+            workflow_attempt: None,
+            state: None,
+            event_type: event_type.into(),
+            agent: None,
+            outcome: None,
+            message: None,
+            metadata_json: None,
+            created_at: Utc::now(),
+        }
+    }
+}
+
+/// Durable snapshot of the prompt and final evidence for one agent-owned
+/// workflow attempt. The report survives worktree cleanup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskStepReport {
+    pub id: String,
+    pub task_id: String,
+    pub workflow_attempt: i64,
+    pub state: String,
+    pub agent: Option<String>,
+    pub prompt_text: Option<String>,
+    pub prompt_sha256: Option<String>,
+    pub artifact_path: Option<String>,
+    pub artifact_sha256: Option<String>,
+    pub artifact_text: Option<String>,
+    pub pane_tail: Option<String>,
+    pub final_report: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl TaskStepReport {
+    pub fn new(
+        task_id: impl Into<String>,
+        workflow_attempt: i64,
+        state: impl Into<String>,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            task_id: task_id.into(),
+            workflow_attempt,
+            state: state.into(),
+            agent: None,
+            prompt_text: None,
+            prompt_sha256: None,
+            artifact_path: None,
+            artifact_sha256: None,
+            artifact_text: None,
+            pane_tail: None,
+            final_report: None,
+            created_at: now,
+            updated_at: now,
         }
     }
 }

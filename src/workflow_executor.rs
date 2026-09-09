@@ -14,7 +14,10 @@ use sha2::{Digest, Sha256};
 
 use crate::agent::AgentRegistry;
 use crate::config::{MergedConfig, WorkflowPlugin};
-use crate::db::{Database, Task, TaskStatus, WorkflowTaskState, WorkflowTransitionRecord};
+use crate::db::{
+    Database, Task, TaskExecutionEvent, TaskStatus, TaskStepReport, WorkflowTaskState,
+    WorkflowTransitionRecord,
+};
 use crate::git::GitOperations;
 use crate::tmux::TmuxOperations;
 use crate::tui::app::{
@@ -40,6 +43,94 @@ pub struct PreparedTransition {
     pub transition: WorkflowTransitionRecord,
     /// The agent bound to the role that owns the destination state, if any.
     pub destination_agent: Option<String>,
+}
+
+// The journal is intended for post-mortem analysis, not as an unbounded copy
+// of a terminal transcript. Keep enough context to explain the handoff while
+// preventing a noisy command or generated file from making the project DB
+// impractical to retain.
+const JOURNAL_TEXT_LIMIT: usize = 128 * 1024;
+const JOURNAL_PANE_LINE_LIMIT: usize = 200;
+
+fn bounded_journal_text(text: &str) -> String {
+    let mut chars = text.chars();
+    let mut bounded: String = chars.by_ref().take(JOURNAL_TEXT_LIMIT).collect();
+    if chars.next().is_some() {
+        bounded.push_str("\n\n[truncated by AGTX execution journal]");
+    }
+    bounded
+}
+
+/// Save exactly the prompt that was delivered to an agent for a particular
+/// state entry. This is intentionally separate from transitions: a launch
+/// may be retried without entering a different state, and both deliveries are
+/// useful in a later investigation.
+fn record_agent_prompt(
+    db: &Database,
+    task: &Task,
+    state: &str,
+    workflow_attempt: i64,
+    agent: &str,
+    prompt: &str,
+) -> Result<()> {
+    let mut report = TaskStepReport::new(&task.id, workflow_attempt, state);
+    report.agent = Some(agent.to_string());
+    report.prompt_sha256 = Some(format!("{:x}", Sha256::digest(prompt.as_bytes())));
+    report.prompt_text = Some(bounded_journal_text(prompt));
+    db.upsert_task_step_report(&report)?;
+
+    let mut event = TaskExecutionEvent::new(&task.id, "agent_prompt_delivered");
+    event.workflow_attempt = Some(workflow_attempt);
+    event.state = Some(state.to_string());
+    event.agent = Some(agent.to_string());
+    event.outcome = Some("started".to_string());
+    event.message = Some("Agent prompt delivered to the task session".to_string());
+    db.record_task_execution_event(&event)
+}
+
+/// Preserve the durable artifact, the agent's optional explicit final report,
+/// and a bounded tail of the pane before it is reused by the next role.
+fn record_step_evidence(
+    db: &Database,
+    task: &Task,
+    state: &WorkflowTaskState,
+    agent: &str,
+    artifact: &Path,
+    runtime: &WorkflowRuntime,
+) -> Result<()> {
+    let bytes = std::fs::read(artifact).map_err(|error| {
+        anyhow::anyhow!(
+            "Could not read workflow evidence '{}' for the execution journal: {error}",
+            artifact.display()
+        )
+    })?;
+    let artifact_text = String::from_utf8_lossy(&bytes);
+    let mut report = TaskStepReport::new(&task.id, state.state_attempt, &state.state);
+    report.agent = Some(agent.to_string());
+    report.artifact_path = Some(artifact.display().to_string());
+    report.artifact_sha256 = Some(format!("{:x}", Sha256::digest(&bytes)));
+    report.artifact_text = Some(bounded_journal_text(&artifact_text));
+    report.final_report = workflow_artifact_value(artifact, "final_report")
+        .ok()
+        .map(|value| bounded_journal_text(&value));
+    report.pane_tail = task
+        .session_name
+        .as_deref()
+        .and_then(|target| runtime.tmux_ops.capture_pane(target).ok())
+        .map(|pane| bounded_journal_text(&tail_lines(&pane, JOURNAL_PANE_LINE_LIMIT)))
+        .filter(|pane| !pane.trim().is_empty());
+    db.upsert_task_step_report(&report)?;
+
+    let mut event = TaskExecutionEvent::new(&task.id, "step_evidence_recorded");
+    event.workflow_attempt = Some(state.state_attempt);
+    event.state = Some(state.state.clone());
+    event.agent = Some(agent.to_string());
+    event.outcome = Some("completed".to_string());
+    event.message = Some(format!(
+        "Captured durable evidence from {}",
+        artifact.display()
+    ));
+    db.record_task_execution_event(&event)
 }
 
 /// Validate and prepare a transition for a task with existing workflow state.
@@ -480,6 +571,14 @@ pub fn start_workflow_planning(
             &agtx_task_env(&task.id, &worktree),
         )?;
     }
+    record_agent_prompt(
+        db,
+        &task,
+        &planning_state,
+        planning_attempt,
+        &planner,
+        &prompt,
+    )?;
 
     task.status = TaskStatus::Planning;
     task.agent = planner;
@@ -533,7 +632,7 @@ pub fn submit_workflow_plan(
             current.plan_revision
         );
     }
-    let mut evidenced = current;
+    let mut evidenced = current.clone();
     evidenced.plan_revision = revision;
     evidenced.plan_hash = Some(format!("{:x}", Sha256::digest(&contents)));
     let handoff = prepare_transition(
@@ -548,7 +647,7 @@ pub fn submit_workflow_plan(
         .clone()
         .ok_or_else(|| anyhow::anyhow!("Plan review state has no bound agent"))?;
     let prompt = format!(
-        "You are the plan reviewer for task {}. Review only {} (revision {}, SHA-256 {}). Do not implement code. Check it against the task, identify concrete changes if needed, then write .agent-flow/plan-review.yaml in this task worktree containing: verdict: approved or verdict: changes_requested (exactly one of these two strings), and findings: with your specific, concrete findings -- especially when requesting changes, since the planner will read this verbatim to revise the plan.\n\nCurrent workflow attempt: {n}. Your output artifact MUST contain the line: workflow_attempt: {n}",
+        "You are the plan reviewer for task {}. Review only {} (revision {}, SHA-256 {}). Do not implement code. Check it against the task, identify concrete changes if needed, then write .agent-flow/plan-review.yaml in this task worktree containing: verdict: approved or verdict: changes_requested (exactly one of these two strings), findings: with your specific, concrete findings -- especially when requesting changes, since the planner will read this verbatim to revise the plan -- and final_report: a concise reviewer handoff summary.\n\nCurrent workflow attempt: {n}. Your output artifact MUST contain the line: workflow_attempt: {n}",
         task.id,
         path.strip_prefix(&worktree).unwrap_or(&path).display(),
         revision,
@@ -571,11 +670,20 @@ pub fn submit_workflow_plan(
         policy.as_ref(),
         Some(Path::new(&worktree)),
     );
+    record_step_evidence(db, &task, &current, &task.agent, &path, runtime)?;
     switch_agent_in_tmux(
         runtime.tmux_ops.as_ref(),
         &target,
         &previous_agent,
         &command,
+    )?;
+    record_agent_prompt(
+        db,
+        &task,
+        &handoff.state.state,
+        handoff.state.state_attempt,
+        &reviewer,
+        &prompt,
     )?;
     db.advance_workflow_state(&handoff.state, &handoff.transition)?;
     task.status = TaskStatus::Review;
@@ -697,6 +805,14 @@ pub fn decide_workflow_plan(
                 &previous_agent,
                 &command,
             )?;
+            record_agent_prompt(
+                db,
+                &task,
+                &decision.state.state,
+                decision.state.state_attempt,
+                &task.agent,
+                &prompt,
+            )?;
         } else {
             return Ok(WorkflowStepOutcome::Blocked {
                 message: "Planning session is unavailable".into(),
@@ -753,6 +869,7 @@ pub fn submit_plan_review(
             artifact.display()
         ),
     };
+    record_step_evidence(db, &task, &current, &task.agent, &artifact, runtime)?;
     decide_workflow_plan(
         workflow,
         project_workflow,
@@ -846,6 +963,14 @@ pub fn start_workflow_implementation(
             &agtx_task_env(&task.id, &worktree),
         )?;
     }
+    record_agent_prompt(
+        db,
+        &task,
+        &implementation.state.state,
+        implementation.state.state_attempt,
+        &implementer,
+        &prompt,
+    )?;
     db.advance_workflow_state(&implementation.state, &implementation.transition)?;
     task.status = TaskStatus::Running;
     task.agent = implementer;
@@ -920,11 +1045,20 @@ pub fn submit_workflow_implementation(
         policy.as_ref(),
         Some(Path::new(&worktree)),
     );
+    record_step_evidence(db, &task, &current, &task.agent, &artifact, runtime)?;
     db.advance_workflow_state_chain(&[
         (&implemented.state, &implemented.transition),
         (&review.state, &review.transition),
     ])?;
     let _ = switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command);
+    record_agent_prompt(
+        db,
+        &task,
+        &review.state.state,
+        review.state.state_attempt,
+        &reviewer,
+        &prompt,
+    )?;
     task.status = TaskStatus::Review;
     task.agent = reviewer;
     task.updated_at = chrono::Utc::now();
@@ -1012,8 +1146,17 @@ pub fn submit_engineering_review(
         policy.as_ref(),
         Some(Path::new(&worktree)),
     );
+    record_step_evidence(db, &task, &current, &task.agent, &artifact, runtime)?;
     db.advance_workflow_state(&transition.state, &transition.transition)?;
     let _ = switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command);
+    record_agent_prompt(
+        db,
+        &task,
+        &transition.state.state,
+        transition.state.state_attempt,
+        &next_agent,
+        &prompt,
+    )?;
     task.status = status;
     task.agent = next_agent;
     task.updated_at = chrono::Utc::now();
@@ -1117,8 +1260,17 @@ pub fn submit_final_validation(
         );
         archive_workflow_artifact(&review_artifact, "superseded-after-validation-failure")?;
     }
+    record_step_evidence(db, &task, &current, &task.agent, &artifact, runtime)?;
     db.advance_workflow_state(&transition.state, &transition.transition)?;
     let _ = switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command);
+    record_agent_prompt(
+        db,
+        &task,
+        &transition.state.state,
+        transition.state.state_attempt,
+        &next_agent,
+        &prompt,
+    )?;
     task.status = TaskStatus::Review;
     task.agent = next_agent;
     task.updated_at = chrono::Utc::now();
@@ -1167,6 +1319,7 @@ pub fn complete_feature_integration(
             artifact.display()
         );
     }
+    record_step_evidence(db, &task, &current, &task.agent, &artifact, runtime)?;
     let policy = project_workflow
         .policy_for_state(workflow, &current.state)?
         .ok_or_else(|| anyhow::anyhow!("Integration state has no role policy"))?;

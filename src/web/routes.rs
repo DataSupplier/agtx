@@ -17,7 +17,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::core::actions::{allowed_actions, CallerKind};
-use crate::db::{Database, PhaseStatus, Task};
+use crate::db::{Database, PhaseStatus, Task, TaskExecutionEvent, TaskStepReport};
 
 use super::state::{ApiError, ApiResult, ConflictState, ServeMode, ServerState};
 
@@ -60,6 +60,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/projects", get(projects))
         .route("/api/projects/{pid}/tasks", get(tasks))
         .route("/api/projects/{pid}/tasks/{tid}", get(task_detail))
+        .route("/api/projects/{pid}/tasks/{tid}/journal", get(task_journal))
         .route("/api/projects/{pid}/tasks/{tid}/diff", get(task_diff))
         .route("/api/projects/{pid}/tasks/{tid}/pane", get(task_pane))
         // Writes. None of these execute anything: an action becomes a queued
@@ -607,6 +608,37 @@ async fn task_detail(
             .to_string()
         }),
         blocked_reason: hook.and_then(|h| h.message),
+    }))
+}
+
+// ── /api/projects/:pid/tasks/:tid/journal ──────────────────────────────
+
+/// The retained evidence trail deliberately does not require a live task
+/// card. A completed task can be removed from the board and its worktree
+/// reclaimed without losing the prompts, artifacts, final reports, or
+/// transition chronology needed for a later post-mortem.
+#[derive(Serialize)]
+struct TaskJournal {
+    task_id: String,
+    events: Vec<TaskExecutionEvent>,
+    reports: Vec<TaskStepReport>,
+}
+
+async fn task_journal(
+    State(state): State<Arc<ServerState>>,
+    Path((pid, tid)): Path<(String, String)>,
+) -> ApiResult<Json<TaskJournal>> {
+    let db = state.project_db(&pid)?;
+    let events = db
+        .task_execution_events(&tid)
+        .map_err(|e| ApiError::Internal(format!("loading task execution journal: {e}")))?;
+    let reports = db
+        .task_step_reports(&tid)
+        .map_err(|e| ApiError::Internal(format!("loading task execution journal: {e}")))?;
+    Ok(Json(TaskJournal {
+        task_id: tid,
+        events,
+        reports,
     }))
 }
 

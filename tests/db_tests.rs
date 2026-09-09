@@ -1,6 +1,7 @@
 use agtx::db::{
     Database, DependencyState, Notification, NotificationKind, PhaseStatus, Project, Task,
-    TaskRuntime, TaskStatus, TransitionRequest, WorkflowTaskState, WorkflowTransitionRecord,
+    TaskExecutionEvent, TaskRuntime, TaskStatus, TaskStepReport, TransitionRequest,
+    WorkflowTaskState, WorkflowTransitionRecord,
 };
 
 // === TaskStatus Tests ===
@@ -910,12 +911,19 @@ fn admission_persists_task_and_evidence_together() {
     let mut state = WorkflowTaskState::new(&task.id, "admission", "feature/poc");
     state.base_sha = Some("abc123".into());
     let transition = WorkflowTransitionRecord::new(&task.id, "admit", "backlog", "admission");
-    db.record_workflow_admission(&task, &state, &transition).unwrap();
+    db.record_workflow_admission(&task, &state, &transition)
+        .unwrap();
 
     let stored_task = db.get_task(&task.id).unwrap().unwrap();
     assert_eq!(stored_task.worktree_path, task.worktree_path);
     assert_eq!(stored_task.branch_name, task.branch_name);
-    assert_eq!(db.get_workflow_task_state(&task.id).unwrap().unwrap().base_sha, state.base_sha);
+    assert_eq!(
+        db.get_workflow_task_state(&task.id)
+            .unwrap()
+            .unwrap()
+            .base_sha,
+        state.base_sha
+    );
     assert_eq!(db.workflow_transition_history(&task.id).unwrap().len(), 1);
 }
 
@@ -938,8 +946,14 @@ fn transition_advancement_updates_state_and_history_together() {
     );
     db.advance_workflow_state(&next, &transition).unwrap();
 
-    assert_eq!(db.get_workflow_task_state(&task.id).unwrap().unwrap().state, "ready_for_planning");
-    assert_eq!(db.workflow_transition_history(&task.id).unwrap()[0].action, "admission_complete");
+    assert_eq!(
+        db.get_workflow_task_state(&task.id).unwrap().unwrap().state,
+        "ready_for_planning"
+    );
+    assert_eq!(
+        db.workflow_transition_history(&task.id).unwrap()[0].action,
+        "admission_complete"
+    );
 }
 
 /// Two racing callers (e.g. a queued MCP transition request and an
@@ -963,19 +977,32 @@ fn advance_workflow_state_rejects_a_transition_from_a_stale_snapshot() {
     // caller that validated against the same stale "planning" state.
     let mut winner = state.clone();
     winner.state = "plan_review".into();
-    let winner_transition = WorkflowTransitionRecord::new(&task.id, "submit_plan", "planning", "plan_review");
-    db.advance_workflow_state(&winner, &winner_transition).unwrap();
+    let winner_transition =
+        WorkflowTransitionRecord::new(&task.id, "submit_plan", "planning", "plan_review");
+    db.advance_workflow_state(&winner, &winner_transition)
+        .unwrap();
 
     let mut loser = state.clone();
     loser.state = "plan_review".into();
-    let loser_transition = WorkflowTransitionRecord::new(&task.id, "submit_plan", "planning", "plan_review");
+    let loser_transition =
+        WorkflowTransitionRecord::new(&task.id, "submit_plan", "planning", "plan_review");
     let result = db.advance_workflow_state(&loser, &loser_transition);
-    assert!(result.is_err(), "the second, now-stale transition must be rejected");
+    assert!(
+        result.is_err(),
+        "the second, now-stale transition must be rejected"
+    );
 
     // The winner's write stands; there is exactly one history row, not two.
-    assert_eq!(db.get_workflow_task_state(&task.id).unwrap().unwrap().state, "plan_review");
+    assert_eq!(
+        db.get_workflow_task_state(&task.id).unwrap().unwrap().state,
+        "plan_review"
+    );
     let history = db.workflow_transition_history(&task.id).unwrap();
-    assert_eq!(history.len(), 1, "the rejected transition must not leave a duplicate history row");
+    assert_eq!(
+        history.len(),
+        1,
+        "the rejected transition must not leave a duplicate history row"
+    );
 }
 
 /// `advance_workflow_state_chain` commits every step of a multi-hop
@@ -1015,7 +1042,10 @@ fn advance_workflow_state_chain_commits_every_step_together() {
     ])
     .unwrap();
 
-    assert_eq!(db.get_workflow_task_state(&task.id).unwrap().unwrap().state, "engineering_review");
+    assert_eq!(
+        db.get_workflow_task_state(&task.id).unwrap().unwrap().state,
+        "engineering_review"
+    );
     let history = db.workflow_transition_history(&task.id).unwrap();
     assert_eq!(history.len(), 2);
     assert_eq!(history[0].action, "implementation_complete");
@@ -1066,7 +1096,10 @@ fn advance_workflow_state_chain_rolls_back_every_step_if_one_fails() {
 
     // The first step's write must not have stuck around: the row is still at
     // its pre-chain state, and no history rows were left behind.
-    assert_eq!(db.get_workflow_task_state(&task.id).unwrap().unwrap().state, "running");
+    assert_eq!(
+        db.get_workflow_task_state(&task.id).unwrap().unwrap().state,
+        "running"
+    );
     assert_eq!(db.workflow_transition_history(&task.id).unwrap().len(), 0);
 }
 
@@ -1076,12 +1109,8 @@ fn deleting_a_task_removes_its_workflow_evidence() {
     let db = Database::open_in_memory_project().unwrap();
     let task = Task::new("F3.3", "claude", "heaves");
     db.create_task(&task).unwrap();
-    db.upsert_workflow_task_state(&WorkflowTaskState::new(
-        &task.id,
-        "backlog",
-        "feature/poc",
-    ))
-    .unwrap();
+    db.upsert_workflow_task_state(&WorkflowTaskState::new(&task.id, "backlog", "feature/poc"))
+        .unwrap();
     db.record_workflow_transition(&WorkflowTransitionRecord::new(
         &task.id,
         "admit",
@@ -1093,6 +1122,64 @@ fn deleting_a_task_removes_its_workflow_evidence() {
     db.delete_task(&task.id).unwrap();
     assert!(db.get_workflow_task_state(&task.id).unwrap().is_none());
     assert!(db.workflow_transition_history(&task.id).unwrap().is_empty());
+    let events = db.task_execution_events(&task.id).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type, "task_deleted");
+    assert_eq!(events[0].outcome.as_deref(), Some("interrupted"));
+}
+
+#[test]
+#[cfg(feature = "test-mocks")]
+fn execution_journal_retains_prompt_and_evidence_after_task_cleanup() {
+    let db = Database::open_in_memory_project().unwrap();
+    let task = Task::new("F4.1", "claude", "heaves");
+    db.create_task(&task).unwrap();
+
+    let mut prompt = TaskStepReport::new(&task.id, 22, "plan_review");
+    prompt.agent = Some("codex".into());
+    prompt.prompt_text = Some("Review the plan.".into());
+    prompt.prompt_sha256 = Some("prompt-sha".into());
+    db.upsert_task_step_report(&prompt).unwrap();
+
+    let mut evidence = TaskStepReport::new(&task.id, 22, "plan_review");
+    evidence.artifact_path = Some(".agent-flow/plan-review.yaml".into());
+    evidence.artifact_text = Some("verdict: approved".into());
+    evidence.artifact_sha256 = Some("artifact-sha".into());
+    evidence.final_report = Some("Plan is approved.".into());
+    evidence.pane_tail = Some("final reviewer summary".into());
+    db.upsert_task_step_report(&evidence).unwrap();
+
+    let mut event = TaskExecutionEvent::new(&task.id, "agent_prompt_delivered");
+    event.workflow_attempt = Some(22);
+    event.state = Some("plan_review".into());
+    event.agent = Some("codex".into());
+    db.record_task_execution_event(&event).unwrap();
+
+    db.delete_task(&task.id).unwrap();
+
+    let reports = db.task_step_reports(&task.id).unwrap();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].prompt_text.as_deref(), Some("Review the plan."));
+    assert_eq!(
+        reports[0].artifact_text.as_deref(),
+        Some("verdict: approved")
+    );
+    assert_eq!(
+        reports[0].final_report.as_deref(),
+        Some("Plan is approved.")
+    );
+    assert_eq!(
+        reports[0].pane_tail.as_deref(),
+        Some("final reviewer summary")
+    );
+    let events = db.task_execution_events(&task.id).unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(events
+        .iter()
+        .any(|event| event.event_type == "agent_prompt_delivered"));
+    assert!(events.iter().any(|event| {
+        event.event_type == "task_deleted" && event.outcome.as_deref() == Some("interrupted")
+    }));
 }
 
 // === Dependency State Tests ===

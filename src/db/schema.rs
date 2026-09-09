@@ -4,7 +4,8 @@ use std::path::Path;
 
 use super::models::{
     DependencyState, MobileDevice, Notification, NotificationKind, PhaseStatus, Project, Task,
-    TaskRuntime, TaskStatus, TransitionRequest, WorkflowTaskState, WorkflowTransitionRecord,
+    TaskExecutionEvent, TaskRuntime, TaskStatus, TaskStepReport, TransitionRequest,
+    WorkflowTaskState, WorkflowTransitionRecord,
 };
 
 /// Database wrapper for SQLite operations
@@ -51,9 +52,7 @@ impl Database {
         // Migration: if the new-hash DB doesn't exist, check for an old-hash DB and rename it
         if !db_path.exists() {
             let old_hash = Self::hash_path_legacy(&path_str);
-            let old_db_path = config_dir
-                .join("projects")
-                .join(format!("{}.db", old_hash));
+            let old_db_path = config_dir.join("projects").join(format!("{}.db", old_hash));
             if old_db_path.exists() {
                 let _ = std::fs::rename(&old_db_path, &db_path);
             }
@@ -206,6 +205,41 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_workflow_history_task
                 ON workflow_transition_history(task_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS task_execution_events (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                workflow_attempt INTEGER,
+                state TEXT,
+                event_type TEXT NOT NULL,
+                agent TEXT,
+                outcome TEXT,
+                message TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_task_execution_events_task
+                ON task_execution_events(task_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS task_step_reports (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                workflow_attempt INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                agent TEXT,
+                prompt_text TEXT,
+                prompt_sha256 TEXT,
+                artifact_path TEXT,
+                artifact_sha256 TEXT,
+                artifact_text TEXT,
+                pane_tail TEXT,
+                final_report TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(task_id, workflow_attempt, state)
+            );
+            CREATE INDEX IF NOT EXISTS idx_task_step_reports_task
+                ON task_step_reports(task_id, created_at);
             "#,
         )?;
 
@@ -491,6 +525,29 @@ impl Database {
     }
 
     pub fn delete_task(&self, task_id: &str) -> Result<()> {
+        // A deletion can be normal cleanup after a completed workflow or an
+        // operator interruption of a live task. Preserve that distinction in
+        // the journal before removing the board-owned rows and worktree.
+        if let Some(task) = self.get_task(task_id)? {
+            let workflow = self.get_workflow_task_state(task_id)?;
+            let mut event = TaskExecutionEvent::new(task_id, "task_deleted");
+            event.workflow_attempt = workflow.as_ref().map(|state| state.state_attempt);
+            event.state = workflow.as_ref().map(|state| state.state.clone());
+            event.agent = Some(task.agent.clone());
+            event.outcome = Some(
+                if task.status == TaskStatus::Done {
+                    "completed"
+                } else {
+                    "interrupted"
+                }
+                .to_string(),
+            );
+            event.message = Some(format!(
+                "Task deleted while board status was {}",
+                task.status.as_str()
+            ));
+            self.record_task_execution_event(&event)?;
+        }
         self.conn.execute(
             "DELETE FROM workflow_transition_history WHERE task_id = ?1",
             params![task_id],
@@ -601,6 +658,123 @@ impl Database {
         Ok(())
     }
 
+    /// Append an operational event without changing board or workflow state.
+    /// Journal rows deliberately have no foreign key to `tasks`: they remain
+    /// available for post-mortem analysis after a completed task is cleaned up.
+    pub fn record_task_execution_event(&self, event: &TaskExecutionEvent) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO task_execution_events (
+                id, task_id, workflow_attempt, state, event_type, agent,
+                outcome, message, metadata_json, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
+            params![
+                event.id,
+                event.task_id,
+                event.workflow_attempt,
+                event.state,
+                event.event_type,
+                event.agent,
+                event.outcome,
+                event.message,
+                event.metadata_json,
+                event.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Upsert one prompt/evidence snapshot for a state attempt. Callers may
+    /// first persist the prompt and later add the artifact and final report.
+    pub fn upsert_task_step_report(&self, report: &TaskStepReport) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO task_step_reports (
+                id, task_id, workflow_attempt, state, agent, prompt_text,
+                prompt_sha256, artifact_path, artifact_sha256, artifact_text,
+                pane_tail, final_report, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            ON CONFLICT(task_id, workflow_attempt, state) DO UPDATE SET
+                agent = COALESCE(excluded.agent, task_step_reports.agent),
+                prompt_text = COALESCE(excluded.prompt_text, task_step_reports.prompt_text),
+                prompt_sha256 = COALESCE(excluded.prompt_sha256, task_step_reports.prompt_sha256),
+                artifact_path = COALESCE(excluded.artifact_path, task_step_reports.artifact_path),
+                artifact_sha256 = COALESCE(excluded.artifact_sha256, task_step_reports.artifact_sha256),
+                artifact_text = COALESCE(excluded.artifact_text, task_step_reports.artifact_text),
+                pane_tail = COALESCE(excluded.pane_tail, task_step_reports.pane_tail),
+                final_report = COALESCE(excluded.final_report, task_step_reports.final_report),
+                updated_at = excluded.updated_at"#,
+            params![
+                report.id, report.task_id, report.workflow_attempt, report.state,
+                report.agent, report.prompt_text, report.prompt_sha256,
+                report.artifact_path, report.artifact_sha256, report.artifact_text,
+                report.pane_tail, report.final_report, report.created_at.to_rfc3339(),
+                report.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Read the retained execution journal for a task, including tasks whose
+    /// board card and worktree have since been cleaned up.
+    pub fn task_execution_events(&self, task_id: &str) -> Result<Vec<TaskExecutionEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM task_execution_events WHERE task_id = ?1 ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map(params![task_id], |row| {
+            Ok(TaskExecutionEvent {
+                id: row.get("id")?,
+                task_id: row.get("task_id")?,
+                workflow_attempt: row.get("workflow_attempt")?,
+                state: row.get("state")?,
+                event_type: row.get("event_type")?,
+                agent: row.get("agent")?,
+                outcome: row.get("outcome")?,
+                message: row.get("message")?,
+                metadata_json: row.get("metadata_json")?,
+                created_at: chrono::DateTime::parse_from_rfc3339(
+                    &row.get::<_, String>("created_at")?,
+                )
+                .map(|value| value.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now()),
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Read the per-state prompt and result snapshots retained for a task.
+    pub fn task_step_reports(&self, task_id: &str) -> Result<Vec<TaskStepReport>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM task_step_reports WHERE task_id = ?1 ORDER BY workflow_attempt, state",
+        )?;
+        let rows = stmt.query_map(params![task_id], |row| {
+            let timestamp = |column: &str| -> rusqlite::Result<chrono::DateTime<chrono::Utc>> {
+                Ok(
+                    chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(column)?)
+                        .map(|value| value.with_timezone(&chrono::Utc))
+                        .unwrap_or_else(|_| chrono::Utc::now()),
+                )
+            };
+            Ok(TaskStepReport {
+                id: row.get("id")?,
+                task_id: row.get("task_id")?,
+                workflow_attempt: row.get("workflow_attempt")?,
+                state: row.get("state")?,
+                agent: row.get("agent")?,
+                prompt_text: row.get("prompt_text")?,
+                prompt_sha256: row.get("prompt_sha256")?,
+                artifact_path: row.get("artifact_path")?,
+                artifact_sha256: row.get("artifact_sha256")?,
+                artifact_text: row.get("artifact_text")?,
+                pane_tail: row.get("pane_tail")?,
+                final_report: row.get("final_report")?,
+                created_at: timestamp("created_at")?,
+                updated_at: timestamp("updated_at")?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     /// Persist the worktree created during admission together with its frozen
     /// base commit and audit record.  A task must never point at a worktree
     /// while lacking the evidence that explains what it was based on.
@@ -651,9 +825,39 @@ impl Database {
                 reason, created_at
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
             params![
-                record.id, record.task_id, record.action, record.from_state, record.to_state,
-                record.actor_role, record.actor_agent, record.reason,
+                record.id,
+                record.task_id,
+                record.action,
+                record.from_state,
+                record.to_state,
+                record.actor_role,
+                record.actor_agent,
+                record.reason,
                 record.created_at.to_rfc3339(),
+            ],
+        )?;
+        let mut event = TaskExecutionEvent::new(&record.task_id, "workflow_transition");
+        event.workflow_attempt = Some(state.state_attempt);
+        event.state = Some(state.state.clone());
+        event.agent = record.actor_agent.clone();
+        event.outcome = Some("succeeded".to_string());
+        event.message = Some(record.action.clone());
+        tx.execute(
+            r#"INSERT INTO task_execution_events (
+                id, task_id, workflow_attempt, state, event_type, agent,
+                outcome, message, metadata_json, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
+            params![
+                event.id,
+                event.task_id,
+                event.workflow_attempt,
+                event.state,
+                event.event_type,
+                event.agent,
+                event.outcome,
+                event.message,
+                event.metadata_json,
+                event.created_at.to_rfc3339(),
             ],
         )?;
         tx.commit()?;
@@ -762,11 +966,18 @@ impl Database {
             WHERE task_id = ?1 AND state = ?13
             "#,
             params![
-                state.task_id, state.state, state.state_attempt, state.target_branch, state.base_sha,
-                state.plan_revision, state.plan_hash, state.approved_plan_revision,
+                state.task_id,
+                state.state,
+                state.state_attempt,
+                state.target_branch,
+                state.base_sha,
+                state.plan_revision,
+                state.plan_hash,
+                state.approved_plan_revision,
                 state.approved_plan_hash,
                 state.validation_passed_at.map(|value| value.to_rfc3339()),
-                state.integration_sha, state.updated_at.to_rfc3339(),
+                state.integration_sha,
+                state.updated_at.to_rfc3339(),
                 record.from_state,
             ],
         )?;
@@ -782,9 +993,39 @@ impl Database {
                 reason, created_at
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
             params![
-                record.id, record.task_id, record.action, record.from_state, record.to_state,
-                record.actor_role, record.actor_agent, record.reason,
+                record.id,
+                record.task_id,
+                record.action,
+                record.from_state,
+                record.to_state,
+                record.actor_role,
+                record.actor_agent,
+                record.reason,
                 record.created_at.to_rfc3339(),
+            ],
+        )?;
+        let mut event = TaskExecutionEvent::new(&record.task_id, "workflow_transition");
+        event.workflow_attempt = Some(state.state_attempt);
+        event.state = Some(state.state.clone());
+        event.agent = record.actor_agent.clone();
+        event.outcome = Some("succeeded".to_string());
+        event.message = Some(record.action.clone());
+        tx.execute(
+            r#"INSERT INTO task_execution_events (
+                id, task_id, workflow_attempt, state, event_type, agent,
+                outcome, message, metadata_json, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
+            params![
+                event.id,
+                event.task_id,
+                event.workflow_attempt,
+                event.state,
+                event.event_type,
+                event.agent,
+                event.outcome,
+                event.message,
+                event.metadata_json,
+                event.created_at.to_rfc3339(),
             ],
         )?;
         Ok(())
@@ -798,9 +1039,10 @@ impl Database {
             "SELECT * FROM workflow_transition_history WHERE task_id = ?1 ORDER BY created_at",
         )?;
         let rows = stmt.query_map(params![task_id], |row| {
-            let created_at = chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>("created_at")?)
-                .map(|value| value.with_timezone(&chrono::Utc))
-                .unwrap_or_else(|_| chrono::Utc::now());
+            let created_at =
+                chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>("created_at")?)
+                    .map(|value| value.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| chrono::Utc::now());
             Ok(WorkflowTransitionRecord {
                 id: row.get("id")?,
                 task_id: row.get("task_id")?,
