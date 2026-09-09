@@ -606,8 +606,27 @@ pub fn decide_workflow_plan(
     db.update_task(&task)?;
     if !approve {
         if let Some(target) = task.session_name.clone() {
+            // `plan_review` has no persisted verdict artifact (unlike
+            // engineering/final review), so the reviewer's actual reasoning
+            // for requesting changes only ever exists in its own tmux pane.
+            // Capture it now, before the window below gets reused for the
+            // planner (which sends codex its exit sequence and starts claude
+            // in its place) -- otherwise the planner is told only "changes
+            // were requested," with zero information about what to change.
+            let review_feedback = runtime
+                .tmux_ops
+                .capture_pane(&target)
+                .ok()
+                .map(|pane| tail_lines(&pane, 80))
+                .filter(|text| !text.trim().is_empty());
+            let feedback_section = match &review_feedback {
+                Some(text) => format!(
+                    "\n\nThe plan reviewer's pane, captured at the moment changes were requested (visible screen only, may be truncated; read further review context from the session transcript if this is not enough):\n---\n{text}\n---"
+                ),
+                None => String::new(),
+            };
             let prompt = format!(
-                "Plan review requested changes for task {}. Revise .agtx/plans/{}.md, increment plan_revision above {}, and do not implement code. When complete, save the artifact for another Shift+V submission.\n\nCurrent workflow attempt: {n}. Your output artifact MUST contain the line: workflow_attempt: {n}",
+                "Plan review requested changes for task {}. Revise .agtx/plans/{}.md, increment plan_revision above {}, and do not implement code.{feedback_section}\n\nWhen complete, save the artifact for another Shift+V submission.\n\nCurrent workflow attempt: {n}. Your output artifact MUST contain the line: workflow_attempt: {n}",
                 task.id, task.id, current.plan_revision, n = decision.state.state_attempt
             );
             spawn_send_to_agent(
@@ -1104,6 +1123,17 @@ pub fn guard_context_for(db: &Database, task: &Task, state: &WorkflowTaskState) 
         clean_worktree: false,
         integrated_into_target: false,
     }
+}
+
+/// The last `max_lines` lines of `text`, trimmed. Used to bound a captured
+/// tmux pane to a reasonable prompt size while keeping whatever was printed
+/// most recently -- typically where a reviewer's final verdict/reasoning
+/// lands, even on a tall or scrolled-back pane.
+fn tail_lines(text: &str, max_lines: usize) -> String {
+    let trimmed = text.trim_end();
+    let lines: Vec<&str> = trimmed.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
 }
 
 /// Read `workflow_attempt` from a workflow evidence file the same way
