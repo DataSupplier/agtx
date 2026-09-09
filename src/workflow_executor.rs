@@ -61,6 +61,40 @@ fn bounded_journal_text(text: &str) -> String {
     bounded
 }
 
+/// Read a simple top-level workflow-artifact field from immutable bytes.
+///
+/// This mirrors the deliberately small parser used for live workflow files,
+/// but ensures a later prompt is derived from the exact stored snapshot rather
+/// than whatever happens to be in the worktree now.
+fn workflow_artifact_content_value(content: &[u8], field: &str) -> Result<String> {
+    let content = std::str::from_utf8(content)
+        .map_err(|error| anyhow::anyhow!("workflow artifact is not UTF-8: {error}"))?;
+    let prefix = format!("{field}:");
+    let lines: Vec<_> = content.lines().collect();
+    let Some((index, value)) = lines.iter().enumerate().find_map(|(index, line)| {
+        line.trim()
+            .strip_prefix(&prefix)
+            .map(|value| (index, value.trim()))
+    }) else {
+        anyhow::bail!("workflow artifact needs a non-empty {field}: value");
+    };
+    let value = if matches!(value, ">" | ">-" | ">+" | "|" | "|-" | "|+") {
+        lines[index + 1..]
+            .iter()
+            .take_while(|line| {
+                line.trim().is_empty() || line.starts_with(' ') || line.starts_with('\t')
+            })
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        value.trim_matches(['\'', '"']).to_string()
+    };
+    (!value.is_empty())
+        .then_some(value)
+        .ok_or_else(|| anyhow::anyhow!("workflow artifact needs a non-empty {field}: value"))
+}
 /// Save exactly the prompt that was delivered to an agent for a particular
 /// state entry. This is intentionally separate from transitions: a launch
 /// may be retried without entering a different state, and both deliveries are
@@ -786,11 +820,12 @@ pub fn submit_workflow_plan(
         .clone()
         .ok_or_else(|| anyhow::anyhow!("Plan review state has no bound agent"))?;
     let prompt = format!(
-        "You are the plan reviewer for task {}. Review only {} (revision {}, SHA-256 {}). Do not implement code. Check it against the task, identify concrete changes if needed, then write .agent-flow/plan-review.yaml in this task worktree containing: verdict: approved or verdict: changes_requested (exactly one of these two strings), findings: with your specific, concrete findings -- especially when requesting changes, since the planner will read this verbatim to revise the plan -- and final_report: a concise reviewer handoff summary.\n\nCurrent workflow attempt: {n}. Your output artifact MUST contain the line: workflow_attempt: {n}",
+        "You are the plan reviewer for task {}. Review only {} (revision {}, SHA-256 {}). Do not implement code. This plan was produced during planning attempt {producer_attempt}; its embedded workflow_attempt must remain that producer attempt. Do not request changes solely because it differs from your review attempt. Check it against the task, identify concrete changes if needed, then write .agent-flow/plan-review.yaml in this task worktree containing: verdict: approved or verdict: changes_requested (exactly one of these two strings), findings: with your specific, concrete findings -- especially when requesting changes, since the planner will receive this exact persisted artifact to revise the plan -- and final_report: a concise reviewer handoff summary.\n\nCurrent review workflow attempt: {n}. Your output artifact MUST contain the line: workflow_attempt: {n}",
         task.id,
         path.strip_prefix(&worktree).unwrap_or(&path).display(),
         revision,
         evidenced.plan_hash.as_deref().unwrap_or_default(),
+        producer_attempt = current.state_attempt,
         n = handoff.state.state_attempt,
     );
     let target = task
@@ -888,84 +923,79 @@ pub fn decide_workflow_plan(
     task.agent = decision.destination_agent.clone().unwrap_or(task.agent);
     task.updated_at = chrono::Utc::now();
     if !approve {
-        if let Some(target) = task.session_name.clone() {
-            // Prefer the plan reviewer's durable `.agent-flow/plan-review.yaml`
-            // `findings:` field -- written by the artifact-driven path
-            // (`submit_plan_review`) -- as the source of the revise prompt's
-            // feedback: it is evidence the reviewer deliberately wrote down,
-            // not ephemeral scrollback. Only when that artifact/field is
-            // absent or empty (e.g. a human rejected via Shift+N before this
-            // artifact existed, or an older project without it) do we fall
-            // back to capturing the reviewer's tmux pane. Capture happens
-            // now, before the window below gets reused for the planner
-            // (which sends codex its exit sequence and starts claude in its
-            // place) -- otherwise the planner is told only "changes were
-            // requested," with zero information about what to change.
-            let artifact_findings = task.worktree_path.as_deref().and_then(|worktree| {
-                let artifact = workflow_artifact_path(
-                    worktree,
-                    plugin.artifacts.plan_review.as_deref(),
-                    &task.id,
-                    ".agent-flow/plan-review.yaml",
-                );
-                workflow_artifact_value(&artifact, "findings").ok()
+        let Some(worktree) = task.worktree_path.as_deref() else {
+            return Ok(WorkflowStepOutcome::Blocked {
+                message: "Plan revision requires an admitted worktree".into(),
             });
-            let feedback_section = if let Some(findings) = artifact_findings {
-                let findings: String = findings.chars().take(12 * 1024).collect();
-                format!("\n\nThe plan reviewer's recorded findings:\n---\n{findings}\n---")
-            } else {
-                let review_feedback = runtime
-                    .tmux_ops
-                    .capture_pane(&target)
-                    .ok()
-                    .map(|pane| {
-                        tail_lines(&pane, 80)
-                            .chars()
-                            .take(12 * 1024)
-                            .collect::<String>()
-                    })
-                    .filter(|text| !text.trim().is_empty());
-                match &review_feedback {
-                    Some(text) => format!(
-                        "\n\nThe plan reviewer's pane, captured at the moment changes were requested (visible screen only, may be truncated; read further review context from the session transcript if this is not enough):\n---\n{text}\n---"
-                    ),
-                    None => String::new(),
-                }
-            };
-            let prompt = format!(
-                "Plan review requested changes for task {}. Revise .agtx/plans/{}.md, increment plan_revision above {}, and do not implement code.{feedback_section}\n\nWhen complete, save the artifact for another Shift+V submission.\n\nCurrent workflow attempt: {n}. Your output artifact MUST contain the line: workflow_attempt: {n}",
-                task.id, task.id, current.plan_revision, n = decision.state.state_attempt
-            );
-            // Replanning owns the same pane as the reviewer. Keep this
-            // acknowledged and synchronous so automation cannot submit a
-            // newly-written plan while this switch is still in flight.
-            let policy = project_workflow.policy_for_state(workflow, &decision.state.state)?;
-            let command = build_policy_agent_command(
-                runtime.agent_registry.get(&task.agent).as_ref(),
-                &task.agent,
-                &prompt,
-                policy.as_ref(),
-                task.worktree_path.as_deref().map(Path::new),
-            );
-            switch_agent_in_tmux(
-                runtime.tmux_ops.as_ref(),
-                &target,
-                &previous_agent,
-                &command,
-            )?;
-            record_agent_prompt(
-                db,
-                &task,
-                &decision.state.state,
-                decision.state.state_attempt,
-                &task.agent,
-                &prompt,
-            )?;
-        } else {
+        };
+        let review_path = workflow_artifact_path(
+            worktree,
+            plugin.artifacts.plan_review.as_deref(),
+            &task.id,
+            ".agent-flow/plan-review.yaml",
+        );
+        if !review_path.is_file() {
+            return Ok(WorkflowStepOutcome::Blocked {
+                message: "Plan changes require a persisted plan-review artifact; write the review before returning to Planning".into(),
+            });
+        }
+        let review_evidence =
+            record_step_evidence(db, &task, &current, &previous_agent, &review_path, runtime)?;
+        let findings = match workflow_artifact_content_value(&review_evidence.content, "findings") {
+            Ok(findings) => findings,
+            Err(_) => {
+                return Ok(WorkflowStepOutcome::Blocked {
+                    message: "Plan changes require non-empty findings in the persisted plan-review artifact".into(),
+                });
+            }
+        };
+        db.bind_workflow_step_input(&WorkflowStepInput {
+            task_id: task.id.clone(),
+            workflow_attempt: decision.state.state_attempt,
+            state: decision.state.state.clone(),
+            name: "plan_review".to_string(),
+            artifact_id: review_evidence.id.clone(),
+            expected_sha256: review_evidence.sha256.clone(),
+            created_at: chrono::Utc::now(),
+        })?;
+        // Verify the exact review snapshot is present before the planner sees
+        // its prompt. A conflicting mutable file is a recoverable error, not
+        // an invitation to revise against an unverified review.
+        restore_workflow_step_inputs(db, &task, &decision.state)?;
+
+        let Some(target) = task.session_name.clone() else {
             return Ok(WorkflowStepOutcome::Blocked {
                 message: "Planning session is unavailable".into(),
             });
-        }
+        };
+        let findings: String = findings.chars().take(12 * 1024).collect();
+        let prompt = format!(
+            "Plan review requested changes for task {}. Revise .agtx/plans/{}.md, increment plan_revision above {}, and do not implement code. The exact review input is artifact {} with SHA-256 {}; its recorded findings follow:\n---\n{}\n---\n\nWhen complete, save the artifact for another Shift+V submission.\n\nCurrent planning workflow attempt: {n}. Your output artifact MUST contain the line: workflow_attempt: {n}",
+            task.id, task.id, current.plan_revision, review_evidence.id,
+            review_evidence.sha256, findings, n = decision.state.state_attempt,
+        );
+        let policy = project_workflow.policy_for_state(workflow, &decision.state.state)?;
+        let command = build_policy_agent_command(
+            runtime.agent_registry.get(&task.agent).as_ref(),
+            &task.agent,
+            &prompt,
+            policy.as_ref(),
+            Some(Path::new(worktree)),
+        );
+        switch_agent_in_tmux(
+            runtime.tmux_ops.as_ref(),
+            &target,
+            &previous_agent,
+            &command,
+        )?;
+        record_agent_prompt(
+            db,
+            &task,
+            &decision.state.state,
+            decision.state.state_attempt,
+            &task.agent,
+            &prompt,
+        )?;
     }
     db.advance_workflow_state(&decision.state, &decision.transition)?;
     db.update_task(&task)?;
@@ -3966,10 +3996,24 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             !sent.contains("please also check the retry path"),
             "the stubbed pane content must be ignored when the artifact has findings, got: {sent}"
         );
+        let inputs = db.workflow_step_inputs(&task.id, 2, "planning").unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].name, "plan_review");
+        let review = db
+            .workflow_artifact(&inputs[0].artifact_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(review.workflow_attempt, 1);
+        assert_eq!(review.state, "plan_review");
+        assert_eq!(review.sha256, inputs[0].expected_sha256);
+        assert!(
+            sent.contains(&format!("artifact {}", review.id)),
+            "planner prompt must identify the exact persisted review artifact, got: {sent}"
+        );
     }
 
     #[test]
-    fn submit_plan_review_changes_requested_falls_back_to_pane_capture_when_findings_missing() {
+    fn submit_plan_review_changes_requested_blocks_when_findings_missing() {
         let (graph, project, plugin) = changes_requested_fixtures();
         let agent_registry = mock_agent_registry_for_argv_launch();
         let (tmux_ops, rx, captured) = mock_tmux_capturing_paste(
@@ -4011,34 +4055,26 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
 
         let outcome =
             submit_plan_review(&graph, &project, &plugin, task.clone(), &mut db, &runtime).unwrap();
-        assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
-
-        rx.recv_timeout(std::time::Duration::from_secs(10))
-            .expect("revise prompt should be delivered to the planner");
-        let sent = captured
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("paste_text should have captured the revise command");
+        assert!(matches!(outcome, WorkflowStepOutcome::Blocked { .. }));
         assert!(
-            sent.contains("needs better error handling on the retry path"),
-            "expected the captured pane content as fallback feedback, got: {sent}"
+            db.workflow_step_inputs(&task.id, 2, "planning")
+                .unwrap()
+                .is_empty(),
+            "a review with no findings must never be handed to a planner"
         );
         assert!(
-            sent.contains("pane, captured at the moment"),
-            "expected the pane-capture fallback header when findings are absent, got: {sent}"
+            rx.recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "a blocked review must not launch the planner"
         );
+        assert!(captured.lock().unwrap().is_none());
     }
 
-    /// Full manual-path regression: `decide_workflow_plan` invoked directly
-    /// with an explicit bool -- exactly how the TUI's Shift+Y/Shift+N
-    /// handlers already call it -- is unaffected by the new artifact-driven
-    /// layer. With no `.agent-flow/plan-review.yaml` on disk at all (e.g. an
-    /// older project, or a human rejecting before this artifact ever
-    /// existed), the reject path must fall back to pane-capture exactly as
-    /// it did before this task.
+    /// A manual Shift+N decision without durable reviewer output is not a
+    /// recoverable planner handoff. It must leave the state untouched rather
+    /// than inventing feedback from terminal scrollback.
     #[test]
-    fn decide_workflow_plan_manual_path_unaffected_by_artifact_driven_layer() {
+    fn decide_workflow_plan_blocks_without_a_persisted_review_artifact() {
         let (graph, project, plugin) = changes_requested_fixtures();
         let agent_registry = mock_agent_registry_for_argv_launch();
         let (tmux_ops, rx, captured) =
@@ -4081,26 +4117,14 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             &runtime,
         )
         .unwrap();
-        assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
+        assert!(matches!(outcome, WorkflowStepOutcome::Blocked { .. }));
         assert_eq!(
             db.get_workflow_task_state(&task.id).unwrap().unwrap().state,
-            "planning"
+            "plan_review"
         );
-
-        rx.recv_timeout(std::time::Duration::from_secs(10))
-            .expect("revise prompt should be delivered to the planner");
-        let sent = captured
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("paste_text should have captured the revise command");
-        assert!(
-            sent.contains("tighten the retry logic"),
-            "expected the captured pane content as fallback feedback (no artifact present), got: {sent}"
-        );
-        assert!(
-            sent.contains("pane, captured at the moment"),
-            "expected the pane-capture fallback header when no plan-review artifact exists, got: {sent}"
-        );
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        assert!(captured.lock().unwrap().is_none());
     }
 }
