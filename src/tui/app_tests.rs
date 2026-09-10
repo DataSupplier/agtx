@@ -158,7 +158,9 @@ fn claude_policy_allows_webfetch_only_when_state_declares_network() {
         build_policy_agent_command(&agent_ops, "claude", "Plan task", Some(&networked), None);
 
     assert!(!allowed_tools_value(&isolated_command).contains("WebFetch"));
+    assert!(!allowed_tools_value(&isolated_command).contains("WebSearch"));
     assert!(allowed_tools_value(&networked_command).contains("WebFetch"));
+    assert!(allowed_tools_value(&networked_command).contains("WebSearch"));
 }
 
 /// The scenario from the reported incident: an implementer with `write_paths`

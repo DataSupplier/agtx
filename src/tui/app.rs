@@ -12225,6 +12225,7 @@ fn claude_policy_flags(
     }
     if network {
         tools.push("WebFetch".to_string());
+        tools.push("WebSearch".to_string());
     }
     format!(
         "--permission-mode dontAsk --allowed-tools '{}'",
