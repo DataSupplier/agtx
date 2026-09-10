@@ -44,7 +44,7 @@ pub const HELP: &[HelpSection] = &[
             e("U", "Revoke an untouched declarative-workflow admission"),
             e(
                 "X",
-                "Reset a pre-implementation workflow task to Backlog (confirmed)",
+                "Reset any declarative-workflow task to Backlog (confirmed)",
             ),
             e(
                 "S / V / Y / N",

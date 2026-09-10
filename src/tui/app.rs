@@ -2528,7 +2528,7 @@ impl App {
                 vertical: 2,
             });
             let text = format!(
-                "Reset \"{}\" to Backlog?\n\nIts worktree and branch will be removed. Any uncommitted worktree changes, planning, and review evidence will be discarded. An existing .agtx/plan.md is saved locally in .plans-backup/.\n\n[y] Reset to Backlog    [n/Esc] Cancel",
+                "Reset \"{}\" to Backlog?\n\nIts worktree, task branch (including commits), PR allocation, and workflow evidence will be discarded. An existing .agtx/plan.md is saved locally in .plans-backup/.\n\n[y] Reset to Backlog    [n/Esc] Cancel",
                 popup.task_title);
             frame.render_widget(
                 Paragraph::new(text)
@@ -6076,18 +6076,9 @@ impl App {
         let Some(db) = self.state.db.as_ref() else {
             return Ok(());
         };
-        let eligible = db
-            .get_workflow_task_state(&task.id)?
-            .map(|state| {
-                matches!(
-                    state.state.as_str(),
-                    "admission" | "ready_for_planning" | "planning" | "plan_review"
-                )
-            })
-            .unwrap_or(false);
-        if !eligible {
+        if db.get_workflow_task_state(&task.id)?.is_none() {
             self.state.warning_message = Some((
-                "Reset to Backlog is only available before implementation starts".into(),
+                "Reset to Backlog is available for declarative-workflow tasks".into(),
                 Instant::now(),
             ));
             return Ok(());

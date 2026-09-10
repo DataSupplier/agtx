@@ -685,10 +685,9 @@ pub fn revoke_workflow_admission(
     })
 }
 
-/// Reset an abandoned planning attempt before implementation begins. This is
-/// deliberately broader than admission revocation: explicit UI confirmation
-/// authorizes discarding uncommitted work, while committed work remains
-/// protected. Durable state is not changed until external cleanup succeeds.
+/// Reset a declarative-workflow task from any state. Explicit UI confirmation
+/// authorizes discarding its worktree, branch commits, and workflow evidence.
+/// Durable state is not changed until external cleanup succeeds.
 pub fn reset_workflow_to_backlog(
     task: Task,
     db: &mut Database,
@@ -699,53 +698,13 @@ pub fn reset_workflow_to_backlog(
             message: "Task has no declarative workflow attempt to reset".into(),
         });
     };
-    if !matches!(
-        state.state.as_str(),
-        "admission" | "ready_for_planning" | "planning" | "plan_review"
-    ) {
-        return Ok(WorkflowStepOutcome::Blocked {
-            message: format!(
-                "Reset is only available before implementation starts (current state: {})",
-                state.state
-            ),
-        });
-    }
-    let Some(worktree) = task.worktree_path.as_deref() else {
-        return Ok(WorkflowStepOutcome::Blocked {
-            message: "Task has no allocated worktree to reset".into(),
-        });
-    };
-    let Some(branch) = task.branch_name.as_deref() else {
-        return Ok(WorkflowStepOutcome::Blocked {
-            message: "Task has no allocated branch to reset".into(),
-        });
-    };
-    let Some(base_sha) = state.base_sha.as_deref() else {
-        return Ok(WorkflowStepOutcome::Blocked {
-            message: "Task has no frozen admission base; refusing to reset".into(),
-        });
-    };
-    match crate::git::resolve_commit(runtime.project_path, branch) {
-        Ok(head) if head == base_sha => {}
-        Ok(_) => {
-            return Ok(WorkflowStepOutcome::Blocked {
-                message:
-                    "Task branch contains commits beyond its admission base; refusing to reset"
-                        .into(),
-            })
-        }
-        Err(error) => {
-            return Ok(WorkflowStepOutcome::Blocked {
-                message: format!("Cannot verify task branch before reset: {error}"),
-            })
-        }
-    }
-
     // Keep the standard planning artifact locally for reuse. The backup is
     // made before any destructive operation and its failure aborts the reset.
-    let plan = Path::new(worktree).join(".agtx").join("plan.md");
-    if plan.is_file() {
-        backup_plan(&plan, runtime.project_path, &task.title)?;
+    if let Some(worktree) = task.worktree_path.as_deref() {
+        let plan = Path::new(worktree).join(".agtx").join("plan.md");
+        if plan.is_file() {
+            backup_plan(&plan, runtime.project_path, &task.title)?;
+        }
     }
     if let Some(session) = task.session_name.as_deref() {
         if let Err(error) = runtime.tmux_ops.kill_window(session) {
@@ -754,20 +713,26 @@ pub fn reset_workflow_to_backlog(
             });
         }
     }
-    if let Err(error) = runtime
-        .git_ops
-        .remove_worktree(runtime.project_path, worktree)
-    {
-        return Ok(WorkflowStepOutcome::Blocked {
-            message: format!("Could not remove task worktree; reset remains recoverable: {error}"),
-        });
+    if let Some(worktree) = task.worktree_path.as_deref() {
+        if let Err(error) = runtime
+            .git_ops
+            .remove_worktree(runtime.project_path, worktree)
+        {
+            return Ok(WorkflowStepOutcome::Blocked {
+                message: format!(
+                    "Could not remove task worktree; reset remains recoverable: {error}"
+                ),
+            });
+        }
     }
-    if let Err(error) = runtime.git_ops.delete_branch(runtime.project_path, branch) {
-        return Ok(WorkflowStepOutcome::Blocked {
-            message: format!(
-                "Worktree removed but branch cleanup failed; reset remains recoverable: {error}"
-            ),
-        });
+    if let Some(branch) = task.branch_name.as_deref() {
+        if let Err(error) = runtime.git_ops.delete_branch(runtime.project_path, branch) {
+            return Ok(WorkflowStepOutcome::Blocked {
+                message: format!(
+                    "Worktree removed but branch cleanup failed; reset remains recoverable: {error}"
+                ),
+            });
+        }
     }
     db.reset_workflow_to_backlog(&task, &state)?;
     Ok(WorkflowStepOutcome::Advanced {
