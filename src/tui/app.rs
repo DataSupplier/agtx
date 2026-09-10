@@ -12181,7 +12181,7 @@ pub(crate) fn build_policy_agent_command(
         return format!("codex{model}{reasoning_effort}{network_config} --sandbox {sandbox} --ask-for-approval never '{quoted_prompt}'");
     }
     if agent == "claude" {
-        let flags = claude_policy_flags(&policy.role_policy, worktree);
+        let flags = claude_policy_flags(&policy.role_policy, policy.network, worktree);
         return format!("claude{model}{effort} {flags} -- '{quoted_prompt}'");
     }
     agent_ops.build_interactive_command(&prompt)
@@ -12208,7 +12208,11 @@ pub(crate) fn build_policy_agent_command(
 /// quotes, same as before this was extracted. A literal single quote in a
 /// configured command or write path would already have broken this quoting;
 /// fixing that is a separate concern from resume parity.
-fn claude_policy_flags(role_policy: &WorkflowRolePolicy, _worktree: Option<&Path>) -> String {
+fn claude_policy_flags(
+    role_policy: &WorkflowRolePolicy,
+    network: bool,
+    _worktree: Option<&Path>,
+) -> String {
     let mut tools = vec!["Read".to_string(), "Glob".to_string(), "Grep".to_string()];
     tools.extend(
         role_policy
@@ -12218,6 +12222,9 @@ fn claude_policy_flags(role_policy: &WorkflowRolePolicy, _worktree: Option<&Path
     );
     if !role_policy.write_paths.is_empty() {
         tools.extend(["Edit".to_string(), "Write".to_string()]);
+    }
+    if network {
+        tools.push("WebFetch".to_string());
     }
     format!(
         "--permission-mode dontAsk --allowed-tools '{}'",
@@ -12306,7 +12313,7 @@ fn build_policy_resume_command(
         .as_deref()
         .map(|value| format!(" --effort {value}"))
         .unwrap_or_default();
-    let flags = claude_policy_flags(&policy.role_policy, worktree);
+    let flags = claude_policy_flags(&policy.role_policy, policy.network, worktree);
     format!("claude{model}{effort} {flags} --continue")
 }
 

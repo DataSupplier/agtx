@@ -142,6 +142,25 @@ fn codex_policy_enables_network_only_when_state_declares_it() {
     assert!(validation_command.contains("--sandbox workspace-write"));
 }
 
+#[test]
+#[cfg(feature = "test-mocks")]
+fn claude_policy_allows_webfetch_only_when_state_declares_network() {
+    let agent_ops = MockAgentOperations::new();
+    let isolated = ResolvedWorkflowPolicy::default();
+    let networked = ResolvedWorkflowPolicy {
+        network: true,
+        ..Default::default()
+    };
+
+    let isolated_command =
+        build_policy_agent_command(&agent_ops, "claude", "Plan task", Some(&isolated), None);
+    let networked_command =
+        build_policy_agent_command(&agent_ops, "claude", "Plan task", Some(&networked), None);
+
+    assert!(!allowed_tools_value(&isolated_command).contains("WebFetch"));
+    assert!(allowed_tools_value(&networked_command).contains("WebFetch"));
+}
+
 /// The scenario from the reported incident: an implementer with `write_paths`
 /// resumed after a lost tmux window must carry `Edit` for its result
 /// artifact and its `allowed_commands`, and must resume with `--continue`
