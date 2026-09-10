@@ -686,9 +686,9 @@ pub fn revoke_workflow_admission(
 }
 
 /// Reset an abandoned planning attempt before implementation begins. This is
-/// deliberately broader than admission revocation, but retains its refusal to
-/// discard dirty or committed work and never changes durable state until all
-/// external cleanup has succeeded.
+/// deliberately broader than admission revocation: explicit UI confirmation
+/// authorizes discarding uncommitted work, while committed work remains
+/// protected. Durable state is not changed until external cleanup succeeds.
 pub fn reset_workflow_to_backlog(
     task: Task,
     db: &mut Database,
@@ -720,11 +720,6 @@ pub fn reset_workflow_to_backlog(
             message: "Task has no allocated branch to reset".into(),
         });
     };
-    if runtime.git_ops.has_changes(Path::new(worktree)) {
-        return Ok(WorkflowStepOutcome::Blocked {
-            message: "Worktree has uncommitted changes; refusing to reset".into(),
-        });
-    }
     let Some(base_sha) = state.base_sha.as_deref() else {
         return Ok(WorkflowStepOutcome::Blocked {
             message: "Task has no frozen admission base; refusing to reset".into(),

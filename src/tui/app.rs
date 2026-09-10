@@ -2528,7 +2528,7 @@ impl App {
                 vertical: 2,
             });
             let text = format!(
-                "Reset \"{}\" to Backlog?\n\nIts worktree and branch will be removed. Planning and review evidence will be cleared. An existing .agtx/plan.md is saved locally in .plans-backup/.\n\n[y] Reset to Backlog    [n/Esc] Cancel",
+                "Reset \"{}\" to Backlog?\n\nIts worktree and branch will be removed. Any uncommitted worktree changes, planning, and review evidence will be discarded. An existing .agtx/plan.md is saved locally in .plans-backup/.\n\n[y] Reset to Backlog    [n/Esc] Cancel",
                 popup.task_title);
             frame.render_widget(
                 Paragraph::new(text)
