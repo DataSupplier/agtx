@@ -34,10 +34,10 @@ use crate::tmux::{
 use crate::workflow::{ResolvedWorkflowPolicy, WorkflowProjectConfig, WorkflowRolePolicy};
 use crate::workflow_automation::run_automation_tick;
 use crate::workflow_executor::{
-    admit_task, complete_feature_integration, decide_workflow_plan, restart_workflow_step,
-    revoke_workflow_admission, start_workflow_implementation, start_workflow_planning,
-    submit_engineering_review, submit_final_validation, submit_workflow_implementation,
-    submit_workflow_plan, WorkflowRuntime, WorkflowStepOutcome,
+    admit_task, complete_feature_integration, decide_workflow_plan, reset_workflow_to_backlog,
+    restart_workflow_step, revoke_workflow_admission, start_workflow_implementation,
+    start_workflow_planning, submit_engineering_review, submit_final_validation,
+    submit_workflow_implementation, submit_workflow_plan, WorkflowRuntime, WorkflowStepOutcome,
 };
 use crate::AppMode;
 
@@ -80,7 +80,7 @@ fn build_footer_text(
                 // Backlog and Ready are both TaskStatus::Backlog, so they offer
                 // the same actions; the gate only lets them through from Ready.
                 match selected_column {
-                    0 | 1 => "[o] new  [Enter] edit  [d] diff  ·  [S] start planning  [U] revoke admission  ·  [?] help  [q] quit".to_string(),
+                    0 | 1 => "[o] new  [Enter] edit  [d] diff  ·  [S] start planning  [U] revoke  [X] reset  ·  [?] help  [q] quit".to_string(),
                     2 => format!("[o] new  [Enter] open{fullscreen}  [d] diff  ·  [m] run  ·  [?] help  [q] quit"),
                     3 => format!("[o] new  [Enter] open{fullscreen}  [d] diff  ·  [r] back  [m] move  ·  [?] help  [q] quit"),
                     4 if has_cyclic_plugin => format!(
@@ -403,6 +403,8 @@ struct AppState {
     skip_move_confirm: bool,
     // Confirmation popup for deleting a task
     delete_confirm_popup: Option<DeleteConfirmPopup>,
+    // Explicit confirmation for destructive workflow recovery.
+    reset_confirm_popup: Option<ResetConfirmPopup>,
     // Confirmation popup for asking if user wants to create PR when moving to Review
     review_confirm_popup: Option<ReviewConfirmPopup>,
     // Trust-on-first-use confirmation popup
@@ -716,6 +718,12 @@ struct DeleteConfirmPopup {
     task_title: String,
 }
 
+#[derive(Debug, Clone)]
+struct ResetConfirmPopup {
+    task_id: String,
+    task_title: String,
+}
+
 /// State for trust-on-first-use confirmation popup
 #[derive(Debug, Clone)]
 struct TrustConfirmPopup {
@@ -936,6 +944,7 @@ impl App {
                 move_confirm_popup: None,
                 skip_move_confirm: false,
                 delete_confirm_popup: None,
+                reset_confirm_popup: None,
                 review_confirm_popup: None,
                 trust_confirm_popup: None,
                 phase_status_cache: HashMap::new(),
@@ -1190,6 +1199,7 @@ impl App {
                 move_confirm_popup: None,
                 skip_move_confirm: false,
                 delete_confirm_popup: None,
+                reset_confirm_popup: None,
                 review_confirm_popup: None,
                 trust_confirm_popup: None,
                 phase_status_cache: HashMap::new(),
@@ -2503,6 +2513,32 @@ impl App {
             frame.render_widget(content, inner);
         }
 
+        if let Some(ref popup) = state.reset_confirm_popup {
+            let popup_area = centered_rect(55, 28, area);
+            frame.render_widget(Clear, popup_area);
+            frame.render_widget(
+                Block::default()
+                    .title(" Reset to Backlog? ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Red)),
+                popup_area,
+            );
+            let inner = popup_area.inner(ratatui::layout::Margin {
+                horizontal: 2,
+                vertical: 2,
+            });
+            let text = format!(
+                "Reset \"{}\" to Backlog?\n\nIts worktree and branch will be removed. Planning and review evidence will be cleared. An existing .agtx/plan.md is saved locally in .plans-backup/.\n\n[y] Reset to Backlog    [n/Esc] Cancel",
+                popup.task_title);
+            frame.render_widget(
+                Paragraph::new(text)
+                    .style(Style::default().fg(Color::White))
+                    .alignment(ratatui::layout::Alignment::Center)
+                    .wrap(Wrap { trim: false }),
+                inner,
+            );
+        }
+
         // Review confirmation popup (ask if user wants to create PR)
         if let Some(ref popup) = state.review_confirm_popup {
             let popup_area = centered_rect(50, 25, area);
@@ -3503,6 +3539,10 @@ impl App {
             return self.handle_delete_confirm_key(key);
         }
 
+        if self.state.reset_confirm_popup.is_some() {
+            return self.handle_reset_confirm_key(key);
+        }
+
         // Handle Review confirmation popup if open
         if self.state.review_confirm_popup.is_some() {
             return self.handle_review_confirm_key(key);
@@ -3629,6 +3669,22 @@ impl App {
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     // Cancelled
                     self.state.delete_confirm_popup = None;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_reset_confirm_key(&mut self, key: crossterm::event::KeyEvent) -> Result<()> {
+        if let Some(popup) = self.state.reset_confirm_popup.clone() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.state.reset_confirm_popup = None;
+                    self.reset_selected_workflow_to_backlog(&popup.task_id)?;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.state.reset_confirm_popup = None
                 }
                 _ => {}
             }
@@ -4752,6 +4808,7 @@ impl App {
             KeyCode::Char('A') => self.admit_selected_task()?,
             KeyCode::Char('S') => self.start_selected_workflow_planning()?,
             KeyCode::Char('U') => self.revoke_selected_workflow_admission()?,
+            KeyCode::Char('X') => self.confirm_reset_selected_workflow_to_backlog()?,
             KeyCode::Char('V') => self.submit_selected_workflow_plan()?,
             KeyCode::Char('Y') => self.decide_selected_workflow_plan(true)?,
             KeyCode::Char('N') => self.decide_selected_workflow_plan(false)?,
@@ -6009,6 +6066,58 @@ impl App {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
         let outcome = revoke_workflow_admission(task, db, &runtime)?;
+        self.apply_workflow_step_outcome(outcome)
+    }
+
+    fn confirm_reset_selected_workflow_to_backlog(&mut self) -> Result<()> {
+        let Some(task) = self.state.board.selected_task().cloned() else {
+            return Ok(());
+        };
+        let Some(db) = self.state.db.as_ref() else {
+            return Ok(());
+        };
+        let eligible = db
+            .get_workflow_task_state(&task.id)?
+            .map(|state| {
+                matches!(
+                    state.state.as_str(),
+                    "admission" | "ready_for_planning" | "planning" | "plan_review"
+                )
+            })
+            .unwrap_or(false);
+        if !eligible {
+            self.state.warning_message = Some((
+                "Reset to Backlog is only available before implementation starts".into(),
+                Instant::now(),
+            ));
+            return Ok(());
+        }
+        self.state.reset_confirm_popup = Some(ResetConfirmPopup {
+            task_id: task.id,
+            task_title: task.title,
+        });
+        Ok(())
+    }
+
+    fn reset_selected_workflow_to_backlog(&mut self, task_id: &str) -> Result<()> {
+        let (Some(project_path), Some(db)) =
+            (self.state.project_path.clone(), self.state.db.as_mut())
+        else {
+            return Ok(());
+        };
+        let Some(task) = db.get_task(task_id)? else {
+            return Ok(());
+        };
+        let runtime = WorkflowRuntime {
+            tmux_ops: &self.state.tmux_ops,
+            agent_registry: &self.state.agent_registry,
+            git_ops: &self.state.git_ops,
+            tmux_project_name: &self.state.tmux_project_name,
+            project_path: &project_path,
+            config: &self.state.config,
+            flags: &self.state.flags,
+        };
+        let outcome = reset_workflow_to_backlog(task, db, &runtime)?;
         self.apply_workflow_step_outcome(outcome)
     }
     /// Start the configured planner from an admitted task worktree.

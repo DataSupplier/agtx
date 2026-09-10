@@ -735,6 +735,63 @@ impl Database {
         tx.commit()?;
         Ok(())
     }
+
+    /// Forget an abandoned pre-implementation workflow attempt while retaining
+    /// a concise, durable audit trail of the human recovery action.
+    pub fn reset_workflow_to_backlog(
+        &mut self,
+        task: &Task,
+        former_state: &WorkflowTaskState,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        let now = chrono::Utc::now();
+        tx.execute(
+            "UPDATE tasks SET status = 'backlog', session_name = NULL, worktree_path = NULL, branch_name = NULL, base_branch = NULL, pr_number = NULL, pr_url = NULL, escalation_note = NULL, updated_at = ?2 WHERE id = ?1",
+            params![task.id, now.to_rfc3339()],
+        )?;
+        // Inputs reference immutable evidence, so clear inputs first.
+        for table in [
+            "workflow_step_inputs",
+            "workflow_artifacts",
+            "task_step_reports",
+            "workflow_task_states",
+        ] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE task_id = ?1"),
+                params![task.id],
+            )?;
+        }
+        let reason = format!(
+            "Human reset abandoned pre-implementation workflow attempt {} in {}",
+            former_state.state_attempt, former_state.state
+        );
+        let record = WorkflowTransitionRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            task_id: task.id.clone(),
+            action: "reset_to_backlog".into(),
+            from_state: former_state.state.clone(),
+            to_state: "backlog".into(),
+            actor_role: Some("human".into()),
+            actor_agent: None,
+            reason: Some(reason.clone()),
+            created_at: now,
+        };
+        tx.execute(
+            "INSERT INTO workflow_transition_history (id, task_id, action, from_state, to_state, actor_role, actor_agent, reason, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![record.id, record.task_id, record.action, record.from_state, record.to_state, record.actor_role, record.actor_agent, record.reason, record.created_at.to_rfc3339()],
+        )?;
+        let mut event = TaskExecutionEvent::new(&task.id, "reset_to_backlog");
+        event.workflow_attempt = Some(former_state.state_attempt);
+        event.state = Some(former_state.state.clone());
+        event.outcome = Some("completed".into());
+        event.message = Some(reason);
+        tx.execute(
+            "INSERT INTO task_execution_events (id, task_id, workflow_attempt, state, event_type, agent, outcome, message, metadata_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![event.id, event.task_id, event.workflow_attempt, event.state, event.event_type, event.agent, event.outcome, event.message, event.metadata_json, event.created_at.to_rfc3339()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
     /// Append an operational event without changing board or workflow state.
     /// Journal rows deliberately have no foreign key to `tasks`: they remain
     /// available for post-mortem analysis after a completed task is cleaned up.

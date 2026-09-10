@@ -7,7 +7,7 @@
 //! disagree about what an admission means.
 
 use anyhow::{bail, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
@@ -683,6 +683,120 @@ pub fn revoke_workflow_admission(
         task,
         message: "Admission revoked; task is Ready without an allocated worktree".into(),
     })
+}
+
+/// Reset an abandoned planning attempt before implementation begins. This is
+/// deliberately broader than admission revocation, but retains its refusal to
+/// discard dirty or committed work and never changes durable state until all
+/// external cleanup has succeeded.
+pub fn reset_workflow_to_backlog(
+    task: Task,
+    db: &mut Database,
+    runtime: &WorkflowRuntime,
+) -> Result<WorkflowStepOutcome> {
+    let Some(state) = db.get_workflow_task_state(&task.id)? else {
+        return Ok(WorkflowStepOutcome::Blocked {
+            message: "Task has no declarative workflow attempt to reset".into(),
+        });
+    };
+    if !matches!(
+        state.state.as_str(),
+        "admission" | "ready_for_planning" | "planning" | "plan_review"
+    ) {
+        return Ok(WorkflowStepOutcome::Blocked {
+            message: format!(
+                "Reset is only available before implementation starts (current state: {})",
+                state.state
+            ),
+        });
+    }
+    let Some(worktree) = task.worktree_path.as_deref() else {
+        return Ok(WorkflowStepOutcome::Blocked {
+            message: "Task has no allocated worktree to reset".into(),
+        });
+    };
+    let Some(branch) = task.branch_name.as_deref() else {
+        return Ok(WorkflowStepOutcome::Blocked {
+            message: "Task has no allocated branch to reset".into(),
+        });
+    };
+    if runtime.git_ops.has_changes(Path::new(worktree)) {
+        return Ok(WorkflowStepOutcome::Blocked {
+            message: "Worktree has uncommitted changes; refusing to reset".into(),
+        });
+    }
+    let Some(base_sha) = state.base_sha.as_deref() else {
+        return Ok(WorkflowStepOutcome::Blocked {
+            message: "Task has no frozen admission base; refusing to reset".into(),
+        });
+    };
+    match crate::git::resolve_commit(runtime.project_path, branch) {
+        Ok(head) if head == base_sha => {}
+        Ok(_) => {
+            return Ok(WorkflowStepOutcome::Blocked {
+                message:
+                    "Task branch contains commits beyond its admission base; refusing to reset"
+                        .into(),
+            })
+        }
+        Err(error) => {
+            return Ok(WorkflowStepOutcome::Blocked {
+                message: format!("Cannot verify task branch before reset: {error}"),
+            })
+        }
+    }
+
+    // Keep the standard planning artifact locally for reuse. The backup is
+    // made before any destructive operation and its failure aborts the reset.
+    let plan = Path::new(worktree).join(".agtx").join("plan.md");
+    if plan.is_file() {
+        backup_plan(&plan, runtime.project_path, &task.title)?;
+    }
+    if let Some(session) = task.session_name.as_deref() {
+        if let Err(error) = runtime.tmux_ops.kill_window(session) {
+            return Ok(WorkflowStepOutcome::Blocked {
+                message: format!("Could not stop task session; reset was not started: {error}"),
+            });
+        }
+    }
+    if let Err(error) = runtime
+        .git_ops
+        .remove_worktree(runtime.project_path, worktree)
+    {
+        return Ok(WorkflowStepOutcome::Blocked {
+            message: format!("Could not remove task worktree; reset remains recoverable: {error}"),
+        });
+    }
+    if let Err(error) = runtime.git_ops.delete_branch(runtime.project_path, branch) {
+        return Ok(WorkflowStepOutcome::Blocked {
+            message: format!(
+                "Worktree removed but branch cleanup failed; reset remains recoverable: {error}"
+            ),
+        });
+    }
+    db.reset_workflow_to_backlog(&task, &state)?;
+    Ok(WorkflowStepOutcome::Advanced {
+        task,
+        message: "Task reset to Backlog; planning evidence was cleared".into(),
+    })
+}
+
+fn backup_plan(source: &Path, project_path: &Path, title: &str) -> Result<PathBuf> {
+    let safe: String = title
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect();
+    let stem = safe.trim_matches('-');
+    let dir = project_path.join(".plans-backup");
+    std::fs::create_dir_all(&dir)?;
+    let mut destination = dir.join(format!("{stem}-plan.md"));
+    let mut suffix = 2;
+    while destination.exists() {
+        destination = dir.join(format!("{stem}-plan-{suffix}.md"));
+        suffix += 1;
+    }
+    std::fs::copy(source, &destination)?;
+    Ok(destination)
 }
 /// Extracted body of `App::start_selected_workflow_planning`.
 ///
@@ -2073,6 +2187,28 @@ mod tests {
             role_bindings: Default::default(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn backup_plan_preserves_contents_and_uses_a_collision_suffix() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("plan.md");
+        std::fs::write(&source, "plan_revision: 1\nkeep this exactly\n").unwrap();
+
+        let first = backup_plan(&source, project_dir.path(), "Recover planning!").unwrap();
+        let second = backup_plan(&source, project_dir.path(), "Recover planning!").unwrap();
+
+        assert_eq!(
+            std::fs::read(&first).unwrap(),
+            std::fs::read(&source).unwrap()
+        );
+        assert_ne!(first, second);
+        assert!(second
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with("-2.md"));
     }
 
     #[test]
