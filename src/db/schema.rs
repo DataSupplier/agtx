@@ -736,7 +736,7 @@ impl Database {
         Ok(())
     }
 
-    /// Forget an abandoned pre-implementation workflow attempt while retaining
+    /// Forget an abandoned workflow attempt while retaining
     /// a concise, durable audit trail of the human recovery action.
     pub fn reset_workflow_to_backlog(
         &mut self,
@@ -762,7 +762,7 @@ impl Database {
             )?;
         }
         let reason = format!(
-            "Human reset abandoned pre-implementation workflow attempt {} in {}",
+            "Human reset discarded workflow attempt {} in {}",
             former_state.state_attempt, former_state.state
         );
         let record = WorkflowTransitionRecord {
