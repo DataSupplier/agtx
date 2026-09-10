@@ -80,7 +80,7 @@ fn build_footer_text(
                 // Backlog and Ready are both TaskStatus::Backlog, so they offer
                 // the same actions; the gate only lets them through from Ready.
                 match selected_column {
-                    0 | 1 => "[o] new  [Enter] edit  [d] diff  ·  [S] start planning  [U] revoke  [X] reset  ·  [?] help  [q] quit".to_string(),
+                    0 | 1 => "[o] new  [Enter] edit  [d] diff  ·  [S] start planning  [U] revoke  [T] reset  ·  [?] help  [q] quit".to_string(),
                     2 => format!("[o] new  [Enter] open{fullscreen}  [d] diff  ·  [m] run  ·  [?] help  [q] quit"),
                     3 => format!("[o] new  [Enter] open{fullscreen}  [d] diff  ·  [r] back  [m] move  ·  [?] help  [q] quit"),
                     4 if has_cyclic_plugin => format!(
@@ -4808,7 +4808,7 @@ impl App {
             KeyCode::Char('A') => self.admit_selected_task()?,
             KeyCode::Char('S') => self.start_selected_workflow_planning()?,
             KeyCode::Char('U') => self.revoke_selected_workflow_admission()?,
-            KeyCode::Char('X') => self.confirm_reset_selected_workflow_to_backlog()?,
+            KeyCode::Char('T') => self.confirm_reset_selected_workflow_to_backlog()?,
             KeyCode::Char('V') => self.submit_selected_workflow_plan()?,
             KeyCode::Char('Y') => self.decide_selected_workflow_plan(true)?,
             KeyCode::Char('N') => self.decide_selected_workflow_plan(false)?,
