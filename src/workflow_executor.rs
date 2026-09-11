@@ -763,6 +763,14 @@ fn backup_plan(source: &Path, project_path: &Path, title: &str) -> Result<PathBu
 /// Planning is deliberately restartable: a task can retain its durable
 /// admission evidence while a terminal or agent process exits, in which case
 /// this relaunches the planner rather than merely realigning state.
+///
+/// `require_plan_approval` answers the Shift+S "require my approval" popup;
+/// it only takes effect on a fresh start (not a restart of an
+/// already-`planning` task, which has no fresh transition to stamp it onto)
+/// and is stored on the task's `WorkflowTaskState::human_gate_plan_approval`
+/// so `assess`'s `apply_human_gates` can hold this one task's `approve_plan`
+/// for a human even when the project-wide `[automation].human_gates` list
+/// does not name it.
 pub fn start_workflow_planning(
     workflow: &WorkflowDefinition,
     project_workflow: &WorkflowProjectConfig,
@@ -770,6 +778,7 @@ pub fn start_workflow_planning(
     mut task: Task,
     db: &mut Database,
     runtime: &WorkflowRuntime,
+    require_plan_approval: bool,
 ) -> Result<WorkflowStepOutcome> {
     // In just-in-time mode a dependency-ready card deliberately has no
     // allocation yet. Admission and planning start share this one operator
@@ -845,7 +854,7 @@ pub fn start_workflow_planning(
             None
         };
         let before_planning = ready.as_ref().map(|ready| &ready.state).unwrap_or(&current);
-        let planning = match prepare_transition(
+        let mut planning = match prepare_transition(
             workflow,
             project_workflow,
             before_planning,
@@ -859,6 +868,7 @@ pub fn start_workflow_planning(
                 });
             }
         };
+        planning.state.human_gate_plan_approval = require_plan_approval;
         let Some(agent) = planning.destination_agent.clone() else {
             return Ok(WorkflowStepOutcome::Blocked {
                 message: "Planning state has no bound agent".into(),
@@ -1773,9 +1783,11 @@ pub enum AutomationDecision {
     /// (for planning) a `plan_revision` that has not actually advanced.
     InvalidArtifact(String),
     /// Evidence is valid but this specific outcome is never auto-advanced.
-    /// Currently only final validation's `failed` verdict: a human must look
-    /// before any rework loop restarts, by fixed rule rather than project
-    /// configuration.
+    /// Either a fixed rule (final validation's `failed` verdict: a human must
+    /// look before any rework loop restarts) or a configured one (an action
+    /// named in `[automation].human_gates`, or `approve_plan` for a task
+    /// whose `human_gate_plan_approval` flag was set via the Shift+S
+    /// "require my approval" popup) -- see `apply_human_gates`.
     HumanGate(String),
 }
 
@@ -1865,7 +1877,7 @@ fn artifact_freshness(artifact: &Path, state: &WorkflowTaskState) -> Option<Auto
 /// tasks' status); nothing is written.
 pub fn assess(
     workflow: &WorkflowDefinition,
-    _project: &WorkflowProjectConfig,
+    project: &WorkflowProjectConfig,
     plugin: &WorkflowPlugin,
     task: &Task,
     state: &WorkflowTaskState,
@@ -1879,7 +1891,13 @@ pub fn assess(
         let Some(worktree) = task.worktree_path.as_deref() else {
             return AutomationDecision::Wait;
         };
-        return assess_feature_integration(worktree, plugin, task, state);
+        return apply_human_gates(
+            assess_feature_integration(worktree, plugin, task, state),
+            project,
+            plugin,
+            task,
+            state,
+        );
     }
 
     let guards = guard_context_for(db, task, state);
@@ -1899,20 +1917,21 @@ pub fn assess(
         // no guards at all (e.g. `ready_for_planning` -> `start_planning`)
         // is exclusively human-initiated and carries no automation signal
         // to act on, even though the graph trivially permits it.
-        return match available
+        let decision = match available
             .iter()
             .find(|transition| !transition.guards.is_empty())
         {
             Some(transition) => AutomationDecision::Advance(transition.action.clone()),
             None => AutomationDecision::Wait,
         };
+        return apply_human_gates(decision, project, plugin, task, state);
     }
 
     let Some(worktree) = task.worktree_path.as_deref() else {
         return AutomationDecision::Wait;
     };
 
-    match state.state.as_str() {
+    let decision = match state.state.as_str() {
         "planning" => assess_planning(worktree, plugin, task, state),
         "plan_review" => assess_plan_review(worktree, plugin, task, state),
         "engineering_review" => assess_engineering_review(worktree, plugin, task, state),
@@ -1921,7 +1940,52 @@ pub fn assess(
         // A role state this function does not yet know an artifact mapping
         // for. Nothing to read, so nothing to report.
         _ => AutomationDecision::Wait,
+    };
+    apply_human_gates(decision, project, plugin, task, state)
+}
+
+/// Downgrade an `Advance` into a `HumanGate` when the action is named in
+/// either gate source: the project-wide `[automation].human_gates` list
+/// (`WorkflowAutomationConfig::human_gates`), which applies to every task, or
+/// this one task's own `WorkflowTaskState::human_gate_plan_approval` flag,
+/// set per-task via the Shift+S "require my approval" popup. Anything other
+/// than `Advance` passes through untouched -- a gate only ever holds back a
+/// transition that was otherwise ready to fire, it never turns `Wait` or
+/// `InvalidArtifact` into something else.
+fn apply_human_gates(
+    decision: AutomationDecision,
+    project: &WorkflowProjectConfig,
+    plugin: &WorkflowPlugin,
+    task: &Task,
+    state: &WorkflowTaskState,
+) -> AutomationDecision {
+    let AutomationDecision::Advance(action) = &decision else {
+        return decision;
+    };
+    let gated = project
+        .automation
+        .human_gates
+        .iter()
+        .any(|gate| gate == action)
+        || (action == "approve_plan" && state.human_gate_plan_approval);
+    if !gated {
+        return decision;
     }
+    let reason = if action == "approve_plan" {
+        task.worktree_path
+            .as_deref()
+            .and_then(|worktree| planning_artifact_path(worktree, plugin, &task.id).ok())
+            .map(|path| {
+                format!(
+                    "Plan approved by the reviewer -- awaiting your sign-off: {}",
+                    path.display()
+                )
+            })
+            .unwrap_or_else(|| "Plan approved by the reviewer -- awaiting your sign-off".into())
+    } else {
+        format!("'{action}' is gated for human approval")
+    };
+    AutomationDecision::HumanGate(reason)
 }
 
 /// Mirrors `submit_workflow_plan`'s own evidence check: a plan artifact is
@@ -2591,6 +2655,62 @@ mod tests {
         assert_eq!(
             decision,
             AutomationDecision::Advance("approve_plan".to_string())
+        );
+    }
+
+    /// Project-wide `[automation].human_gates = ["approve_plan"]` holds back
+    /// every task's `approve_plan`, not just one that opted in via the
+    /// Shift+S popup.
+    #[test]
+    fn assess_plan_review_gates_approve_plan_when_project_configured() {
+        let graph = assess_plan_review_workflow();
+        let plugin = plugin_for_tests(graph.clone());
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
+        std::fs::write(
+            worktree.path().join(".agent-flow/plan-review.yaml"),
+            "verdict: approved\nworkflow_attempt: 1\n",
+        )
+        .unwrap();
+        let task = admitted_task(worktree.path());
+        let state = WorkflowTaskState::new(&task.id, "plan_review", "main");
+        let db = Database::open_in_memory_project().unwrap();
+        let mut project = project();
+        project.automation.human_gates = vec!["approve_plan".to_string()];
+
+        let decision = assess(&graph, &project, &plugin, &task, &state, &db);
+        let AutomationDecision::HumanGate(reason) = decision else {
+            panic!("expected a HumanGate decision, got {decision:?}");
+        };
+        assert!(
+            reason.contains("plan.md") || reason.contains("awaiting your sign-off"),
+            "reason should reference the plan artifact or say what it's waiting on: {reason}"
+        );
+    }
+
+    /// A task's own `human_gate_plan_approval` flag (set via the Shift+S
+    /// "require my approval" popup) gates just that task's `approve_plan`,
+    /// with no project-wide `[automation].human_gates` entry at all.
+    #[test]
+    fn assess_plan_review_gates_approve_plan_when_task_opted_in() {
+        let graph = assess_plan_review_workflow();
+        let plugin = plugin_for_tests(graph.clone());
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
+        std::fs::write(
+            worktree.path().join(".agent-flow/plan-review.yaml"),
+            "verdict: approved\nworkflow_attempt: 1\n",
+        )
+        .unwrap();
+        let task = admitted_task(worktree.path());
+        let mut state = WorkflowTaskState::new(&task.id, "plan_review", "main");
+        state.human_gate_plan_approval = true;
+        let db = Database::open_in_memory_project().unwrap();
+
+        let decision = assess(&graph, &project(), &plugin, &task, &state, &db);
+        assert!(
+            matches!(decision, AutomationDecision::HumanGate(_)),
+            "expected a HumanGate decision, got {decision:?}"
         );
     }
 
@@ -3330,9 +3450,16 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             flags: &flags,
         };
 
-        let outcome =
-            start_workflow_planning(&graph, &project, &plugin, task.clone(), &mut db, &runtime)
-                .unwrap();
+        let outcome = start_workflow_planning(
+            &graph,
+            &project,
+            &plugin,
+            task.clone(),
+            &mut db,
+            &runtime,
+            false,
+        )
+        .unwrap();
         assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
 
         // Both hops committed for real, not just observed mid-flight.

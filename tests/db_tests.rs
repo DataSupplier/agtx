@@ -879,6 +879,7 @@ fn workflow_state_and_transition_history_are_durable() {
 
     let mut state = WorkflowTaskState::new(&task.id, "admission", "feature/poc");
     state.base_sha = Some("abc123".into());
+    state.human_gate_plan_approval = true;
     db.upsert_workflow_task_state(&state).unwrap();
 
     let mut transition = WorkflowTransitionRecord::new(
@@ -894,6 +895,7 @@ fn workflow_state_and_transition_history_are_durable() {
     let stored = db.get_workflow_task_state(&task.id).unwrap().unwrap();
     assert_eq!(stored.target_branch, "feature/poc");
     assert_eq!(stored.base_sha.as_deref(), Some("abc123"));
+    assert!(stored.human_gate_plan_approval);
     let history = db.workflow_transition_history(&task.id).unwrap();
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].action, "admission_complete");

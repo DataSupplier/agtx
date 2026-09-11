@@ -400,6 +400,15 @@ pub struct WorkflowAutomationConfig {
     pub enabled: bool,
     #[serde(default)]
     pub admission_policy: AdmissionPolicy,
+    /// Action names that automation must never auto-fire even when the
+    /// destination artifact's evidence is valid and ready -- `assess` reports
+    /// `AutomationDecision::HumanGate` for these instead of `Advance`,
+    /// exactly like the fixed final-validation-failure gate, but project-
+    /// configured rather than hard-coded. A per-task override exists
+    /// alongside this project-wide list: see
+    /// `WorkflowTaskState::human_gate_plan_approval`.
+    #[serde(default)]
+    pub human_gates: Vec<String>,
 }
 
 /// Project-owned bindings for a declared workflow.

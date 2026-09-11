@@ -200,6 +200,13 @@ pub struct WorkflowTaskState {
     pub validation_passed_at: Option<DateTime<Utc>>,
     pub integration_sha: Option<String>,
     pub updated_at: DateTime<Utc>,
+    /// Per-task override of `[automation].human_gates`: set when this task's
+    /// plan-review approval was started (Shift+S) with the "require my
+    /// approval" answer, this makes `assess` report `HumanGate` for
+    /// `approve_plan` on this one task even when the project-wide list does
+    /// not name it. Never cleared automatically -- it is scoped to this
+    /// task's lifetime, not to a single pass through `plan_review`.
+    pub human_gate_plan_approval: bool,
 }
 
 impl WorkflowTaskState {
@@ -221,6 +228,7 @@ impl WorkflowTaskState {
             validation_passed_at: None,
             integration_sha: None,
             updated_at: Utc::now(),
+            human_gate_plan_approval: false,
         }
     }
 }

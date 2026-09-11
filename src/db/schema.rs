@@ -189,7 +189,8 @@ impl Database {
                 approved_plan_hash TEXT,
                 validation_passed_at TEXT,
                 integration_sha TEXT,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                human_gate_plan_approval INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS workflow_transition_history (
@@ -306,6 +307,15 @@ impl Database {
         // is not attempted.
         let _ = self.conn.execute(
             "ALTER TABLE workflow_task_states ADD COLUMN state_attempt INTEGER NOT NULL DEFAULT 1",
+            [],
+        );
+
+        // Migration: per-task override of `[automation].human_gates`, set via
+        // the Shift+S "require my approval" popup. Existing rows predate the
+        // column and default to 0 (no per-task gate), which is exactly the
+        // pre-migration behavior.
+        let _ = self.conn.execute(
+            "ALTER TABLE workflow_task_states ADD COLUMN human_gate_plan_approval INTEGER NOT NULL DEFAULT 0",
             [],
         );
 
@@ -596,8 +606,8 @@ impl Database {
             INSERT INTO workflow_task_states (
                 task_id, state, state_attempt, target_branch, base_sha, plan_revision, plan_hash,
                 approved_plan_revision, approved_plan_hash, validation_passed_at,
-                integration_sha, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                integration_sha, updated_at, human_gate_plan_approval
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             ON CONFLICT(task_id) DO UPDATE SET
                 state = excluded.state,
                 state_attempt = excluded.state_attempt,
@@ -609,7 +619,8 @@ impl Database {
                 approved_plan_hash = excluded.approved_plan_hash,
                 validation_passed_at = excluded.validation_passed_at,
                 integration_sha = excluded.integration_sha,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                human_gate_plan_approval = excluded.human_gate_plan_approval
             "#,
             params![
                 state.task_id,
@@ -624,6 +635,7 @@ impl Database {
                 state.validation_passed_at.map(|value| value.to_rfc3339()),
                 state.integration_sha,
                 state.updated_at.to_rfc3339(),
+                state.human_gate_plan_approval,
             ],
         )?;
         Ok(())
@@ -650,6 +662,7 @@ impl Database {
             validation_passed_at: timestamp("validation_passed_at"),
             integration_sha: row.get("integration_sha")?,
             updated_at: timestamp("updated_at").unwrap_or_else(chrono::Utc::now),
+            human_gate_plan_approval: row.get("human_gate_plan_approval")?,
         })
     }
 
@@ -1065,8 +1078,8 @@ impl Database {
             INSERT INTO workflow_task_states (
                 task_id, state, state_attempt, target_branch, base_sha, plan_revision, plan_hash,
                 approved_plan_revision, approved_plan_hash, validation_passed_at,
-                integration_sha, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                integration_sha, updated_at, human_gate_plan_approval
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             ON CONFLICT(task_id) DO UPDATE SET
                 state = excluded.state, state_attempt = excluded.state_attempt,
                 target_branch = excluded.target_branch,
@@ -1074,7 +1087,8 @@ impl Database {
                 plan_hash = excluded.plan_hash, approved_plan_revision = excluded.approved_plan_revision,
                 approved_plan_hash = excluded.approved_plan_hash,
                 validation_passed_at = excluded.validation_passed_at,
-                integration_sha = excluded.integration_sha, updated_at = excluded.updated_at
+                integration_sha = excluded.integration_sha, updated_at = excluded.updated_at,
+                human_gate_plan_approval = excluded.human_gate_plan_approval
             "#,
             params![
                 state.task_id, state.state, state.state_attempt, state.target_branch, state.base_sha,
@@ -1082,6 +1096,7 @@ impl Database {
                 state.approved_plan_hash,
                 state.validation_passed_at.map(|value| value.to_rfc3339()),
                 state.integration_sha, state.updated_at.to_rfc3339(),
+                state.human_gate_plan_approval,
             ],
         )?;
         tx.execute(
@@ -1227,8 +1242,9 @@ impl Database {
                 state = ?2, state_attempt = ?3, target_branch = ?4, base_sha = ?5,
                 plan_revision = ?6, plan_hash = ?7,
                 approved_plan_revision = ?8, approved_plan_hash = ?9,
-                validation_passed_at = ?10, integration_sha = ?11, updated_at = ?12
-            WHERE task_id = ?1 AND state = ?13
+                validation_passed_at = ?10, integration_sha = ?11, updated_at = ?12,
+                human_gate_plan_approval = ?13
+            WHERE task_id = ?1 AND state = ?14
             "#,
             params![
                 state.task_id,
@@ -1243,6 +1259,7 @@ impl Database {
                 state.validation_passed_at.map(|value| value.to_rfc3339()),
                 state.integration_sha,
                 state.updated_at.to_rfc3339(),
+                state.human_gate_plan_approval,
                 record.from_state,
             ],
         )?;

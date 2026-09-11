@@ -759,6 +759,7 @@ mod tests {
             task_after,
             &mut db,
             &runtime,
+            false,
         )
         .unwrap();
         let WorkflowStepOutcome::Advanced { task: started, .. } = outcome else {

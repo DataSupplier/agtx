@@ -37,7 +37,8 @@ use crate::workflow_executor::{
     admit_task, complete_feature_integration, decide_workflow_plan, reset_workflow_to_backlog,
     restart_workflow_step, revoke_workflow_admission, start_workflow_implementation,
     start_workflow_planning, submit_engineering_review, submit_final_validation,
-    submit_workflow_implementation, submit_workflow_plan, WorkflowRuntime, WorkflowStepOutcome,
+    submit_workflow_implementation, submit_workflow_plan, AutomationDecision, WorkflowRuntime,
+    WorkflowStepOutcome,
 };
 use crate::AppMode;
 
@@ -407,6 +408,9 @@ struct AppState {
     reset_confirm_popup: Option<ResetConfirmPopup>,
     // Confirmation popup for asking if user wants to create PR when moving to Review
     review_confirm_popup: Option<ReviewConfirmPopup>,
+    // Asks whether this task's plan approval requires human sign-off before
+    // automation may advance it, shown on a fresh Shift+S planning start.
+    plan_approval_gate_popup: Option<PlanApprovalGatePopup>,
     // Trust-on-first-use confirmation popup
     trust_confirm_popup: Option<TrustConfirmPopup>,
     // Channel for receiving background worktree setup results
@@ -743,6 +747,14 @@ struct ReviewConfirmPopup {
     task_title: String,
 }
 
+/// State for asking, on a fresh Shift+S planning start, whether this task's
+/// plan approval requires human sign-off even when automation is enabled.
+#[derive(Debug, Clone)]
+struct PlanApprovalGatePopup {
+    task_id: String,
+    task_title: String,
+}
+
 /// State for plugin selection popup
 #[derive(Debug, Clone)]
 struct PluginSelectPopup {
@@ -946,6 +958,7 @@ impl App {
                 delete_confirm_popup: None,
                 reset_confirm_popup: None,
                 review_confirm_popup: None,
+                plan_approval_gate_popup: None,
                 trust_confirm_popup: None,
                 phase_status_cache: HashMap::new(),
                 last_transition_poll: Instant::now(),
@@ -1201,6 +1214,7 @@ impl App {
                 delete_confirm_popup: None,
                 reset_confirm_popup: None,
                 review_confirm_popup: None,
+                plan_approval_gate_popup: None,
                 trust_confirm_popup: None,
                 phase_status_cache: HashMap::new(),
                 last_transition_poll: Instant::now(),
@@ -2567,6 +2581,34 @@ impl App {
             frame.render_widget(content, inner);
         }
 
+        // Plan-approval human-gate popup (asked on a fresh Shift+S start)
+        if let Some(ref popup) = state.plan_approval_gate_popup {
+            let popup_area = centered_rect(55, 28, area);
+            frame.render_widget(Clear, popup_area);
+
+            let main_block = Block::default()
+                .title(" Require Plan Approval? ")
+                .borders(Borders::ALL)
+                .border_style(
+                    Style::default().fg(hex_to_color(&state.config.theme.color_popup_border)),
+                );
+            frame.render_widget(main_block, popup_area);
+
+            let inner = popup_area.inner(ratatui::layout::Margin {
+                horizontal: 2,
+                vertical: 2,
+            });
+            let text = format!(
+                "Starting planning for:\n\n\"{}\"\n\nRequire your approval before implementation starts, even with automation enabled?\n\n[y] Yes, gate this task    [n] No, use project automation    [Esc] Cancel",
+                popup.task_title
+            );
+            let content = Paragraph::new(text)
+                .style(Style::default().fg(Color::White))
+                .alignment(ratatui::layout::Alignment::Center)
+                .wrap(Wrap { trim: false });
+            frame.render_widget(content, inner);
+        }
+
         // Trust confirmation popup
         if let Some(ref popup) = state.trust_confirm_popup {
             // Sized to the content. At a fixed 30% height the answer line fell
@@ -3548,6 +3590,10 @@ impl App {
             return self.handle_review_confirm_key(key);
         }
 
+        if self.state.plan_approval_gate_popup.is_some() {
+            return self.handle_plan_approval_gate_key(key);
+        }
+
         // Handle update popup if open
         if self.state.update_popup.is_some() {
             return self.handle_update_popup_key(key);
@@ -3708,6 +3754,30 @@ impl App {
                 KeyCode::Esc => {
                     // Cancelled - don't move
                     self.state.review_confirm_popup = None;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_plan_approval_gate_key(&mut self, key: crossterm::event::KeyEvent) -> Result<()> {
+        if let Some(popup) = self.state.plan_approval_gate_popup.clone() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    // Require human sign-off on this task's plan approval
+                    self.state.plan_approval_gate_popup = None;
+                    self.start_selected_workflow_planning_with_gate(&popup.task_id, true)?;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') => {
+                    // Leave this task on whatever the project's own
+                    // automation policy already decides
+                    self.state.plan_approval_gate_popup = None;
+                    self.start_selected_workflow_planning_with_gate(&popup.task_id, false)?;
+                }
+                KeyCode::Esc => {
+                    // Cancelled - don't start planning
+                    self.state.plan_approval_gate_popup = None;
                 }
                 _ => {}
             }
@@ -6112,13 +6182,51 @@ impl App {
         self.apply_workflow_step_outcome(outcome)
     }
     /// Start the configured planner from an admitted task worktree.
+    ///
+    /// A fresh start first asks, via `plan_approval_gate_popup`, whether this
+    /// task's plan approval should require human sign-off even when
+    /// automation is enabled. Restarting an already-`planning` task skips the
+    /// popup and goes straight to `start_selected_workflow_planning_with_gate`,
+    /// since `start_workflow_planning` only stamps that flag on a fresh start.
     fn start_selected_workflow_planning(&mut self) -> Result<()> {
-        let (task, project_path) = match (
-            self.state.board.selected_task().cloned(),
-            self.state.project_path.clone(),
-        ) {
-            (Some(task), Some(project_path)) => (task, project_path),
-            _ => return Ok(()),
+        let Some(task) = self.state.board.selected_task().cloned() else {
+            return Ok(());
+        };
+        let is_restart = self
+            .state
+            .db
+            .as_ref()
+            .and_then(|db| db.get_workflow_task_state(&task.id).ok().flatten())
+            .map(|state| state.state == "planning")
+            .unwrap_or(false);
+        if is_restart {
+            return self.start_selected_workflow_planning_with_gate(&task.id, false);
+        }
+        self.state.plan_approval_gate_popup = Some(PlanApprovalGatePopup {
+            task_id: task.id,
+            task_title: task.title,
+        });
+        Ok(())
+    }
+
+    /// The actual launch, deferred behind `plan_approval_gate_popup`'s
+    /// y/n/Esc answer (or called directly for a restart, which never shows
+    /// that popup).
+    fn start_selected_workflow_planning_with_gate(
+        &mut self,
+        task_id: &str,
+        require_plan_approval: bool,
+    ) -> Result<()> {
+        let Some(project_path) = self.state.project_path.clone() else {
+            return Ok(());
+        };
+        let Some(task) = self
+            .state
+            .db
+            .as_ref()
+            .and_then(|db| db.get_task(task_id).ok().flatten())
+        else {
+            return Ok(());
         };
         let Some(plugin) = self.load_task_plugin(&task) else {
             return Ok(());
@@ -6148,8 +6256,15 @@ impl App {
             .db
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("project database is unavailable"))?;
-        let outcome =
-            start_workflow_planning(workflow, &project_workflow, &plugin, task, db, &runtime)?;
+        let outcome = start_workflow_planning(
+            workflow,
+            &project_workflow,
+            &plugin,
+            task,
+            db,
+            &runtime,
+            require_plan_approval,
+        )?;
         self.apply_workflow_step_outcome(outcome)
     }
 
@@ -6544,6 +6659,28 @@ impl App {
         let advanced = results
             .iter()
             .any(|result| matches!(result.outcome, Some(WorkflowStepOutcome::Advanced { .. })));
+        // `HumanGate` deliberately produces no outcome (nothing was
+        // attempted this tick), so without this a gated task would look
+        // exactly like one still waiting on its agent. Surface the first one
+        // found as a footer toast; re-running every tick while the gate
+        // holds keeps it visible rather than letting the toast's own timeout
+        // hide it, and `assess` re-derives the same reason fresh each time
+        // so this never goes stale.
+        if let Some(result) = results
+            .iter()
+            .find(|result| matches!(result.decision, AutomationDecision::HumanGate(_)))
+        {
+            if let AutomationDecision::HumanGate(reason) = &result.decision {
+                let title = db
+                    .get_task(&result.task_id)
+                    .ok()
+                    .flatten()
+                    .map(|task| task.title)
+                    .unwrap_or_else(|| result.task_id.clone());
+                self.state.warning_message =
+                    Some((format!("\"{title}\": {reason}"), Instant::now()));
+            }
+        }
         if advanced {
             let _ = self.refresh_tasks();
         }
