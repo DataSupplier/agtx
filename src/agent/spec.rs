@@ -923,11 +923,22 @@ pub fn spec(name: &str) -> Option<&'static AgentSpec> {
 /// outer quote and let the shell mangle the text.
 /// Largest prompt agtx will hand to a process in argv.
 ///
-/// `ARG_MAX` is ~1 MB on macOS and Linux and task descriptions are far below
-/// that, but the limit should be explicit rather than incidental: past this the
-/// caller falls back to the mid-session lane, which has no such ceiling. Counted
-/// in bytes, not chars, because that is what `execve` counts.
-pub const MAX_LAUNCH_PROMPT_BYTES: usize = 128 * 1024;
+/// This is bounded by tmux itself, not the OS: the built command reaches tmux
+/// as one client/server protocol message (`new-window ... sh -c '<command>'`),
+/// and tmux's own message-size ceiling — not `execve`'s `ARG_MAX` — is what
+/// actually fails first. Measured empirically against the tmux build this
+/// image ships: `new-window` with a command around 16-17 KB starts failing
+/// with tmux's own "command too long", well under any OS argv limit. The
+/// prompt itself is quoted at least twice before it reaches tmux (once by
+/// `compose_command` embedding it in the agent's launch line, again by
+/// `create_window` wrapping the whole line in `sh -c '…'`), and each embedded
+/// `'` inflates on every such pass — so this stays well under the measured
+/// wall to leave headroom for that quoting and for the fixed CLI-flag/prompt-
+/// template text around it, not just for the raw prompt bytes. Past this
+/// limit the caller falls back to the mid-session lane, which has no such
+/// ceiling. Counted in bytes, not chars, because that is what the underlying
+/// message size counts.
+pub const MAX_LAUNCH_PROMPT_BYTES: usize = 4 * 1024;
 
 /// Strip characters that cannot survive the trip through argv intact.
 ///

@@ -920,12 +920,14 @@ pub fn start_workflow_planning(
         );
         switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command)?;
     } else {
-        // A prompt embedded directly in the launch command becomes a single
-        // tmux/shell argv element; large enough and tmux's own re-exec of it
-        // fails with "command too long". Past that ceiling, launch with no
-        // prompt and deliver it afterward via paste_text (stdin, no argv
-        // limit) instead — same approach already used by the TUI's
-        // agent-switch launch flow.
+        // A prompt embedded directly in the launch command becomes part of
+        // one tmux client/server message; large enough (see
+        // `MAX_LAUNCH_PROMPT_BYTES`'s doc comment for the measured ceiling)
+        // and tmux itself rejects it with "command too long" before the
+        // window is ever created. Past that ceiling, launch with no prompt
+        // and deliver it afterward via paste_text (stdin, no such limit)
+        // instead — same approach already used by the TUI's agent-switch
+        // launch flow.
         let can_embed = crate::agent::spec::can_launch_with_prompt(
             agent_ops.prompt_injection(),
             &prompt,
@@ -3058,11 +3060,11 @@ mod launch_tests {
 
     /// A task description large enough to push the built prompt past
     /// `MAX_LAUNCH_PROMPT_BYTES` must not be embedded in the `create_window`
-    /// launch command -- that becomes a single tmux/shell argv element, and
-    /// tmux's own re-exec of an oversized one fails with "command too long"
-    /// (the crash this test guards against). Instead the window must launch
-    /// with an empty prompt and the real prompt must be delivered afterward
-    /// via `paste_text` + a literal `Enter` keypress.
+    /// launch command -- past that (empirically measured) size, tmux itself
+    /// rejects the command with "command too long" (the crash this test
+    /// guards against). Instead the window must launch with an empty prompt
+    /// and the real prompt must be delivered afterward via `paste_text` + a
+    /// literal `Enter` keypress.
     #[test]
     fn start_workflow_implementation_defers_an_oversized_prompt_to_paste_text() {
         let graph = WorkflowDefinition {
@@ -3107,7 +3109,7 @@ mod launch_tests {
         plugin.prompts.running = Some("Implement: {task}".into());
 
         let mut task = crate::db::Task::new("Implement thing", "codex", "proj");
-        // Comfortably past MAX_LAUNCH_PROMPT_BYTES (128 KiB).
+        // Comfortably past MAX_LAUNCH_PROMPT_BYTES (4 KiB).
         task.description = Some("x".repeat(200_000));
         task.worktree_path = Some("C:/work/wt".into());
 
