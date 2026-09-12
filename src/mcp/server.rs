@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{GlobalConfig, ProjectConfig};
 use crate::core::actions::CallerKind;
 use crate::db::{Database, Task, TaskStatus, TransitionRequest};
+use crate::tmux::{RealTmuxOps, TmuxOperations};
 
 /// Whether the MCP server is bound to a specific project or serves all projects globally.
 #[derive(Debug, Clone)]
@@ -952,26 +953,19 @@ impl AgtxMcpServer {
             None => return format!("Task {} has no active session", params.task_id),
         };
 
-        // Send the message text
-        let send_text = Command::new("tmux")
-            .args([
-                "-L",
-                "agtx",
-                "send-keys",
-                "-t",
-                &session_name,
-                &params.message,
-            ])
-            .output();
-
-        if let Err(e) = send_text {
+        // Send the message text via tmux's load-buffer/paste-buffer, piping the
+        // text over stdin rather than passing it as a `send-keys` argv element.
+        // A `send-keys` argument is subject to Linux's per-argument MAX_ARG_STRLEN
+        // (128 KiB), well under MAX_MESSAGE_LENGTH above and well below what a
+        // pasted task description/instruction can reasonably reach — paste_text
+        // has no such ceiling.
+        let tmux = RealTmuxOps;
+        if let Err(e) = tmux.paste_text(&session_name, &params.message) {
             return format!("Error sending message: {}", e);
         }
 
         // Send Enter
-        let send_enter = Command::new("tmux")
-            .args(["-L", "agtx", "send-keys", "-t", &session_name, "Enter"])
-            .output();
+        let send_enter = tmux.send_key(&session_name, "Enter");
 
         match send_enter {
             Ok(_) => {
