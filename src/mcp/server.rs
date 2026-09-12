@@ -911,8 +911,12 @@ impl AgtxMcpServer {
     fn send_to_task(&self, Parameters(params): Parameters<SendToTaskParams>) -> String {
         tracing::info!(tool = "send_to_task", task_id = %params.task_id, "MCP tool called");
 
-        // Input validation: limit message length and reject null bytes
-        const MAX_MESSAGE_LENGTH: usize = 4096;
+        // Input validation: limit message length and reject null bytes.
+        // The message is passed as a single argv element straight to a `tmux`
+        // subprocess (no shell, no tmux control-mode parsing), so the real
+        // ceiling is the OS ARG_MAX (~1-2MB on Linux/macOS). Cap well under
+        // that rather than at an arbitrary small value.
+        const MAX_MESSAGE_LENGTH: usize = 1024 * 1024;
         if params.message.len() > MAX_MESSAGE_LENGTH {
             return format!(
                 "Error: message too long ({} bytes, max {})",
