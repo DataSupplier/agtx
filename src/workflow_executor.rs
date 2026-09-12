@@ -1033,12 +1033,22 @@ pub fn submit_workflow_plan(
         .destination_agent
         .clone()
         .ok_or_else(|| anyhow::anyhow!("Plan review state has no bound agent"))?;
+    let review_artifact_path = workflow_artifact_path(
+        &worktree,
+        plugin.artifacts.plan_review.as_deref(),
+        &task.id,
+        ".agent-flow/plan-review.yaml",
+    );
     let prompt = format!(
-        "You are the plan reviewer for task {}. Review only {} (revision {}, SHA-256 {}). Do not implement code. This plan was produced during planning attempt {producer_attempt}; its embedded workflow_attempt must remain that producer attempt. Do not request changes solely because it differs from your review attempt. Check it against the task, identify concrete changes if needed, then write .agent-flow/plan-review.yaml in this task worktree containing: verdict: approved or verdict: changes_requested (exactly one of these two strings), findings: with your specific, concrete findings -- especially when requesting changes, since the planner will receive this exact persisted artifact to revise the plan -- and final_report: a concise reviewer handoff summary.\n\nCurrent review workflow attempt: {n}. Your output artifact MUST contain the line: workflow_attempt: {n}",
+        "You are the plan reviewer for task {}. Review only {} (revision {}, SHA-256 {}). Do not implement code. This plan was produced during planning attempt {producer_attempt}; its embedded workflow_attempt must remain that producer attempt. Do not request changes solely because it differs from your review attempt. Check it against the task, identify concrete changes if needed, then write {} in this task worktree containing: verdict: approved or verdict: changes_requested (exactly one of these two strings), findings: with your specific, concrete findings -- especially when requesting changes, since the planner will receive this exact persisted artifact to revise the plan -- and final_report: a concise reviewer handoff summary.\n\nCurrent review workflow attempt: {n}. Your output artifact MUST contain the line: workflow_attempt: {n}",
         task.id,
         path.strip_prefix(&worktree).unwrap_or(&path).display(),
         revision,
         evidenced.plan_hash.as_deref().unwrap_or_default(),
+        review_artifact_path
+            .strip_prefix(&worktree)
+            .unwrap_or(&review_artifact_path)
+            .display(),
         producer_attempt = current.state_attempt,
         n = handoff.state.state_attempt,
     );
@@ -1419,7 +1429,12 @@ pub fn submit_workflow_implementation(
     let Some(current) = db.get_workflow_task_state(&task.id)? else {
         return Ok(WorkflowStepOutcome::NoOp);
     };
-    let artifact = Path::new(&worktree).join(".agent-flow/implementation-result.yaml");
+    let artifact = workflow_artifact_path(
+        &worktree,
+        plugin.artifacts.running.as_deref(),
+        &task.id,
+        ".agent-flow/implementation-result.yaml",
+    );
     if !artifact.is_file() {
         return Ok(WorkflowStepOutcome::Blocked {
             message: format!("Missing implementation evidence: {}", artifact.display()),
@@ -1852,14 +1867,23 @@ pub enum AutomationDecision {
 /// already compute them for their own action -- reused here rather than
 /// re-derived, since `assess` has no specific action in mind and instead
 /// asks the graph which actions are currently legal at all.
-pub fn guard_context_for(db: &Database, task: &Task, state: &WorkflowTaskState) -> GuardContext {
+pub fn guard_context_for(
+    db: &Database,
+    task: &Task,
+    state: &WorkflowTaskState,
+    plugin: &WorkflowPlugin,
+) -> GuardContext {
     let implementation_recorded = task
         .worktree_path
         .as_deref()
         .map(|worktree| {
-            Path::new(worktree)
-                .join(".agent-flow/implementation-result.yaml")
-                .is_file()
+            workflow_artifact_path(
+                worktree,
+                plugin.artifacts.running.as_deref(),
+                &task.id,
+                ".agent-flow/implementation-result.yaml",
+            )
+            .is_file()
         })
         .unwrap_or(false);
     GuardContext {
@@ -1956,7 +1980,7 @@ pub fn assess(
         );
     }
 
-    let guards = guard_context_for(db, task, state);
+    let guards = guard_context_for(db, task, state, plugin);
     let available = workflow.available_transitions(&state.state, guards);
     if available.is_empty() {
         return AutomationDecision::Wait;
@@ -1992,7 +2016,7 @@ pub fn assess(
         "plan_review" => assess_plan_review(worktree, plugin, task, state),
         "engineering_review" => assess_engineering_review(worktree, plugin, task, state),
         "final_validation" => assess_final_validation(worktree, plugin, task, state),
-        "implementing" | "running" => assess_implementation(worktree, state),
+        "implementing" | "running" => assess_implementation(worktree, plugin, task, state),
         // A role state this function does not yet know an artifact mapping
         // for. Nothing to read, so nothing to report.
         _ => AutomationDecision::Wait,
@@ -2216,8 +2240,18 @@ fn assess_feature_integration(
 /// Mirrors `submit_workflow_implementation`'s evidence check: the
 /// implementer's result file has no verdict of its own, it is either
 /// present (and fresh) or it is not.
-fn assess_implementation(worktree: &str, state: &WorkflowTaskState) -> AutomationDecision {
-    let artifact = Path::new(worktree).join(".agent-flow/implementation-result.yaml");
+fn assess_implementation(
+    worktree: &str,
+    plugin: &WorkflowPlugin,
+    task: &Task,
+    state: &WorkflowTaskState,
+) -> AutomationDecision {
+    let artifact = workflow_artifact_path(
+        worktree,
+        plugin.artifacts.running.as_deref(),
+        &task.id,
+        ".agent-flow/implementation-result.yaml",
+    );
     match artifact_freshness(&artifact, state) {
         Some(decision) => decision,
         None => AutomationDecision::Advance("implementation_complete".to_string()),
@@ -2520,6 +2554,82 @@ mod tests {
             decision,
             AutomationDecision::Advance("start_final_validation".to_string())
         );
+    }
+
+    #[test]
+    fn assess_implementation_resolves_a_task_scoped_artifact_path() {
+        // `running`'s artifact check used to hardcode a flat
+        // `.agent-flow/implementation-result.yaml` path, ignoring
+        // `plugin.artifacts.running` entirely -- unlike every sibling
+        // `assess_*` function. This pins the fix: a `{task_id}`-templated
+        // `plugin.artifacts.running` must actually be consulted.
+        let mut graph = assess_workflow();
+        // `assess_workflow()`'s fixture has no outgoing transition from
+        // `running` at all; add one so `assess` reaches the
+        // `available_transitions` check and falls through into the
+        // `"running" => assess_implementation(...)` match arm this test
+        // actually exercises, instead of short-circuiting to `Wait` earlier.
+        graph.transitions.push(WorkflowTransition {
+            action: "implementation_complete".into(),
+            from: "running".into(),
+            to: "engineering_review".into(),
+            guards: vec![],
+        });
+        let mut plugin = plugin_for_tests(graph.clone());
+        plugin.artifacts.running = Some(".agent-flow/{task_id}/implementation-result.yaml".into());
+        let worktree = tempfile::tempdir().unwrap();
+        let task = admitted_task(worktree.path());
+        std::fs::create_dir_all(worktree.path().join(".agent-flow").join(&task.id)).unwrap();
+        std::fs::write(
+            worktree
+                .path()
+                .join(".agent-flow")
+                .join(&task.id)
+                .join("implementation-result.yaml"),
+            "workflow_attempt: 1\n",
+        )
+        .unwrap();
+        let mut state = WorkflowTaskState::new(&task.id, "running", "main");
+        state.state_attempt = 1;
+        let db = Database::open_in_memory_project().unwrap();
+
+        let decision = assess(&graph, &project(), &plugin, &task, &state, &db);
+        assert_eq!(
+            decision,
+            AutomationDecision::Advance("implementation_complete".to_string())
+        );
+
+        // Sanity check the flat (pre-fix) path was deliberately left empty:
+        // if the fix regressed to reading the old hardcoded path instead of
+        // the task-scoped one, this artifact wouldn't exist there and the
+        // decision above would be Wait, not Advance.
+        assert!(!worktree
+            .path()
+            .join(".agent-flow/implementation-result.yaml")
+            .exists());
+    }
+
+    #[test]
+    fn guard_context_for_resolves_a_task_scoped_implementation_artifact() {
+        let mut plugin = plugin_for_tests(assess_workflow());
+        plugin.artifacts.running = Some(".agent-flow/{task_id}/implementation-result.yaml".into());
+        let worktree = tempfile::tempdir().unwrap();
+        let task = admitted_task(worktree.path());
+        std::fs::create_dir_all(worktree.path().join(".agent-flow").join(&task.id)).unwrap();
+        std::fs::write(
+            worktree
+                .path()
+                .join(".agent-flow")
+                .join(&task.id)
+                .join("implementation-result.yaml"),
+            "workflow_attempt: 1\n",
+        )
+        .unwrap();
+        let state = WorkflowTaskState::new(&task.id, "running", "main");
+        let db = Database::open_in_memory_project().unwrap();
+
+        let guards = guard_context_for(&db, &task, &state, &plugin);
+        assert!(guards.implementation_recorded);
     }
 
     #[test]
@@ -3829,6 +3939,146 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         assert_eq!(
             db.get_workflow_task_state(&task.id).unwrap().unwrap().state,
             "plan_review"
+        );
+    }
+
+    /// `submit_workflow_plan`'s reviewer prompt used to hardcode a flat
+    /// `.agent-flow/plan-review.yaml` write instruction regardless of
+    /// `plugin.artifacts.plan_review`, unlike every other artifact-writing
+    /// prompt in this plugin. Pins the fix: a `{task_id}`-templated
+    /// `plugin.artifacts.plan_review` must be reflected in the prompt text
+    /// actually delivered to the reviewer agent.
+    #[test]
+    fn submit_workflow_plan_prompt_references_the_task_scoped_review_path() {
+        let graph = WorkflowDefinition {
+            initial_state: "planning".into(),
+            states: vec![
+                WorkflowState {
+                    id: "planning".into(),
+                    label: "Planning".into(),
+                    role: Some("planner".into()),
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "plan_review".into(),
+                    label: "Plan review".into(),
+                    role: Some("plan_reviewer".into()),
+                    terminal: true,
+                },
+            ],
+            transitions: vec![WorkflowTransition {
+                action: "submit_plan".into(),
+                from: "planning".into(),
+                to: "plan_review".into(),
+                guards: vec![],
+            }],
+        };
+        graph.validate().unwrap();
+
+        let mut project = WorkflowProjectConfig {
+            target_branch: "main".into(),
+            role_bindings: Default::default(),
+            ..Default::default()
+        };
+        project
+            .role_bindings
+            .insert("planner".into(), "claude".into());
+        project
+            .role_bindings
+            .insert("plan_reviewer".into(), "claude".into());
+        project
+            .role_policies
+            .roles
+            .insert("plan_reviewer".into(), WorkflowRolePolicy::default());
+
+        let mut plugin = plugin(graph.clone());
+        plugin.artifacts.planning = Some(".agent-flow/plan.yaml".into());
+        plugin.artifacts.plan_review = Some(".agent-flow/{task_id}/plan-review.yaml".into());
+
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
+        std::fs::write(
+            worktree.path().join(".agent-flow/plan.yaml"),
+            "plan_revision: 1\n",
+        )
+        .unwrap();
+
+        let mut task = crate::db::Task::new("Plan thing", "claude", "proj");
+        task.worktree_path = Some(worktree.path().to_string_lossy().to_string());
+        task.session_name = Some("proj:task-plan".into());
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("wf.db");
+        let mut db = Database::open_project_at_path(&db_path).unwrap();
+        db.create_task(&task).unwrap();
+        let current = WorkflowTaskState::new(&task.id, "planning", "main");
+        let record = WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "planning");
+        db.record_workflow_admission(&task, &current, &record)
+            .unwrap();
+
+        let mut mock_tmux = MockTmuxOperations::new();
+        mock_tmux
+            .expect_send_keys()
+            .withf(|_, cmd: &str| cmd == "/exit")
+            .returning(|_, _| Ok(()));
+        mock_tmux.expect_send_key().returning(|_, _| Ok(()));
+        let command_checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let command_checks_for_mock = Arc::clone(&command_checks);
+        mock_tmux.expect_pane_current_command().returning(move |_| {
+            if command_checks_for_mock.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Some("bash".to_string())
+            } else {
+                Some("claude".to_string())
+            }
+        });
+        mock_tmux
+            .expect_capture_pane()
+            .returning(|_| Ok(String::new()));
+        let captured_prompt = Arc::new(Mutex::new(None));
+        let captured_prompt_clone = captured_prompt.clone();
+        mock_tmux.expect_paste_text().returning(move |_, text| {
+            *captured_prompt_clone.lock().unwrap() = Some(text.to_string());
+            Ok(())
+        });
+
+        let mut mock_registry = MockAgentRegistry::new();
+        mock_registry
+            .expect_get()
+            .returning(|_| Arc::new(MockAgentOperations::new()) as Arc<dyn AgentOperations>);
+
+        let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(mock_tmux);
+        let agent_registry: Arc<dyn AgentRegistry> = Arc::new(mock_registry);
+        let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
+        let config = merged_config();
+        let flags = feature_flags();
+        let runtime = WorkflowRuntime {
+            tmux_ops: &tmux_ops,
+            agent_registry: &agent_registry,
+            git_ops: &git_ops,
+            tmux_project_name: "proj",
+            project_path: Path::new("C:/work/project"),
+            config: &config,
+            flags: &flags,
+        };
+
+        let outcome =
+            submit_workflow_plan(&graph, &project, &plugin, task.clone(), &mut db, &runtime)
+                .unwrap();
+        assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
+
+        let prompt = captured_prompt
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("paste_text should have delivered the reviewer prompt");
+        let expected_path = format!(".agent-flow/{}/plan-review.yaml", task.id);
+        assert!(
+            prompt.contains(&expected_path),
+            "prompt must tell the reviewer to write the task-scoped path {expected_path}, got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("write .agent-flow/plan-review.yaml"),
+            "prompt must not still reference the old flat path"
         );
     }
 

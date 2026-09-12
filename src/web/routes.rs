@@ -379,7 +379,7 @@ fn card(
     // callers already use -- no mutation, no tmux, no `run_automation_tick`.
     let (workflow_actions, automation_status) = match (workflow_ctx, &workflow_task_state) {
         (Some(ctx), Some(state)) => {
-            let guards = crate::workflow_executor::guard_context_for(db, &t, state);
+            let guards = crate::workflow_executor::guard_context_for(db, &t, state, &ctx.plugin);
             let actions = ctx
                 .workflow
                 .available_transitions(&state.state, guards)
