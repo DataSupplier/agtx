@@ -525,8 +525,13 @@ mod tests {
 
     fn permissive_registry() -> MockAgentRegistry {
         let mut mock = MockAgentRegistry::new();
-        mock.expect_get()
-            .returning(|_| Arc::new(MockAgentOperations::new()) as Arc<dyn AgentOperations>);
+        mock.expect_get().returning(|_| {
+            let mut agent_ops = MockAgentOperations::new();
+            agent_ops
+                .expect_prompt_injection()
+                .returning(|| crate::agent::PromptInjection::Argv);
+            Arc::new(agent_ops) as Arc<dyn AgentOperations>
+        });
         mock
     }
 

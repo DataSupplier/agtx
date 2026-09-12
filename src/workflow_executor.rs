@@ -24,7 +24,8 @@ use crate::tui::app::{
     agtx_task_env, archive_workflow_artifact, build_policy_agent_command,
     ensure_project_tmux_session, ensure_review_addresses_failed_validation, generate_task_slug,
     plan_revision, planning_artifact_path, resolve_prompt, switch_agent_in_tmux,
-    workflow_artifact_path, workflow_artifact_sha256, workflow_artifact_value,
+    wait_for_agent_ready, workflow_artifact_path, workflow_artifact_sha256,
+    workflow_artifact_value,
 };
 use crate::workflow::{GuardContext, WorkflowDefinition, WorkflowProjectConfig};
 
@@ -902,13 +903,6 @@ pub fn start_workflow_planning(
         runtime.tmux_ops.as_ref(),
     );
     let policy = project_workflow.policy_for_state(workflow, &planning_state)?;
-    let command = build_policy_agent_command(
-        agent_ops.as_ref(),
-        &planner,
-        &prompt,
-        policy.as_ref(),
-        Some(Path::new(&worktree)),
-    );
 
     if let Some(transitions) = &transitions {
         for prepared in transitions {
@@ -917,8 +911,32 @@ pub fn start_workflow_planning(
     }
 
     if restarting && runtime.tmux_ops.window_exists(&target).unwrap_or(false) {
+        let command = build_policy_agent_command(
+            agent_ops.as_ref(),
+            &planner,
+            &prompt,
+            policy.as_ref(),
+            Some(Path::new(&worktree)),
+        );
         switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command)?;
     } else {
+        // A prompt embedded directly in the launch command becomes a single
+        // tmux/shell argv element; large enough and tmux's own re-exec of it
+        // fails with "command too long". Past that ceiling, launch with no
+        // prompt and deliver it afterward via paste_text (stdin, no argv
+        // limit) instead — same approach already used by the TUI's
+        // agent-switch launch flow.
+        let can_embed = crate::agent::spec::can_launch_with_prompt(
+            agent_ops.prompt_injection(),
+            &prompt,
+        );
+        let command = build_policy_agent_command(
+            agent_ops.as_ref(),
+            &planner,
+            if can_embed { &prompt } else { "" },
+            policy.as_ref(),
+            Some(Path::new(&worktree)),
+        );
         runtime.tmux_ops.create_window(
             runtime.tmux_project_name,
             &window_name,
@@ -927,6 +945,16 @@ pub fn start_workflow_planning(
             true,
             &agtx_task_env(&task.id, &worktree),
         )?;
+        if !can_embed {
+            let _ = wait_for_agent_ready(
+                runtime.tmux_ops,
+                &target,
+                Some(&planner),
+                runtime.config.auto_trust,
+            );
+            runtime.tmux_ops.paste_text(&target, &prompt)?;
+            runtime.tmux_ops.send_key(&target, "Enter")?;
+        }
     }
     record_agent_prompt(
         db,
@@ -1290,13 +1318,7 @@ pub fn start_workflow_implementation(
         n = implementation.state.state_attempt,
     );
     let policy = project_workflow.policy_for_state(workflow, &implementation.state.state)?;
-    let command = build_policy_agent_command(
-        runtime.agent_registry.get(&implementer).as_ref(),
-        &implementer,
-        &prompt,
-        policy.as_ref(),
-        Some(Path::new(&worktree)),
-    );
+    let agent_ops = runtime.agent_registry.get(&implementer);
     let existing_target = task.session_name.clone();
     let session_available = existing_target
         .as_ref()
@@ -1309,12 +1331,34 @@ pub fn start_workflow_implementation(
         format!("{}:{window_name}", runtime.tmux_project_name)
     };
     if session_available {
+        let command = build_policy_agent_command(
+            agent_ops.as_ref(),
+            &implementer,
+            &prompt,
+            policy.as_ref(),
+            Some(Path::new(&worktree)),
+        );
         switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command)?;
     } else {
         ensure_project_tmux_session(
             runtime.tmux_project_name,
             runtime.project_path,
             runtime.tmux_ops.as_ref(),
+        );
+        // See the matching comment in `start_workflow_planning`: a prompt
+        // embedded directly in the launch command can overflow tmux's own
+        // command-line re-exec ("command too long"). Defer oversized prompts
+        // to a post-launch paste_text instead.
+        let can_embed = crate::agent::spec::can_launch_with_prompt(
+            agent_ops.prompt_injection(),
+            &prompt,
+        );
+        let command = build_policy_agent_command(
+            agent_ops.as_ref(),
+            &implementer,
+            if can_embed { &prompt } else { "" },
+            policy.as_ref(),
+            Some(Path::new(&worktree)),
         );
         runtime.tmux_ops.create_window(
             runtime.tmux_project_name,
@@ -1324,6 +1368,16 @@ pub fn start_workflow_implementation(
             true,
             &agtx_task_env(&task.id, &worktree),
         )?;
+        if !can_embed {
+            let _ = wait_for_agent_ready(
+                runtime.tmux_ops,
+                &target,
+                Some(&implementer),
+                runtime.config.auto_trust,
+            );
+            runtime.tmux_ops.paste_text(&target, &prompt)?;
+            runtime.tmux_ops.send_key(&target, "Enter")?;
+        }
     }
     record_agent_prompt(
         db,
@@ -2938,9 +2992,13 @@ mod launch_tests {
             });
 
         let mut mock_registry = MockAgentRegistry::new();
-        mock_registry
-            .expect_get()
-            .returning(|_| Arc::new(MockAgentOperations::new()) as Arc<dyn AgentOperations>);
+        mock_registry.expect_get().returning(|_| {
+            let mut agent_ops = MockAgentOperations::new();
+            agent_ops
+                .expect_prompt_injection()
+                .returning(|| crate::agent::PromptInjection::Argv);
+            Arc::new(agent_ops) as Arc<dyn AgentOperations>
+        });
 
         let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(mock_tmux);
         let agent_registry: Arc<dyn AgentRegistry> = Arc::new(mock_registry);
@@ -2996,6 +3054,172 @@ mod launch_tests {
             .clone()
             .expect("create_window should receive a command");
         assert_eq!(actual, expected);
+    }
+
+    /// A task description large enough to push the built prompt past
+    /// `MAX_LAUNCH_PROMPT_BYTES` must not be embedded in the `create_window`
+    /// launch command -- that becomes a single tmux/shell argv element, and
+    /// tmux's own re-exec of an oversized one fails with "command too long"
+    /// (the crash this test guards against). Instead the window must launch
+    /// with an empty prompt and the real prompt must be delivered afterward
+    /// via `paste_text` + a literal `Enter` keypress.
+    #[test]
+    fn start_workflow_implementation_defers_an_oversized_prompt_to_paste_text() {
+        let graph = WorkflowDefinition {
+            initial_state: "plan_review".into(),
+            states: vec![
+                WorkflowState {
+                    id: "plan_review".into(),
+                    label: "Plan review".into(),
+                    role: None,
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "implementation".into(),
+                    label: "Implementation".into(),
+                    role: Some("implementer".into()),
+                    terminal: true,
+                },
+            ],
+            transitions: vec![WorkflowTransition {
+                action: "start_implementation".into(),
+                from: "plan_review".into(),
+                to: "implementation".into(),
+                guards: vec![crate::workflow::WorkflowGuard::ApprovedPlan],
+            }],
+        };
+        graph.validate().unwrap();
+
+        let mut project = WorkflowProjectConfig {
+            target_branch: "main".into(),
+            role_bindings: Default::default(),
+            ..Default::default()
+        };
+        project
+            .role_bindings
+            .insert("implementer".into(), "claude".into());
+        project
+            .role_policies
+            .roles
+            .insert("implementer".into(), WorkflowRolePolicy::default());
+
+        let mut plugin = plugin(graph.clone());
+        plugin.prompts.running = Some("Implement: {task}".into());
+
+        let mut task = crate::db::Task::new("Implement thing", "codex", "proj");
+        // Comfortably past MAX_LAUNCH_PROMPT_BYTES (128 KiB).
+        task.description = Some("x".repeat(200_000));
+        task.worktree_path = Some("C:/work/wt".into());
+
+        let mut db = Database::open_in_memory_project().unwrap();
+        db.create_task(&task).unwrap();
+        let mut current = WorkflowTaskState::new(&task.id, "plan_review", "main");
+        current.plan_revision = 2;
+        current.plan_hash = Some("abc123".into());
+        current.approved_plan_revision = Some(2);
+        current.approved_plan_hash = Some("abc123".into());
+        let record = WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "plan_review");
+        db.record_workflow_admission(&task, &current, &record)
+            .unwrap();
+
+        let mut mock_tmux = MockTmuxOperations::new();
+        mock_tmux.expect_has_session().returning(|_| true);
+        let captured_command = Arc::new(Mutex::new(None));
+        let captured_command_clone = captured_command.clone();
+        mock_tmux
+            .expect_create_window()
+            .returning(move |_, _, _, command, _, _| {
+                *captured_command_clone.lock().unwrap() = command;
+                Ok(())
+            });
+        // Lets `wait_for_agent_ready`'s Step 1 break immediately instead of
+        // polling for 30s: a non-shell `pane_current_command` reads as "the
+        // agent process is already running".
+        mock_tmux
+            .expect_pane_current_command()
+            .returning(|_| Some("claude".to_string()));
+        // Constant content lets Step 2's stabilization check succeed on its
+        // first few ticks instead of waiting out its own 30s ceiling.
+        mock_tmux
+            .expect_capture_pane()
+            .returning(|_| Ok("ready".to_string()));
+        let captured_paste = Arc::new(Mutex::new(None));
+        let captured_paste_clone = captured_paste.clone();
+        mock_tmux
+            .expect_paste_text()
+            .returning(move |_, text| {
+                *captured_paste_clone.lock().unwrap() = Some(text.to_string());
+                Ok(())
+            });
+        let sent_enter = Arc::new(Mutex::new(false));
+        let sent_enter_clone = sent_enter.clone();
+        mock_tmux
+            .expect_send_key()
+            .returning(move |_, key| {
+                if key == "Enter" {
+                    *sent_enter_clone.lock().unwrap() = true;
+                }
+                Ok(())
+            });
+
+        let mut mock_registry = MockAgentRegistry::new();
+        mock_registry.expect_get().returning(|_| {
+            let mut agent_ops = MockAgentOperations::new();
+            agent_ops
+                .expect_prompt_injection()
+                .returning(|| crate::agent::PromptInjection::Argv);
+            Arc::new(agent_ops) as Arc<dyn AgentOperations>
+        });
+
+        let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(mock_tmux);
+        let agent_registry: Arc<dyn AgentRegistry> = Arc::new(mock_registry);
+        let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
+        let config = merged_config();
+        let flags = feature_flags();
+        let runtime = WorkflowRuntime {
+            tmux_ops: &tmux_ops,
+            agent_registry: &agent_registry,
+            git_ops: &git_ops,
+            tmux_project_name: "proj",
+            project_path: Path::new("C:/work/project"),
+            config: &config,
+            flags: &flags,
+        };
+
+        let outcome = start_workflow_implementation(
+            &graph,
+            &project,
+            &plugin,
+            task.clone(),
+            &mut db,
+            &runtime,
+        )
+        .unwrap();
+        assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
+
+        let launch_command = captured_command
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("create_window should receive a command");
+        assert!(
+            !launch_command.contains('x'),
+            "oversized prompt must not be embedded in the launch command: {launch_command}"
+        );
+
+        let pasted = captured_paste
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("paste_text should have delivered the deferred prompt");
+        assert!(
+            pasted.contains(&"x".repeat(200_000)),
+            "paste_text should carry the full oversized prompt"
+        );
+        assert!(
+            *sent_enter.lock().unwrap(),
+            "the deferred prompt must be submitted with Enter"
+        );
     }
 
     /// `submit_engineering_review` parity: an `approved_for_validation`
@@ -3431,9 +3655,13 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             });
 
         let mut mock_registry = MockAgentRegistry::new();
-        mock_registry
-            .expect_get()
-            .returning(|_| Arc::new(MockAgentOperations::new()) as Arc<dyn AgentOperations>);
+        mock_registry.expect_get().returning(|_| {
+            let mut agent_ops = MockAgentOperations::new();
+            agent_ops
+                .expect_prompt_injection()
+                .returning(|| crate::agent::PromptInjection::Argv);
+            Arc::new(agent_ops) as Arc<dyn AgentOperations>
+        });
 
         let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(mock_tmux);
         let agent_registry: Arc<dyn AgentRegistry> = Arc::new(mock_registry);

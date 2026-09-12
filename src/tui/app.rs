@@ -14023,7 +14023,7 @@ fn dismiss_launch_dialog(
     false
 }
 
-fn wait_for_agent_ready(
+pub(crate) fn wait_for_agent_ready(
     tmux_ops: &Arc<dyn TmuxOperations>,
     target: &str,
     agent_name: Option<&str>,
