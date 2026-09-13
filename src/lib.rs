@@ -3,6 +3,7 @@ pub mod config;
 pub mod core;
 pub mod db;
 pub mod git;
+pub mod insights_export;
 pub mod mcp;
 pub mod skills;
 pub mod tmux;

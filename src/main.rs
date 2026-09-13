@@ -28,6 +28,7 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             Some("update") => return run_update(&raw[2..]),
+            Some("export-insights") => return export_insights(&raw[2..]),
             _ => {}
         }
     }
@@ -141,6 +142,22 @@ async fn main() -> Result<()> {
     let mut app = tui::App::new(mode, flags)?;
     app.run().await?;
 
+    Ok(())
+}
+
+/// `agtx export-insights <project>` writes idempotent Heaves ingestion events as NDJSON.
+fn export_insights(args: &[String]) -> Result<()> {
+    let path = args
+        .first()
+        .map(PathBuf::from)
+        .unwrap_or(std::env::current_dir()?);
+    let path = path.canonicalize()?;
+    if !git::is_git_repo(&path) {
+        anyhow::bail!("export-insights requires a git project directory");
+    }
+    for event in agtx::insights_export::export_project(&path)? {
+        println!("{}", serde_json::to_string(&event)?);
+    }
     Ok(())
 }
 

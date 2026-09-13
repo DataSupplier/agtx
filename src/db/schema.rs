@@ -961,6 +961,33 @@ impl Database {
             Err(error) => Err(error.into()),
         }
     }
+
+    /// Read immutable artifact metadata/content for export or recovery. Callers that
+    /// only need observability must use metadata and hashes, never transmit `content`.
+    pub fn workflow_artifacts_for_task(&self, task_id: &str) -> Result<Vec<WorkflowArtifact>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM workflow_artifacts WHERE task_id = ?1 ORDER BY workflow_attempt, state, kind",
+        )?;
+        let rows = stmt.query_map(params![task_id], |row| {
+            let created_at =
+                chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>("created_at")?)
+                    .map(|value| value.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| chrono::Utc::now());
+            Ok(WorkflowArtifact {
+                id: row.get("id")?,
+                task_id: row.get("task_id")?,
+                workflow_attempt: row.get("workflow_attempt")?,
+                state: row.get("state")?,
+                kind: row.get("kind")?,
+                source_path: row.get("source_path")?,
+                sha256: row.get("sha256")?,
+                content: row.get("content")?,
+                created_at,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
     /// Upsert one prompt/evidence snapshot for a state attempt. Callers may
     /// first persist the prompt and later add the artifact and final report.
     pub fn upsert_task_step_report(&self, report: &TaskStepReport) -> Result<()> {
