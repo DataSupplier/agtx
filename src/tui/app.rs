@@ -8463,6 +8463,12 @@ impl App {
         }
 
         match req.action.as_str() {
+            "start_workflow_planning" => {
+                self.start_selected_workflow_planning_with_gate(
+                    &req.task_id,
+                    req.require_plan_approval,
+                )?;
+            }
             "research" => {
                 if task.status != TaskStatus::Backlog {
                     anyhow::bail!(

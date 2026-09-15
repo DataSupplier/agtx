@@ -74,6 +74,23 @@ pub struct MoveTaskParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct StartWorkflowPlanningParams {
+    /// The task ID (UUID).
+    #[schemars(description = "The task ID (UUID)")]
+    pub task_id: String,
+    /// Whether the generated plan needs human approval before implementation.
+    #[schemars(
+        description = "True pauses after planning for manual review; false continues automatically"
+    )]
+    pub require_plan_approval: bool,
+    /// Project ID (required in global mode — call list_projects first to get IDs).
+    #[schemars(
+        description = "Project ID. Required in global mode. Call list_projects first to get project IDs."
+    )]
+    pub project_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetTransitionStatusParams {
     /// The transition request ID returned by move_task
     #[schemars(description = "The transition request ID returned by move_task")]
@@ -747,6 +764,38 @@ impl AgtxMcpServer {
                 }
             }
             Err(e) => e,
+        }
+    }
+
+    #[tool(
+        description = "Queue the Shift+S declarative workflow-planning start for a task. This creates its worktree and launches the configured planner. Set require_plan_approval to true to pause after planning for manual review; false continues automatically. Use get_transition_status to check completion."
+    )]
+    fn start_workflow_planning(
+        &self,
+        Parameters(params): Parameters<StartWorkflowPlanningParams>,
+    ) -> String {
+        match self.open_project_db_for(params.project_id.as_deref()) {
+            Ok(db) => match db.get_task(&params.task_id) {
+                Ok(Some(_)) => {
+                    let mut req = TransitionRequest::new(&params.task_id, "start_workflow_planning");
+                    req.require_plan_approval = params.require_plan_approval;
+                    let request_id = req.id.clone();
+                    match db.create_transition_request(&req) {
+                        Ok(()) => serde_json::to_string_pretty(&MoveTaskResult {
+                            request_id,
+                            message: format!(
+                                "Workflow planning queued for task {}. The agtx TUI will process it shortly.",
+                                params.task_id
+                            ),
+                        })
+                        .unwrap_or_else(|error| format!("Error serializing response: {error}")),
+                        Err(error) => format!("Error creating workflow planning request: {error}"),
+                    }
+                }
+                Ok(None) => format!("Task not found: {}", params.task_id),
+                Err(error) => format!("Error checking task: {error}"),
+            },
+            Err(error) => error,
         }
     }
 

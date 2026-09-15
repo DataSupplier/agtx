@@ -326,6 +326,7 @@ impl Database {
                 id TEXT PRIMARY KEY,
                 task_id TEXT NOT NULL,
                 action TEXT NOT NULL,
+                require_plan_approval INTEGER NOT NULL DEFAULT 0,
                 requested_at TEXT NOT NULL,
                 processed_at TEXT,
                 error TEXT
@@ -358,6 +359,11 @@ impl Database {
 
         let _ = self.conn.execute(
             "ALTER TABLE transition_requests ADD COLUMN claimed_by TEXT",
+            [],
+        );
+
+        let _ = self.conn.execute(
+            "ALTER TABLE transition_requests ADD COLUMN require_plan_approval INTEGER NOT NULL DEFAULT 0",
             [],
         );
 
@@ -1547,14 +1553,15 @@ impl Database {
     pub fn create_transition_request(&self, req: &TransitionRequest) -> Result<()> {
         self.conn.execute(
             r#"
-            INSERT INTO transition_requests (id, task_id, action, reason, requested_at, processed_at, error)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            INSERT INTO transition_requests (id, task_id, action, reason, require_plan_approval, requested_at, processed_at, error)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             "#,
             params![
                 req.id,
                 req.task_id,
                 req.action,
                 req.reason,
+                req.require_plan_approval,
                 req.requested_at.to_rfc3339(),
                 req.processed_at.map(|dt| dt.to_rfc3339()),
                 req.error,
@@ -1646,6 +1653,7 @@ impl Database {
             task_id: row.get("task_id")?,
             action: row.get("action")?,
             reason: row.get("reason").ok().flatten(),
+            require_plan_approval: row.get("require_plan_approval").unwrap_or(false),
             requested_at: chrono::DateTime::parse_from_rfc3339(
                 &row.get::<_, String>("requested_at")?,
             )
