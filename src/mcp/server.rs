@@ -7,6 +7,7 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router, ServerHandler, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::config::{GlobalConfig, ProjectConfig};
 use crate::core::actions::CallerKind;
@@ -139,6 +140,10 @@ pub struct SendToTaskParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CreateTaskParams {
+    /// Optional caller-assigned UUID. When supplied, a retry with an equivalent
+    /// payload reconciles the existing task instead of creating a duplicate.
+    #[schemars(description = "Optional caller-assigned UUID for an idempotent task create")]
+    pub id: Option<String>,
     /// Task title
     #[schemars(description = "Task title")]
     pub title: String,
@@ -167,6 +172,10 @@ pub struct CreateTaskParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct BatchTask {
+    /// Optional caller-assigned UUID. Every supplied ID must be a valid UUID and
+    /// must be unique within the batch.
+    #[schemars(description = "Optional caller-assigned UUID for an idempotent task create")]
+    pub id: Option<String>,
     /// Task title
     #[schemars(description = "Task title")]
     pub title: String,
@@ -181,6 +190,10 @@ pub struct BatchTask {
         description = "Indices (0-based) into the tasks array that this task depends on. Referenced tasks must have a lower index (no forward references)."
     )]
     pub depends_on: Option<Vec<usize>>,
+    /// Explicit task UUID dependencies. This supports dependencies on tasks in
+    /// earlier batches as well as caller-assigned tasks in this batch.
+    #[schemars(description = "Task UUID dependencies; cannot be combined with depends_on")]
+    pub referenced_task_ids: Option<Vec<String>>,
     /// Base branch to create worktree from (defaults to project's main branch)
     #[schemars(
         description = "Base branch to create the worktree from (e.g. another task's branch for stacked PRs). Defaults to project's main branch."
@@ -243,6 +256,30 @@ pub struct DeleteTaskParams {
         description = "Project ID. Required in global mode. Call list_projects first to get project IDs."
     )]
     pub project_id: Option<String>,
+}
+
+fn parse_supplied_task_id(id: Option<&str>) -> Result<Option<String>, String> {
+    match id {
+        None => Ok(None),
+        Some(value) => Uuid::parse_str(value)
+            .map(|uuid| Some(uuid.to_string()))
+            .map_err(|_| format!("Invalid task ID '{}': expected UUID", value)),
+    }
+}
+
+fn task_matches_export(
+    task: &Task,
+    title: &str,
+    description: &Option<String>,
+    plugin: &Option<String>,
+    referenced_tasks: &Option<String>,
+    base_branch: &Option<String>,
+) -> bool {
+    task.title == title
+        && task.description == *description
+        && task.plugin == *plugin
+        && task.referenced_tasks == *referenced_tasks
+        && task.base_branch == *base_branch
 }
 
 // === Response types ===
@@ -1007,11 +1044,48 @@ impl AgtxMcpServer {
             }
         }
 
-        let mut task = Task::new(&params.title, &default_agent, &project_name);
+        let supplied_id = match parse_supplied_task_id(params.id.as_deref()) {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        let resolved_plugin = params.plugin.or(default_plugin);
+        let mut task = match supplied_id {
+            Some(id) => Task::with_id(id, &params.title, &default_agent, &project_name),
+            None => Task::new(&params.title, &default_agent, &project_name),
+        };
         task.description = params.description;
-        task.plugin = params.plugin.or(default_plugin);
+        task.plugin = resolved_plugin;
         task.referenced_tasks = params.referenced_tasks;
         task.base_branch = params.base_branch;
+
+        if params.id.is_some() {
+            match db.get_task(&task.id) {
+                Ok(Some(existing))
+                    if task_matches_export(
+                        &existing,
+                        &task.title,
+                        &task.description,
+                        &task.plugin,
+                        &task.referenced_tasks,
+                        &task.base_branch,
+                    ) =>
+                {
+                    let response = CreateTaskResponse {
+                        id: existing.id,
+                        title: existing.title,
+                        status: existing.status.as_str().to_string(),
+                    };
+                    return serde_json::to_string_pretty(&response)
+                        .unwrap_or_else(|e| format!("Error serializing: {}", e));
+                }
+                Ok(Some(_)) => return format!(
+                    "Identity conflict: task ID {} already exists with a different export payload",
+                    task.id
+                ),
+                Ok(None) => {}
+                Err(e) => return format!("Error checking task identity: {}", e),
+            }
+        }
 
         match db.create_task(&task) {
             Ok(()) => {
@@ -1043,8 +1117,25 @@ impl AgtxMcpServer {
             return "Error: maximum 50 tasks per batch".to_string();
         }
 
-        // Pass 1: Validate index-based dependencies
+        // Pass 1: validate supplied UUIDs and dependency declarations.
+        let mut supplied_ids = std::collections::HashSet::new();
         for (i, batch_task) in params.tasks.iter().enumerate() {
+            if batch_task.depends_on.is_some() && batch_task.referenced_task_ids.is_some() {
+                return format!(
+                    "Error: task[{}] cannot combine depends_on and referenced_task_ids",
+                    i
+                );
+            }
+            if let Some(id) = batch_task.id.as_deref() {
+                let normalized = match parse_supplied_task_id(Some(id)) {
+                    Ok(Some(value)) => value,
+                    Ok(None) => unreachable!(),
+                    Err(error) => return format!("Error: task[{}] {}", i, error),
+                };
+                if !supplied_ids.insert(normalized) {
+                    return format!("Error: task[{}] duplicates a caller-assigned task ID", i);
+                }
+            }
             if let Some(ref deps) = batch_task.depends_on {
                 let mut seen = std::collections::HashSet::new();
                 for &dep_idx in deps {
@@ -1062,6 +1153,19 @@ impl AgtxMcpServer {
                     }
                 }
             }
+            if let Some(ref deps) = batch_task.referenced_task_ids {
+                let mut seen = std::collections::HashSet::new();
+                for id in deps {
+                    let normalized = match parse_supplied_task_id(Some(id)) {
+                        Ok(Some(value)) => value,
+                        Ok(None) => unreachable!(),
+                        Err(error) => return format!("Error: task[{}] dependency {}", i, error),
+                    };
+                    if !seen.insert(normalized) {
+                        return format!("Error: task[{}] has a duplicate referenced_task_id", i);
+                    }
+                }
+            }
         }
 
         let mut db = match self.open_project_db_for(params.project_id.as_deref()) {
@@ -1073,10 +1177,19 @@ impl AgtxMcpServer {
             self.config_defaults_for(params.project_id.as_deref());
         let project_name = self.project_name_for(params.project_id.as_deref());
 
-        // Pass 2: Create all tasks, collect IDs
+        // Pass 2: build all tasks with their supplied IDs where present.
         let mut created_tasks: Vec<Task> = Vec::with_capacity(params.tasks.len());
         for batch_task in &params.tasks {
-            let mut task = Task::new(&batch_task.title, &default_agent, &project_name);
+            let id = match parse_supplied_task_id(batch_task.id.as_deref()) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            let mut task = match id {
+                Some(value) => {
+                    Task::with_id(value, &batch_task.title, &default_agent, &project_name)
+                }
+                None => Task::new(&batch_task.title, &default_agent, &project_name),
+            };
             task.description = batch_task.description.clone();
             task.plugin = batch_task.plugin.clone().or_else(|| default_plugin.clone());
             task.base_branch = batch_task.base_branch.clone();
@@ -1092,10 +1205,56 @@ impl AgtxMcpServer {
                     .collect();
                 created_tasks[i].referenced_tasks = Some(dep_ids.join(","));
             }
+            if let Some(ref deps) = batch_task.referenced_task_ids {
+                created_tasks[i].referenced_tasks = Some(deps.join(","));
+            }
         }
 
-        // Insert all tasks atomically — on any failure none are committed
-        if let Err(e) = db.create_tasks_batch(&created_tasks) {
+        let batch_ids: std::collections::HashSet<&str> =
+            created_tasks.iter().map(|task| task.id.as_str()).collect();
+        for task in &created_tasks {
+            if let Some(ref refs) = task.referenced_tasks {
+                for reference in refs.split(',').filter(|value| !value.is_empty()) {
+                    if batch_ids.contains(reference) {
+                        continue;
+                    }
+                    match db.get_task(reference) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            return format!("Error: referenced task not found: {}", reference)
+                        }
+                        Err(e) => return format!("Error checking referenced task: {}", e),
+                    }
+                }
+            }
+        }
+
+        // Equivalent retries are reconciled without writes. Conflicting source
+        // payloads fail before this batch can partially provision.
+        let mut new_tasks = Vec::new();
+        for task in &created_tasks {
+            match db.get_task(&task.id) {
+                Ok(Some(existing))
+                    if task_matches_export(
+                        &existing,
+                        &task.title,
+                        &task.description,
+                        &task.plugin,
+                        &task.referenced_tasks,
+                        &task.base_branch,
+                    ) => {}
+                Ok(Some(_)) => return format!(
+                    "Identity conflict: task ID {} already exists with a different export payload",
+                    task.id
+                ),
+                Ok(None) => new_tasks.push(task.clone()),
+                Err(e) => return format!("Error checking task identity: {}", e),
+            }
+        }
+
+        // Insert the new subset atomically. Cross-batch graph atomicity is
+        // achieved by idempotent, topologically ordered exporter waves.
+        if let Err(e) = db.create_tasks_batch(&new_tasks) {
             return format!("Error creating tasks: {}", e);
         }
 

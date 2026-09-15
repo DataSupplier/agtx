@@ -127,10 +127,22 @@ impl Task {
         agent: impl Into<String>,
         project_id: impl Into<String>,
     ) -> Self {
-        let id = uuid::Uuid::new_v4().to_string();
+        Self::with_id(uuid::Uuid::new_v4().to_string(), title, agent, project_id)
+    }
+
+    /// Construct a task with an externally assigned, already-validated identity.
+    ///
+    /// This is used by integrations whose source of truth owns the durable task
+    /// UUID. `Task::new` remains the normal path for locally-created cards.
+    pub fn with_id(
+        id: impl Into<String>,
+        title: impl Into<String>,
+        agent: impl Into<String>,
+        project_id: impl Into<String>,
+    ) -> Self {
         let now = Utc::now();
         Self {
-            id,
+            id: id.into(),
             title: title.into(),
             description: None,
             status: TaskStatus::Backlog,
