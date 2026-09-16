@@ -635,7 +635,12 @@ pub const AGENT_SPECS: &[AgentSpec] = &[
             "GEMINI_API_KEY",
             "GOOGLE_GENERATIVE_AI_API_KEY",
         ],
-        env: &[],
+        // Codex's workspace sandbox cannot write OpenCode's default
+        // `/home/agtx/.local/share/opencode/log` location during a nested
+        // OpenCode handoff. `/tmp` is sandbox-writable and avoids an
+        // interactive filesystem-permission prompt; it contains only
+        // disposable OpenCode runtime data.
+        env: &[("XDG_DATA_HOME", "/tmp/agtx-opencode")],
         base_args: &[],
         // OpenCode 2.x accepts `--prompt` but only pre-fills its composer; it
         // does not submit the message. Launch bare and let AGTX paste and
