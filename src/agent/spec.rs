@@ -172,7 +172,12 @@ pub enum McpConfigKind {
     /// servers and sibling top-level keys survive.
     AntigravityJsonMerge,
     /// `opencode.json`, whose key is `mcp` and whose entry shape differs.
-    OpenCode,
+    /// Merged rather than overwritten: this file is commonly project-tracked
+    /// with real `model`/`provider`/`permissions` content (agtx's own
+    /// generated permission profile lives here too — see
+    /// `OPENCODE_PERMISSION_PROFILE.md`), so a naive overwrite would silently
+    /// erase it on every worktree config redeploy.
+    OpenCodeMerge,
     /// `.pi/mcp.json` — parsed, agtx inserted, written back, so other servers
     /// survive. pi has no MCP client of its own; the `pi-mcp-adapter` package
     /// reads this path as its highest-precedence project layer, and without the
@@ -646,7 +651,7 @@ pub const AGENT_SPECS: &[AgentSpec] = &[
         // tree, but OpenCode's own project commands live under `.config/`.
         skill_scan_dir: Some(".config/opencode/command"),
         command_syntax: CommandSyntax::Hyphen,
-        mcp_config: Some(McpConfigKind::OpenCode),
+        mcp_config: Some(McpConfigKind::OpenCodeMerge),
         // OpenCode's lifecycle callbacks are a TypeScript plugin API
         // (`.opencode/plugin/*.ts`), not shell commands in a config file — there
         // is no `hooks` key to write. opencode 1.18.20.

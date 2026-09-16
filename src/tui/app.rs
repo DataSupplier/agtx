@@ -12327,7 +12327,119 @@ pub(crate) fn build_policy_agent_command(
         let flags = claude_policy_flags(&policy.role_policy, policy.network, worktree);
         return format!("claude{model}{effort} {flags} -- '{quoted_prompt}'");
     }
+    if agent == "opencode" {
+        // OpenCode has no `--sandbox`/`--allowed-tools`-style CLI surface for
+        // this; its non-interactive execution is entirely config-driven via
+        // `opencode.json`'s `permissions` key. Write the resolved profile
+        // before launch so it's in effect for this invocation. See
+        // OPENCODE_PERMISSION_PROFILE.md.
+        if let Some(wt) = worktree {
+            write_opencode_permission_profile(wt, &policy.role_policy, policy.network);
+        }
+        return agent_ops.build_interactive_command(&prompt);
+    }
     agent_ops.build_interactive_command(&prompt)
+}
+
+/// The OpenCode `permissions` rules this role's resolved policy implies.
+/// Ordered allow/ask/deny, last-match-wins (OpenCode V2 semantics) -- callers
+/// append this slice to whatever the project's own `opencode.json` already
+/// has, never replacing the whole array.
+///
+/// Action/resource names beyond `subagent` and `external_directory` are not
+/// independently verified against OpenCode's schema here -- confirm against
+/// the installed OpenCode version before relying on this in production.
+/// Kept deliberately narrow per OpenCode's own guidance that command-based
+/// directory inference is best-effort: this generates one `bash` rule per
+/// `allowed_commands` entry and one `edit`/`write` rule per `write_paths`
+/// glob, never a blanket shell or filesystem allow.
+///
+/// `allow_subagents` is intentionally independent of `permission_mode`: a
+/// subagent deny is only ever emitted when a role explicitly sets
+/// `Some(false)`, never as an automatic consequence of `"autonomous"`.
+fn opencode_permission_rules(
+    role_policy: &WorkflowRolePolicy,
+    network: bool,
+    worktree: &Path,
+) -> Vec<serde_json::Value> {
+    let mut rules = Vec::new();
+    if role_policy.permission_mode.as_deref() == Some("autonomous") {
+        rules.push(serde_json::json!({
+            "action": "external_directory",
+            "resource": format!("{}/**", worktree.display()),
+            "effect": "allow"
+        }));
+        for path in &role_policy.write_paths {
+            rules.push(serde_json::json!({ "action": "edit", "resource": path, "effect": "allow" }));
+            rules.push(serde_json::json!({ "action": "write", "resource": path, "effect": "allow" }));
+        }
+        for command in &role_policy.allowed_commands {
+            rules.push(serde_json::json!({
+                "action": "bash",
+                "resource": format!("{command}*"),
+                "effect": "allow"
+            }));
+        }
+        if network {
+            rules.push(serde_json::json!({ "action": "network", "resource": "*", "effect": "allow" }));
+        }
+    }
+    if role_policy.allow_subagents == Some(false) {
+        rules.push(serde_json::json!({ "action": "subagent", "resource": "*", "effect": "deny" }));
+    }
+    rules
+}
+
+/// Where agtx records which OpenCode permission rules it generated last, so a
+/// redeploy can remove exactly those entries before appending the fresh set,
+/// instead of either accumulating duplicates or clobbering the project's own
+/// hand-written rules. One file per worktree, not committed -- matches
+/// `.agtx/status/` in spirit.
+fn opencode_permission_sidecar_path(worktree: &Path) -> PathBuf {
+    worktree.join(".agtx").join("state").join("opencode-permissions.json")
+}
+
+/// Merge this role's generated OpenCode permission rules into the worktree's
+/// `opencode.json`, replacing only the slice agtx itself generated last time
+/// (tracked in the sidecar file) and leaving every other key -- and any
+/// permission rule the project hand-wrote -- untouched. See
+/// OPENCODE_PERMISSION_PROFILE.md Phase 3. Best-effort: a read/parse/write
+/// failure here must not abort the launch, so every step is silently
+/// swallowed, matching the rest of this file's config-writer convention.
+fn write_opencode_permission_profile(worktree: &Path, role_policy: &WorkflowRolePolicy, network: bool) {
+    let rules = opencode_permission_rules(role_policy, network, worktree);
+    let cfg_path = worktree.join("opencode.json");
+    let mut root = std::fs::read_to_string(&cfg_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let sidecar_path = opencode_permission_sidecar_path(worktree);
+    let previous: Vec<serde_json::Value> = std::fs::read_to_string(&sidecar_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    let mut permissions: Vec<serde_json::Value> =
+        root["permissions"].as_array().cloned().unwrap_or_default();
+    // Remove exactly the entries agtx generated last time (by value match),
+    // never a project-authored rule that merely looks similar.
+    permissions.retain(|entry| !previous.contains(entry));
+    permissions.extend(rules.iter().cloned());
+    root["permissions"] = serde_json::Value::Array(permissions);
+
+    if let Some(parent) = sidecar_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(
+        &sidecar_path,
+        serde_json::to_string_pretty(&rules).unwrap_or_default(),
+    );
+    let _ = std::fs::write(
+        &cfg_path,
+        serde_json::to_string_pretty(&root).unwrap_or_default(),
+    );
 }
 
 /// The `--permission-mode dontAsk --allowed-tools '<tools>'` fragment for a
@@ -14998,19 +15110,26 @@ fn write_mcp_config(
                 &project_path_str,
             );
         }
-        agent::McpConfigKind::OpenCode => {
-            let cfg = serde_json::json!({
-                "mcp": {
-                    "agtx": {
-                        "type": "local",
-                        "command": [&agtx_bin, "mcp-serve", &project_path_str]
-                    }
-                }
+        agent::McpConfigKind::OpenCodeMerge => {
+            // opencode.json is commonly project-tracked with real `model`/
+            // `provider`/`permissions` content (see OPENCODE_PERMISSION_PROFILE.md)
+            // -- read-modify-write only the `mcp.agtx` key, exactly like
+            // `merge_mcp_servers_json` does for the mcpServers-shaped configs,
+            // instead of clobbering the rest of the file.
+            let path = Path::new(worktree_path).join("opencode.json");
+            let mut root = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .filter(|v| v.is_object())
+                .unwrap_or_else(|| serde_json::json!({}));
+            if !root["mcp"].is_object() {
+                root["mcp"] = serde_json::json!({});
+            }
+            root["mcp"]["agtx"] = serde_json::json!({
+                "type": "local",
+                "command": [&agtx_bin, "mcp-serve", &project_path_str]
             });
-            let _ = std::fs::write(
-                Path::new(worktree_path).join("opencode.json"),
-                serde_json::to_string_pretty(&cfg).unwrap_or_default(),
-            );
+            let _ = std::fs::write(&path, serde_json::to_string_pretty(&root).unwrap_or_default());
         }
     }
 }

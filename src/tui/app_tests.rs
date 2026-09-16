@@ -5714,6 +5714,247 @@ fn test_write_skills_to_worktree_mcp_opencode() {
     assert_eq!(v["mcp"]["agtx"]["command"][1], "mcp-serve");
 }
 
+/// Regression test for the opencode.json clobber bug: a project-tracked
+/// `opencode.json` with real `model`/`provider`/`permissions` content must
+/// survive config deployment untouched except for the injected `mcp.agtx`
+/// key. Before this fix, `write_mcp_config`'s `OpenCode` arm did a raw
+/// `std::fs::write` of `{"mcp": ...}` alone, silently erasing everything else
+/// in the file on every worktree config redeploy.
+#[test]
+fn test_write_skills_to_worktree_mcp_opencode_preserves_existing_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let wt = dir.path().to_string_lossy().to_string();
+
+    let existing = serde_json::json!({
+        "$schema": "https://opencode.ai/config.json",
+        "model": "deepseek/deepseek-flash",
+        "provider": {
+            "deepseek": { "options": { "apiKey": "{env:DEEPSEEK_API_KEY}" } }
+        },
+        "permissions": [
+            { "action": "external_directory", "resource": "/workspace/.agtx/skills/*", "effect": "allow" }
+        ]
+    });
+    std::fs::write(
+        dir.path().join("opencode.json"),
+        serde_json::to_string_pretty(&existing).unwrap(),
+    )
+    .unwrap();
+
+    write_skills_to_worktree(&wt, dir.path(), &None, &["opencode"], false);
+
+    let content = std::fs::read_to_string(dir.path().join("opencode.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(v["model"], "deepseek/deepseek-flash", "model must survive redeploy");
+    assert_eq!(
+        v["provider"]["deepseek"]["options"]["apiKey"], "{env:DEEPSEEK_API_KEY}",
+        "provider config must survive redeploy"
+    );
+    assert_eq!(
+        v["permissions"][0]["action"], "external_directory",
+        "project's own permission rules must survive redeploy"
+    );
+    // And the new mcp key was still injected correctly.
+    assert_eq!(v["mcp"]["agtx"]["type"], "local");
+}
+
+/// Repeated config deployment must be idempotent: no duplicate keys, no
+/// drift, byte-identical output after the first merge.
+#[test]
+fn test_write_skills_to_worktree_mcp_opencode_idempotent_on_repeat() {
+    let dir = tempfile::tempdir().unwrap();
+    let wt = dir.path().to_string_lossy().to_string();
+
+    write_skills_to_worktree(&wt, dir.path(), &None, &["opencode"], false);
+    let first = std::fs::read_to_string(dir.path().join("opencode.json")).unwrap();
+
+    write_skills_to_worktree(&wt, dir.path(), &None, &["opencode"], false);
+    let second = std::fs::read_to_string(dir.path().join("opencode.json")).unwrap();
+
+    write_skills_to_worktree(&wt, dir.path(), &None, &["opencode"], false);
+    let third = std::fs::read_to_string(dir.path().join("opencode.json")).unwrap();
+
+    assert_eq!(second, third, "a 3rd redeploy must not drift from the 2nd");
+    let (v1, v2): (serde_json::Value, serde_json::Value) = (
+        serde_json::from_str(&first).unwrap(),
+        serde_json::from_str(&second).unwrap(),
+    );
+    assert_eq!(v1, v2, "repeated redeploys of an unchanged config must not drift");
+}
+
+/// `permission_mode: None` (today's default) generates no rules at all --
+/// existing projects with no opt-in see zero behavior change.
+#[test]
+fn test_opencode_permission_rules_none_by_default() {
+    let policy = WorkflowRolePolicy {
+        write_paths: vec!["api/**".into()],
+        allowed_commands: vec!["pytest".into()],
+        ..Default::default()
+    };
+    let rules = opencode_permission_rules(&policy, true, Path::new("/wt"));
+    assert!(rules.is_empty(), "no permission_mode must generate no rules");
+}
+
+/// `permission_mode = "autonomous"` translates `write_paths`,
+/// `allowed_commands`, and network into narrow, explicit allow rules --
+/// never a blanket allow.
+#[test]
+fn test_opencode_permission_rules_autonomous_translates_role_policy() {
+    let policy = WorkflowRolePolicy {
+        permission_mode: Some("autonomous".into()),
+        write_paths: vec!["api/**".into(), "nuxt-app/**".into()],
+        allowed_commands: vec!["pytest".into(), "pnpm test".into()],
+        ..Default::default()
+    };
+    let rules = opencode_permission_rules(&policy, true, Path::new("/wt"));
+
+    let has = |action: &str, resource: &str, effect: &str| {
+        rules.iter().any(|r| r["action"] == action && r["resource"] == resource && r["effect"] == effect)
+    };
+    assert!(has("external_directory", "/wt/**", "allow"));
+    assert!(has("edit", "api/**", "allow"));
+    assert!(has("write", "api/**", "allow"));
+    assert!(has("edit", "nuxt-app/**", "allow"));
+    assert!(has("bash", "pytest*", "allow"));
+    assert!(has("bash", "pnpm test*", "allow"));
+    assert!(has("network", "*", "allow"));
+    assert!(
+        !rules.iter().any(|r| r["resource"] == "*" && r["action"] != "network"),
+        "must never emit a blanket allow rule"
+    );
+}
+
+/// `allow_subagents` is independent of `permission_mode`: a deny is only
+/// emitted when explicitly `Some(false)`, never implied by autonomous mode,
+/// and never emitted for `None`/`Some(true)`.
+#[test]
+fn test_opencode_permission_rules_subagents_independent_of_autonomous() {
+    let autonomous_no_subagent_opinion = WorkflowRolePolicy {
+        permission_mode: Some("autonomous".into()),
+        ..Default::default()
+    };
+    let rules = opencode_permission_rules(&autonomous_no_subagent_opinion, false, Path::new("/wt"));
+    assert!(
+        !rules.iter().any(|r| r["action"] == "subagent"),
+        "autonomous mode alone must not deny subagents"
+    );
+
+    let explicit_deny = WorkflowRolePolicy {
+        allow_subagents: Some(false),
+        ..Default::default()
+    };
+    let rules = opencode_permission_rules(&explicit_deny, false, Path::new("/wt"));
+    assert!(rules.iter().any(|r| r["action"] == "subagent" && r["effect"] == "deny"));
+
+    let explicit_allow = WorkflowRolePolicy {
+        allow_subagents: Some(true),
+        ..Default::default()
+    };
+    let rules = opencode_permission_rules(&explicit_allow, false, Path::new("/wt"));
+    assert!(!rules.iter().any(|r| r["action"] == "subagent"));
+}
+
+/// Phase 3: a redeploy under a *different* role policy (e.g. planner ->
+/// implementer, different write_paths) must replace exactly the previously
+/// generated slice, not accumulate it, and must never touch a rule the
+/// project hand-wrote.
+#[test]
+fn test_write_opencode_permission_profile_replaces_generated_slice_without_accumulating() {
+    let dir = tempfile::tempdir().unwrap();
+    let wt = dir.path();
+
+    let project_rule = serde_json::json!({
+        "action": "external_directory", "resource": "/workspace/.agtx/skills/*", "effect": "allow"
+    });
+    std::fs::write(
+        wt.join("opencode.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "model": "deepseek/deepseek-flash",
+            "permissions": [project_rule.clone()]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let planner = WorkflowRolePolicy {
+        permission_mode: Some("autonomous".into()),
+        write_paths: vec![".agtx/plans/**".into()],
+        ..Default::default()
+    };
+    write_opencode_permission_profile(wt, &planner, false);
+
+    let after_planner: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(wt.join("opencode.json")).unwrap()).unwrap();
+    let perms = after_planner["permissions"].as_array().unwrap();
+    assert!(perms.contains(&project_rule), "project's own rule must survive");
+    assert!(
+        perms.iter().any(|r| r["resource"] == ".agtx/plans/**"),
+        "planner's generated rule must be present"
+    );
+    assert_eq!(after_planner["model"], "deepseek/deepseek-flash");
+
+    // Redeploy under a different role -- implementer, different write_paths.
+    let implementer = WorkflowRolePolicy {
+        permission_mode: Some("autonomous".into()),
+        write_paths: vec!["api/**".into()],
+        ..Default::default()
+    };
+    write_opencode_permission_profile(wt, &implementer, false);
+
+    let after_implementer: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(wt.join("opencode.json")).unwrap()).unwrap();
+    let perms = after_implementer["permissions"].as_array().unwrap();
+    assert!(perms.contains(&project_rule), "project's own rule must still survive");
+    assert!(
+        perms.iter().any(|r| r["resource"] == "api/**"),
+        "implementer's generated rule must be present"
+    );
+    assert!(
+        !perms.iter().any(|r| r["resource"] == ".agtx/plans/**"),
+        "planner's stale generated rule must be removed, not accumulated"
+    );
+}
+
+/// OpenCode must not silently fall through to an unconfigured interactive
+/// command when a role policy is resolved: `build_policy_agent_command`
+/// should write the permission profile into the worktree's `opencode.json`
+/// as a side effect of building the launch command.
+#[test]
+#[cfg(feature = "test-mocks")]
+fn test_build_policy_agent_command_opencode_writes_permission_profile() {
+    let dir = tempfile::tempdir().unwrap();
+    let wt = dir.path();
+
+    let mut agent_ops = MockAgentOperations::new();
+    agent_ops
+        .expect_build_interactive_command()
+        .returning(|prompt| format!("opencode --prompt '{}'", prompt));
+    let policy = ResolvedWorkflowPolicy {
+        role_policy: WorkflowRolePolicy {
+            permission_mode: Some("autonomous".into()),
+            write_paths: vec!["api/**".into()],
+            allowed_commands: vec!["pytest".into()],
+            ..Default::default()
+        },
+        network: true,
+        ..Default::default()
+    };
+
+    let _command = build_policy_agent_command(
+        &agent_ops,
+        "opencode",
+        "Implement T003",
+        Some(&policy),
+        Some(wt),
+    );
+
+    let cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(wt.join("opencode.json")).unwrap()).unwrap();
+    let perms = cfg["permissions"].as_array().unwrap();
+    assert!(perms.iter().any(|r| r["resource"] == "api/**"));
+    assert!(perms.iter().any(|r| r["action"] == "network"));
+}
+
 // =============================================================================
 // Tests for load_task_plugin
 // =============================================================================

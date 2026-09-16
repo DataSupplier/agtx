@@ -306,6 +306,22 @@ pub struct WorkflowRolePolicy {
     /// Optional provider-native reasoning/effort level for this role.
     #[serde(default)]
     pub effort: Option<String>,
+    /// Non-interactive execution profile for this role's agent, when the
+    /// agent supports one (currently: opencode). `None` preserves prior
+    /// behavior -- the agent's own default, unconfigured by agtx. The only
+    /// recognized value today is `"autonomous"`: routine operations already
+    /// authorized by this role's `write_paths`/`allowed_commands`/network
+    /// must not block on an interactive permission prompt. See
+    /// `OPENCODE_PERMISSION_PROFILE.md`.
+    #[serde(default)]
+    pub permission_mode: Option<String>,
+    /// Independent of `permission_mode` -- deliberately NOT implied by
+    /// `"autonomous"`. `None` inherits the agent's own default; `Some(false)`
+    /// explicitly denies sub-agent/delegation tool use for this role.
+    /// A subagent deny must be an explicit, visible policy choice on a
+    /// specific role, never an automatic side effect of autonomous mode.
+    #[serde(default)]
+    pub allow_subagents: Option<bool>,
 }
 
 /// Cross-role capabilities that default to the project policy rather than an
