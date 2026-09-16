@@ -101,7 +101,10 @@ pub fn submit_message(tmux_ops: &Arc<dyn TmuxOperations>, target: &str, text: &s
     let needle = delivery_needle(text);
     for _ in 0..SUBMIT_ATTEMPTS {
         let before = tmux_ops.capture_pane(target).unwrap_or_default();
-        let _ = tmux_ops.send_key(target, "Enter");
+        // In the current Codex TUI, tmux's named `Enter` key can leave a
+        // bracketed-paste message parked in the composer. The terminal
+        // carriage-return sequence is accepted as an actual submission.
+        let _ = tmux_ops.send_key(target, "C-m");
         for _ in 0..SUBMIT_CONFIRM_POLLS {
             std::thread::sleep(std::time::Duration::from_millis(200));
             let Ok(now) = tmux_ops.capture_pane(target) else {
