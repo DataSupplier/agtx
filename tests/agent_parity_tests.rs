@@ -96,6 +96,9 @@ fn interactive_command_parity_with_prompt() {
             "gemini",
             "GEMINI_TRUST_WORKSPACE=true gemini --approval-mode yolo -i 'hi'",
         ),
+        // The generic command builder preserves OpenCode's CLI form. Workflow
+        // launch paths intentionally pass it an empty prompt because OpenCode
+        // does not submit `--prompt` text automatically.
         ("opencode", "opencode --prompt 'hi'"),
         ("cursor", "agent --yolo --trust 'hi'"),
         ("grok", "grok --yolo --trust 'hi'"),
@@ -228,8 +231,6 @@ fn prompt_injection_parity() {
         ("cursor", PromptInjection::Argv),
         // gemini 0.46.0 — survives the restart that answering folder-trust causes
         ("gemini", PromptInjection::FlagInteractive("-i")),
-        // opencode 1.18.20 — `--prompt`, and it stays interactive
-        ("opencode", PromptInjection::FlagInteractive("--prompt")),
         // agy 1.1.21 — an argv prompt is queued behind the trust dialog, not eaten
         ("antigravity", PromptInjection::FlagInteractive("-i")),
         // pi 0.84.3 — `pi --approve '<prompt>'` stays interactive and submits it
@@ -243,7 +244,9 @@ fn prompt_injection_parity() {
     // dialogs, no located trust store, `-i` unchecked. It must stay unverified
     // rather than inherit a neighbour's behaviour — assuming that is what produced
     // the antigravity and cursor dialog bugs in the first place.
-    let unverified = ["copilot"];
+    // OpenCode 2.x leaves `--prompt` text in the composer rather than
+    // submitting it, so it must use the post-readiness paste path.
+    let unverified = ["copilot", "opencode"];
     for name in unverified {
         assert_eq!(
             agent(name).prompt_injection(),

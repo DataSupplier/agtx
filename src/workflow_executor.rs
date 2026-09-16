@@ -910,15 +910,30 @@ pub fn start_workflow_planning(
         }
     }
 
+    // Only pass a prompt through argv for agent forms that are verified to
+    // submit it. OpenCode's `--prompt` merely opens its interactive composer,
+    // so it must use the post-readiness paste path even on a planner relaunch.
+    let can_embed =
+        crate::agent::spec::can_launch_with_prompt(agent_ops.prompt_injection(), &prompt);
     if restarting && runtime.tmux_ops.window_exists(&target).unwrap_or(false) {
         let command = build_policy_agent_command(
             agent_ops.as_ref(),
             &planner,
-            &prompt,
+            if can_embed { &prompt } else { "" },
             policy.as_ref(),
             Some(Path::new(&worktree)),
         );
         switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command)?;
+        if !can_embed {
+            let _ = wait_for_agent_ready(
+                runtime.tmux_ops,
+                &target,
+                Some(&planner),
+                runtime.config.auto_trust,
+            );
+            runtime.tmux_ops.paste_text(&target, &prompt)?;
+            runtime.tmux_ops.send_key(&target, "Enter")?;
+        }
     } else {
         // A prompt embedded directly in the launch command becomes part of
         // one tmux client/server message; large enough (see
@@ -928,10 +943,6 @@ pub fn start_workflow_planning(
         // and deliver it afterward via paste_text (stdin, no such limit)
         // instead — same approach already used by the TUI's agent-switch
         // launch flow.
-        let can_embed = crate::agent::spec::can_launch_with_prompt(
-            agent_ops.prompt_injection(),
-            &prompt,
-        );
         let command = build_policy_agent_command(
             agent_ops.as_ref(),
             &planner,
@@ -1342,15 +1353,31 @@ pub fn start_workflow_implementation(
     } else {
         format!("{}:{window_name}", runtime.tmux_project_name)
     };
+    // Keep unverified prompt forms out of both a fresh launch and an existing
+    // session switch. In particular, `opencode --prompt` leaves text unsent in
+    // the composer, which makes a successful process launch look like a
+    // completed workflow action.
+    let can_embed =
+        crate::agent::spec::can_launch_with_prompt(agent_ops.prompt_injection(), &prompt);
     if session_available {
         let command = build_policy_agent_command(
             agent_ops.as_ref(),
             &implementer,
-            &prompt,
+            if can_embed { &prompt } else { "" },
             policy.as_ref(),
             Some(Path::new(&worktree)),
         );
         switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command)?;
+        if !can_embed {
+            let _ = wait_for_agent_ready(
+                runtime.tmux_ops,
+                &target,
+                Some(&implementer),
+                runtime.config.auto_trust,
+            );
+            runtime.tmux_ops.paste_text(&target, &prompt)?;
+            runtime.tmux_ops.send_key(&target, "Enter")?;
+        }
     } else {
         ensure_project_tmux_session(
             runtime.tmux_project_name,
@@ -1361,10 +1388,6 @@ pub fn start_workflow_implementation(
         // embedded directly in the launch command can overflow tmux's own
         // command-line re-exec ("command too long"). Defer oversized prompts
         // to a post-launch paste_text instead.
-        let can_embed = crate::agent::spec::can_launch_with_prompt(
-            agent_ops.prompt_injection(),
-            &prompt,
-        );
         let command = build_policy_agent_command(
             agent_ops.as_ref(),
             &implementer,

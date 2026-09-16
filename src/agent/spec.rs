@@ -637,12 +637,11 @@ pub const AGENT_SPECS: &[AgentSpec] = &[
         ],
         env: &[],
         base_args: &[],
-        // `--prompt`, not `-p`: opencode has no `-p` short form at all, so the
-        // previous value would have failed the moment it was used. Verified
-        // against opencode 1.18.20: `opencode --prompt '<prompt>'` submits the
-        // prompt as a user message and stays interactive.
+        // OpenCode 2.x accepts `--prompt` but only pre-fills its composer; it
+        // does not submit the message. Launch bare and let AGTX paste and
+        // submit after the interactive UI reports ready.
         prompt_form: PromptForm::Flag("--prompt"),
-        launch_prompt_verified: true,
+        launch_prompt_verified: false,
         resume: ResumeArgs::Append(&["--continue"]),
         headless_args: &[],
         skill_dir: Some((".opencode/command", "")),
