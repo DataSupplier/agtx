@@ -292,7 +292,7 @@ pub fn restart_workflow_step(
     }
     restore_workflow_step_inputs(db, task, &state)?;
     runtime.tmux_ops.paste_text(target, &prompt)?;
-    runtime.tmux_ops.send_key(target, "Enter")?;
+    runtime.tmux_ops.send_key(target, "C-m")?;
 
     let mut event = TaskExecutionEvent::new(&task.id, "agent_prompt_restarted");
     event.workflow_attempt = Some(state.state_attempt);
@@ -932,7 +932,7 @@ pub fn start_workflow_planning(
                 runtime.config.auto_trust,
             );
             runtime.tmux_ops.paste_text(&target, &prompt)?;
-            runtime.tmux_ops.send_key(&target, "Enter")?;
+            runtime.tmux_ops.send_key(&target, "C-m")?;
         }
     } else {
         // A prompt embedded directly in the launch command becomes part of
@@ -966,7 +966,7 @@ pub fn start_workflow_planning(
                 runtime.config.auto_trust,
             );
             runtime.tmux_ops.paste_text(&target, &prompt)?;
-            runtime.tmux_ops.send_key(&target, "Enter")?;
+            runtime.tmux_ops.send_key(&target, "C-m")?;
         }
     }
     record_agent_prompt(
@@ -1376,7 +1376,7 @@ pub fn start_workflow_implementation(
                 runtime.config.auto_trust,
             );
             runtime.tmux_ops.paste_text(&target, &prompt)?;
-            runtime.tmux_ops.send_key(&target, "Enter")?;
+            runtime.tmux_ops.send_key(&target, "C-m")?;
         }
     } else {
         ensure_project_tmux_session(
@@ -1411,7 +1411,7 @@ pub fn start_workflow_implementation(
                 runtime.config.auto_trust,
             );
             runtime.tmux_ops.paste_text(&target, &prompt)?;
-            runtime.tmux_ops.send_key(&target, "Enter")?;
+            runtime.tmux_ops.send_key(&target, "C-m")?;
         }
     }
     record_agent_prompt(
