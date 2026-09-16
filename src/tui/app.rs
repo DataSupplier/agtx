@@ -13765,6 +13765,7 @@ pub(crate) fn switch_agent_in_tmux(
             tmux_ops.send_key(target, "Enter")?;
         } else {
             tmux_ops.send_keys(target, cmd)?;
+            tmux_ops.send_key(target, "C-m")?;
         }
     } else {
         tmux_ops.send_key(target, "C-c")?;
@@ -13805,6 +13806,7 @@ pub(crate) fn switch_agent_in_tmux(
                 tmux_ops.send_key(target, "Enter")?;
             } else {
                 tmux_ops.send_keys(target, cmd)?;
+                tmux_ops.send_key(target, "C-m")?;
             }
         }
 
@@ -13858,9 +13860,10 @@ pub(crate) fn switch_agent_in_tmux(
         // exactly as it was.
         tmux_ops.paste_text(target, &cmd)?;
         std::thread::sleep(std::time::Duration::from_millis(300));
-        tmux_ops.send_key(target, "Enter")?;
+        tmux_ops.send_key(target, "C-m")?;
     } else {
         tmux_ops.send_keys(target, &cmd)?;
+        tmux_ops.send_key(target, "C-m")?;
     }
 
     // 6. Wait for the new agent process to actually start (pane_current_command != shell).
