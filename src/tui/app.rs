@@ -12360,15 +12360,20 @@ pub(crate) fn build_policy_agent_command(
 fn opencode_permission_rules(
     role_policy: &WorkflowRolePolicy,
     network: bool,
-    worktree: &Path,
 ) -> Vec<serde_json::Value> {
     let mut rules = Vec::new();
     if role_policy.permission_mode.as_deref() == Some("autonomous") {
-        rules.push(serde_json::json!({
-            "action": "external_directory",
-            "resource": format!("{}/**", worktree.display()),
-            "effect": "allow"
-        }));
+        // Deliberately no `external_directory` rule keyed on this worktree's
+        // own absolute path here. That path is resolved fresh per task
+        // (a new UUID-named worktree every time) and this file
+        // (`opencode.json`) is committed and merged back to `main` as part
+        // of normal task integration -- so a per-worktree absolute path
+        // baked in here becomes permanent, accumulating cruft across tasks
+        // and stomping on other worktrees' grants once merged. Cross-tree
+        // access agents actually need (e.g. `.agtx/`, shared tmp) belongs in
+        // the project's own checked-in, stable `opencode.json` rules
+        // instead, precisely because those are hand-reviewed and identical
+        // across every worktree -- see OPENCODE_PERMISSION_PROFILE.md.
         for path in &role_policy.write_paths {
             rules.push(serde_json::json!({ "action": "edit", "resource": path, "effect": "allow" }));
             rules.push(serde_json::json!({ "action": "write", "resource": path, "effect": "allow" }));
@@ -12407,7 +12412,7 @@ fn opencode_permission_sidecar_path(worktree: &Path) -> PathBuf {
 /// failure here must not abort the launch, so every step is silently
 /// swallowed, matching the rest of this file's config-writer convention.
 fn write_opencode_permission_profile(worktree: &Path, role_policy: &WorkflowRolePolicy, network: bool) {
-    let rules = opencode_permission_rules(role_policy, network, worktree);
+    let rules = opencode_permission_rules(role_policy, network);
     let cfg_path = worktree.join("opencode.json");
     let mut root = std::fs::read_to_string(&cfg_path)
         .ok()

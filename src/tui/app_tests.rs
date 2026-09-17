@@ -5791,7 +5791,7 @@ fn test_opencode_permission_rules_none_by_default() {
         allowed_commands: vec!["pytest".into()],
         ..Default::default()
     };
-    let rules = opencode_permission_rules(&policy, true, Path::new("/wt"));
+    let rules = opencode_permission_rules(&policy, true);
     assert!(rules.is_empty(), "no permission_mode must generate no rules");
 }
 
@@ -5806,12 +5806,15 @@ fn test_opencode_permission_rules_autonomous_translates_role_policy() {
         allowed_commands: vec!["pytest".into(), "pnpm test".into()],
         ..Default::default()
     };
-    let rules = opencode_permission_rules(&policy, true, Path::new("/wt"));
+    let rules = opencode_permission_rules(&policy, true);
 
     let has = |action: &str, resource: &str, effect: &str| {
         rules.iter().any(|r| r["action"] == action && r["resource"] == resource && r["effect"] == effect)
     };
-    assert!(has("external_directory", "/wt/**", "allow"));
+    assert!(
+        !rules.iter().any(|r| r["action"] == "external_directory"),
+        "must never bake a resolved worktree path into a rule that gets committed with the worktree"
+    );
     assert!(has("edit", "api/**", "allow"));
     assert!(has("write", "api/**", "allow"));
     assert!(has("edit", "nuxt-app/**", "allow"));
@@ -5833,7 +5836,7 @@ fn test_opencode_permission_rules_subagents_independent_of_autonomous() {
         permission_mode: Some("autonomous".into()),
         ..Default::default()
     };
-    let rules = opencode_permission_rules(&autonomous_no_subagent_opinion, false, Path::new("/wt"));
+    let rules = opencode_permission_rules(&autonomous_no_subagent_opinion, false);
     assert!(
         !rules.iter().any(|r| r["action"] == "subagent"),
         "autonomous mode alone must not deny subagents"
@@ -5843,14 +5846,14 @@ fn test_opencode_permission_rules_subagents_independent_of_autonomous() {
         allow_subagents: Some(false),
         ..Default::default()
     };
-    let rules = opencode_permission_rules(&explicit_deny, false, Path::new("/wt"));
+    let rules = opencode_permission_rules(&explicit_deny, false);
     assert!(rules.iter().any(|r| r["action"] == "subagent" && r["effect"] == "deny"));
 
     let explicit_allow = WorkflowRolePolicy {
         allow_subagents: Some(true),
         ..Default::default()
     };
-    let rules = opencode_permission_rules(&explicit_allow, false, Path::new("/wt"));
+    let rules = opencode_permission_rules(&explicit_allow, false);
     assert!(!rules.iter().any(|r| r["action"] == "subagent"));
 }
 
