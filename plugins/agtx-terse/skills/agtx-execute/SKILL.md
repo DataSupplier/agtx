@@ -22,7 +22,7 @@ mcp__agtx__get_task(task_id: "<the id passed to this command>")
 
 1. Read `.agtx/plan.md` if it exists (skip `get_task`), otherwise fetch via `get_task`
 2. Implement the changes
-3. Run relevant tests to verify your changes
+3. Run relevant tests to verify your changes. For a long-running test/typecheck/gate command, launch it in the background, capture its PID (`$!`), and wait on that PID (e.g. `while kill -0 "$PID" 2>/dev/null; do sleep 15; done; wait "$PID"`) instead of blind-sleeping a fixed duration before checking its output — a fixed sleep either wastes time after the job finishes early or forces another full wait cycle when it runs long.
 4. Fix any issues found during testing
 
 ## Output
