@@ -5935,6 +5935,7 @@ fn test_build_policy_agent_command_opencode_writes_permission_profile() {
     let policy = ResolvedWorkflowPolicy {
         role_policy: WorkflowRolePolicy {
             permission_mode: Some("autonomous".into()),
+            model: Some("glm/glm-5.3-flash".into()),
             write_paths: vec!["api/**".into()],
             allowed_commands: vec!["pytest".into()],
             ..Default::default()
@@ -5943,13 +5944,14 @@ fn test_build_policy_agent_command_opencode_writes_permission_profile() {
         ..Default::default()
     };
 
-    let _command = build_policy_agent_command(
+    let command = build_policy_agent_command(
         &agent_ops,
         "opencode",
         "Implement T003",
         Some(&policy),
         Some(wt),
     );
+    assert!(command.starts_with("opencode --model glm/glm-5.3-flash"));
 
     let cfg: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(wt.join("opencode.json")).unwrap()).unwrap();

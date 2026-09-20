@@ -627,13 +627,16 @@ pub const AGENT_SPECS: &[AgentSpec] = &[
         description: "AI-powered coding assistant",
         co_author: "OpenCode <noreply@opencode.ai>",
         // Multi-provider: the variable that matters is whichever provider the
-        // user's opencode config selects, so all four it knows about are listed.
-        // Present in the 1.18.20 binary.
+        // user's opencode config selects. Include the built-in provider keys
+        // plus the project-configured DeepSeek and GLM-compatible providers.
+        // Present in the 1.18.20 binary for the built-in entries.
         api_key_env: &[
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
             "GEMINI_API_KEY",
             "GOOGLE_GENERATIVE_AI_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "GLM_FLASH_API_KEY",
         ],
         // Codex's workspace sandbox cannot write OpenCode's default
         // `/home/agtx/.local/share/opencode/log` location during a nested

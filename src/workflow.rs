@@ -577,10 +577,12 @@ impl WorkflowProjectConfig {
 fn validate_agent_option(kind: &str, value: &str) -> anyhow::Result<()> {
     if value.is_empty()
         || !value.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '/')
         })
     {
-        bail!("workflow {kind} must contain only ASCII letters, digits, '-', '_' or '.'");
+        bail!(
+            "workflow {kind} must contain only ASCII letters, digits, '-', '_', '.', or '/'"
+        );
     }
     Ok(())
 }
@@ -799,6 +801,7 @@ write_paths = [".agtx/plans/**"]
         assert!(validate_command_prefix("git status; git push").is_err());
         assert!(validate_worktree_glob("../.git/config").is_err());
         assert!(validate_worktree_glob("/etc/passwd").is_err());
+        assert!(validate_agent_option("model", "glm/glm-5.3-flash").is_ok());
         assert!(validate_agent_option("model", "sonnet; rm").is_err());
     }
 

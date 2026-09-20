@@ -12336,9 +12336,35 @@ pub(crate) fn build_policy_agent_command(
         if let Some(wt) = worktree {
             write_opencode_permission_profile(wt, &policy.role_policy, policy.network);
         }
-        return agent_ops.build_interactive_command(&prompt);
+        return add_opencode_model(
+            agent_ops.build_interactive_command(&prompt),
+            policy.role_policy.model.as_deref(),
+        );
     }
     agent_ops.build_interactive_command(&prompt)
+}
+
+/// Add a workflow-selected model to OpenCode's launch command.
+///
+/// OpenCode accepts `--model provider/model` on its interactive command. The
+/// command builder may prefix the binary with environment assignments, so the
+/// flag is inserted immediately after the `opencode` token rather than
+/// appended after the opening prompt. Model values are validated by the
+/// workflow config loader before reaching this function.
+fn add_opencode_model(command: String, model: Option<&str>) -> String {
+    let Some(model) = model.filter(|value| !value.is_empty()) else {
+        return command;
+    };
+    let Some(binary_start) = command.find("opencode") else {
+        return command;
+    };
+    let binary_end = binary_start + "opencode".len();
+    format!(
+        "{} --model {}{}",
+        &command[..binary_end],
+        model,
+        &command[binary_end..]
+    )
 }
 
 /// The OpenCode `permissions` rules this role's resolved policy implies.
@@ -12560,6 +12586,12 @@ fn build_policy_resume_command(
         );
     }
     if agent != "claude" {
+        if agent == "opencode" {
+            return add_opencode_model(
+                agent_ops.build_resume_command(),
+                policy.role_policy.model.as_deref(),
+            );
+        }
         return agent_ops.build_resume_command();
     }
     let model = policy
