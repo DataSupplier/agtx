@@ -889,9 +889,18 @@ pub fn start_workflow_planning(
     };
 
     let agent_ops = runtime.agent_registry.get(&planner);
+    // The plan's revision and workflow attempt are state-machine facts, not
+    // values a replacement terminal agent should infer from a missing file or
+    // a prior pane.  A planner can be relaunched after its original agent
+    // exits before saving an artifact, so give every launch the exact next
+    // revision as well as the current attempt.  The SHA-256 deliberately is
+    // absent: it belongs to the bytes the executor reads after the plan is
+    // saved, and cannot be predicted or copied into the plan artifact.
+    let next_plan_revision = current.plan_revision + 1;
     let prompt = format!(
-        "{}\n\nCurrent workflow attempt: {n}. Your output artifact MUST contain the line: workflow_attempt: {n}",
+        "{}\n\nAuthoritative planning metadata from AGTX: write plan_revision: {next_plan_revision} and workflow_attempt: {n}. The recorded plan revision before this planning run is {}. Do not infer either value from a missing/stale artifact or terminal scrollback. Do not add, predict, or copy a plan SHA-256 into the plan artifact; AGTX hashes the exact saved bytes after submission.\n\nCurrent workflow attempt: {n}. Your output artifact MUST contain the line: workflow_attempt: {n}",
         resolve_prompt(&Some(plugin.clone()), "planning", &task.content_text(), &task.id, task.cycle),
+        current.plan_revision,
         n = planning_attempt,
     );
     let slug = generate_task_slug(&task.id, &task.title);
@@ -1051,7 +1060,7 @@ pub fn submit_workflow_plan(
         ".agent-flow/plan-review.yaml",
     );
     let prompt = format!(
-        "You are the plan reviewer for task {}. Review only {} (revision {}, SHA-256 {}). Do not implement code. This plan was produced during planning attempt {producer_attempt}; its embedded workflow_attempt must remain that producer attempt. Do not request changes solely because it differs from your review attempt. Check it against the task, identify concrete changes if needed, then write {} in this task worktree containing: verdict: approved or verdict: changes_requested (exactly one of these two strings), findings: with your specific, concrete findings -- especially when requesting changes, since the planner will receive this exact persisted artifact to revise the plan -- and final_report: a concise reviewer handoff summary.\n\nCurrent review workflow attempt: {n}. Your output artifact MUST contain the line: workflow_attempt: {n}",
+        "You are the plan reviewer for task {}. Review only {} (revision {}, SHA-256 {}). Do not implement code. This plan was produced during planning attempt {producer_attempt}; its embedded workflow_attempt must remain that producer attempt. Do not request changes solely because it differs from your review attempt. Check it against the task, identify concrete changes if needed, then write {} in this task worktree containing: verdict: approved or verdict: changes_requested (exactly one of these two strings), findings: with your specific, concrete findings -- especially when requesting changes, since the planner will receive this exact persisted artifact to revise the plan -- and final_report: a concise reviewer handoff summary.\n\nAuthoritative review metadata from AGTX: write workflow_attempt: {n}. Do not copy the plan's workflow_attempt or SHA-256 into the review artifact; the plan SHA-256 above identifies the immutable input AGTX recorded.\n\nCurrent review workflow attempt: {n}. Your output artifact MUST contain the line: workflow_attempt: {n}",
         task.id,
         path.strip_prefix(&worktree).unwrap_or(&path).display(),
         revision,
@@ -1204,9 +1213,10 @@ pub fn decide_workflow_plan(
             });
         };
         let findings: String = findings.chars().take(12 * 1024).collect();
+        let next_plan_revision = current.plan_revision + 1;
         let prompt = format!(
-            "Plan review requested changes for task {}. Revise .agtx/plans/{}.md, increment plan_revision above {}, and do not implement code. The exact review input is artifact {} with SHA-256 {}; its recorded findings follow:\n---\n{}\n---\n\nWhen complete, save the artifact for another Shift+V submission.\n\nCurrent planning workflow attempt: {n}. Your output artifact MUST contain the line: workflow_attempt: {n}",
-            task.id, task.id, current.plan_revision, review_evidence.id,
+            "Plan review requested changes for task {}. Revise .agtx/plans/{}.md and do not implement code. The exact review input is artifact {} with SHA-256 {}; its recorded findings follow:\n---\n{}\n---\n\nAuthoritative revision metadata from AGTX: write plan_revision: {next_plan_revision} and workflow_attempt: {n}. Do not infer either value from the existing plan, review artifact, or terminal scrollback. Do not add, predict, or copy a plan SHA-256 into the plan artifact; AGTX hashes the exact saved bytes after submission.\n\nWhen complete, save the artifact for another Shift+V submission.\n\nCurrent planning workflow attempt: {n}. Your output artifact MUST contain the line: workflow_attempt: {n}",
+            task.id, task.id, review_evidence.id,
             review_evidence.sha256, findings, n = decision.state.state_attempt,
         );
         let policy = project_workflow.policy_for_state(workflow, &decision.state.state)?;
@@ -3784,8 +3794,17 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         let db_path_for_check = db_path.clone();
         mock_tmux
             .expect_create_window()
-            .returning(move |_, _, _, _, _, _| {
+            .returning(move |_, _, _, command, _, _| {
                 assert_state_already_persisted(&db_path_for_check, &task_id_for_check, "planning");
+                let command = command.expect("planner launch must carry its prompt");
+                assert!(
+                    command.contains("Authoritative planning metadata from AGTX: write plan_revision: 1 and workflow_attempt: 3"),
+                    "planner fallback metadata must be explicit in the launch prompt, got: {command}"
+                );
+                assert!(
+                    command.contains("Do not add, predict, or copy a plan SHA-256 into the plan artifact"),
+                    "planner prompt must make the executor-owned hash boundary explicit, got: {command}"
+                );
                 Ok(())
             });
 
@@ -4102,6 +4121,10 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         assert!(
             !prompt.contains("write .agent-flow/plan-review.yaml"),
             "prompt must not still reference the old flat path"
+        );
+        assert!(
+            prompt.contains("Authoritative review metadata from AGTX: write workflow_attempt: 2"),
+            "reviewer prompt must give a fallback agent the exact review attempt, got: {prompt}"
         );
     }
 
@@ -4835,6 +4858,14 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         assert!(
             sent.contains(&format!("artifact {}", review.id)),
             "planner prompt must identify the exact persisted review artifact, got: {sent}"
+        );
+        assert!(
+            sent.contains("Authoritative revision metadata from AGTX: write plan_revision: 1 and workflow_attempt: 2"),
+            "revision handoff must give a replacement planner exact metadata, got: {sent}"
+        );
+        assert!(
+            sent.contains("Do not add, predict, or copy a plan SHA-256 into the plan artifact"),
+            "revision handoff must keep hashing executor-owned, got: {sent}"
         );
     }
 
