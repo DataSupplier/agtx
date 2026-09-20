@@ -5951,13 +5951,14 @@ fn test_build_policy_agent_command_opencode_writes_permission_profile() {
         Some(&policy),
         Some(wt),
     );
-    assert!(command.starts_with("opencode --model glm/glm-5.3-flash"));
+    assert!(command.starts_with("opencode --prompt 'Implement T003'"));
 
     let cfg: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(wt.join("opencode.json")).unwrap()).unwrap();
     let perms = cfg["permissions"].as_array().unwrap();
     assert!(perms.iter().any(|r| r["resource"] == "api/**"));
     assert!(perms.iter().any(|r| r["action"] == "network"));
+    assert_eq!(cfg["model"], "glm/glm-5.3-flash");
 }
 
 // =============================================================================
@@ -12547,7 +12548,8 @@ fn test_switch_agent_retries_with_ctrl_c_when_shell_not_found() {
 #[test]
 #[cfg(feature = "test-mocks")]
 fn test_switch_agent_sends_ctrl_d_as_last_resort() {
-    // Shell never found → C-d last resort, but new agent cmd still sent
+    // Shell never found → C-d last resort, and the replacement must not be
+    // pasted into the still-active agent.
     let mut mock_tmux = MockTmuxOperations::new();
     mock_tmux
         .expect_send_keys()
@@ -12557,26 +12559,10 @@ fn test_switch_agent_sends_ctrl_d_as_last_resort() {
     mock_tmux
         .expect_pane_current_command()
         .returning(|_| Some("claude".to_string()));
-    // C-c on retry
-    mock_tmux
-        .expect_send_key()
-        .withf(|_, key: &str| key == "C-c")
-        .times(1)
-        .returning(|_, _| Ok(()));
-    // C-d as last resort
-    mock_tmux
-        .expect_send_key()
-        .withf(|_, key: &str| key == "C-d")
-        .times(1)
-        .returning(|_, _| Ok(()));
-    // new agent still sent
-    mock_tmux
-        .expect_send_keys()
-        .withf(|_, cmd: &str| cmd == "cd -- \"$AGTX_WORKTREE\" && env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT newagent")
-        .times(1)
-        .returning(|_, _| Ok(()));
+    mock_tmux.expect_send_key().returning(|_, _| Ok(()));
+    mock_tmux.expect_paste_text().times(0);
 
-    let _ = switch_agent_in_tmux(&mock_tmux, "proj:task", "claude", "newagent");
+    assert!(switch_agent_in_tmux(&mock_tmux, "proj:task", "claude", "newagent").is_err());
 }
 
 #[test]
@@ -12780,7 +12766,10 @@ fn switch_agent_in_tmux_codex_reviewer_findings_round_trip_through_a_real_shell(
 fn switch_agent_in_tmux_reports_failure_when_previous_agent_never_confirmed_exited() {
     let mut mock_tmux = MockTmuxOperations::new();
     mock_tmux.expect_send_key().returning(|_, _| Ok(()));
-    mock_tmux.expect_send_keys().returning(|_, _| Ok(()));
+    // The replacement command must never be sent into a still-live Codex
+    // composer. That turns an agent hand-off into a Codex user message.
+    mock_tmux.expect_send_keys().times(0);
+    mock_tmux.expect_paste_text().times(0);
     // The old agent's own process name, forever -- it never reaches a shell,
     // and it never becomes anything that could plausibly be the new agent.
     mock_tmux

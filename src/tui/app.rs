@@ -12336,35 +12336,13 @@ pub(crate) fn build_policy_agent_command(
         if let Some(wt) = worktree {
             write_opencode_permission_profile(wt, &policy.role_policy, policy.network);
         }
-        return add_opencode_model(
-            agent_ops.build_interactive_command(&prompt),
-            policy.role_policy.model.as_deref(),
-        );
+        // `opencode --model` is not an interactive-CLI flag in OpenCode 2.x;
+        // it belongs to `opencode run`, which would replace the terminal
+        // session with a one-shot headless command. The profile writer above
+        // sets the worktree-local config model instead.
+        return agent_ops.build_interactive_command(&prompt);
     }
     agent_ops.build_interactive_command(&prompt)
-}
-
-/// Add a workflow-selected model to OpenCode's launch command.
-///
-/// OpenCode accepts `--model provider/model` on its interactive command. The
-/// command builder may prefix the binary with environment assignments, so the
-/// flag is inserted immediately after the `opencode` token rather than
-/// appended after the opening prompt. Model values are validated by the
-/// workflow config loader before reaching this function.
-fn add_opencode_model(command: String, model: Option<&str>) -> String {
-    let Some(model) = model.filter(|value| !value.is_empty()) else {
-        return command;
-    };
-    let Some(binary_start) = command.find("opencode") else {
-        return command;
-    };
-    let binary_end = binary_start + "opencode".len();
-    format!(
-        "{} --model {}{}",
-        &command[..binary_end],
-        model,
-        &command[binary_end..]
-    )
 }
 
 /// The OpenCode `permissions` rules this role's resolved policy implies.
@@ -12445,6 +12423,17 @@ fn write_opencode_permission_profile(worktree: &Path, role_policy: &WorkflowRole
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .filter(|v| v.is_object())
         .unwrap_or_else(|| serde_json::json!({}));
+    // The interactive CLI reads its selected model from configuration. Keep
+    // the workflow's short aliases compatible with the project provider
+    // names, while preserving explicitly provider-qualified policy values.
+    if let Some(model) = role_policy.model.as_deref().filter(|value| !value.is_empty()) {
+        let model = match model {
+            "deepseek-flash" => "deepseek/deepseek-flash",
+            "glm-5.3-flash" => "glm/glm-5.3-flash",
+            other => other,
+        };
+        root["model"] = serde_json::Value::String(model.to_owned());
+    }
 
     let sidecar_path = opencode_permission_sidecar_path(worktree);
     let previous: Vec<serde_json::Value> = std::fs::read_to_string(&sidecar_path)
@@ -12587,10 +12576,7 @@ fn build_policy_resume_command(
     }
     if agent != "claude" {
         if agent == "opencode" {
-            return add_opencode_model(
-                agent_ops.build_resume_command(),
-                policy.role_policy.model.as_deref(),
-            );
+            return agent_ops.build_resume_command();
         }
         return agent_ops.build_resume_command();
     }
@@ -13865,9 +13851,22 @@ pub(crate) fn switch_agent_in_tmux(
             // 2s
             std::thread::sleep(std::time::Duration::from_millis(100));
             if !is_agent_active(tmux_ops, target, Some(current_agent)) {
+                found_shell = true;
                 break;
             }
         }
+    }
+
+    // A hand-off command typed while the old agent still owns the pane is not
+    // a launch: Codex treats it as a user chat message and may then edit an
+    // artifact under the wrong role. Never send the replacement command until
+    // the previous process has demonstrably released the shell.
+    if !found_shell {
+        anyhow::bail!(
+            "agent switch could not confirm '{current_agent}' exited in tmux pane '{target}' \
+             (Ctrl+C, retry, and the Ctrl+D last resort all failed to reach a shell); \
+             refusing to send the replacement command into the active agent"
+        )
     }
 
     // 4. Let the shell fully initialize before sending the new agent command
@@ -13938,14 +13937,7 @@ pub(crate) fn switch_agent_in_tmux(
             }
         }
     }
-    if found_shell {
-        anyhow::bail!("agent switch did not start a process in tmux pane '{target}'")
-    }
-    anyhow::bail!(
-        "agent switch could not confirm '{current_agent}' exited in tmux pane '{target}' \
-         (Ctrl+C, retry, and the Ctrl+D last resort all failed to reach a shell); \
-         a best-effort hand-off command was sent, but the new agent's launch cannot be verified"
-    )
+    anyhow::bail!("agent switch did not start a process in tmux pane '{target}'")
 }
 
 /// Wait for an agent in a tmux pane to be ready for input.
