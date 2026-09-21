@@ -1099,7 +1099,7 @@ pub fn submit_workflow_plan(
         ".agent-flow/plan-review.yaml",
     );
     let prompt = format!(
-        "You are the plan reviewer for task {}. Review only {} (AGTX revision {}, immutable artifact {}). Do not implement code. Check it against the task, identify all concrete changes currently needed, then write {} in this task worktree containing: verdict: approved or verdict: changes_requested (exactly one of these two strings), findings: a non-empty folded scalar with specific, concrete findings, and final_report: a concise reviewer handoff summary. AGTX owns all revision, attempt, and SHA-256 metadata; do not write any of them into the review artifact.",
+        "You are the plan reviewer for task {}. Review only {} (AGTX revision {}, immutable artifact {}). Do not implement code. Review only the submitted revision and its stated acceptance criteria. Request changes only for a contradiction with the task, approved specification, repository rule, or API contract; a safety, data-integrity, tenancy, migration, or transaction-ownership defect; or an acceptance criterion that cannot be delivered or validated from the plan. Classify every finding as BLOCKING, REQUIRED-NONBLOCKING, or SUGGESTION. Every BLOCKING finding must cite the exact conflicting plan text and governing requirement. Do not request changes merely because a summary is less detailed than executable steps, an implied documentation update is not repeated elsewhere, an ordinary targeted test is not enumerated, or a resolved finding is phrased differently in non-normative text. On a revision, verify whether prior findings are resolved and do not reopen them or introduce adjacent scope unless the revised text creates a new material contradiction. Prefer one consolidated set of actionable findings. Use changes_requested only when at least one BLOCKING finding exists; otherwise use approved and record required-nonblocking items as implementation/checklist notes. Then write {} in this task worktree containing: verdict: approved or verdict: changes_requested (exactly one of these two strings), findings: a non-empty folded scalar with specific, concrete findings, and final_report: a concise reviewer handoff summary. AGTX owns all revision, attempt, and SHA-256 metadata; do not write any of them into the review artifact.",
         task.id,
         path.strip_prefix(&worktree).unwrap_or(&path).display(),
         revision,
@@ -4241,6 +4241,14 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
         assert!(
             prompt.contains("AGTX owns all revision, attempt, and SHA-256 metadata"),
             "reviewer prompt must prohibit agent-authored orchestration metadata, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Classify every finding as BLOCKING, REQUIRED-NONBLOCKING, or SUGGESTION"),
+            "reviewer prompt must require calibrated finding classifications, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Use changes_requested only when at least one BLOCKING finding exists"),
+            "reviewer prompt must reserve rejection for blocking findings, got: {prompt}"
         );
     }
 
