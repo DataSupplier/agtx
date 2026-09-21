@@ -851,8 +851,10 @@ impl Database {
         Ok(())
     }
 
-    /// Persist complete immutable workflow evidence. Re-recording the same
-    /// state attempt is allowed only when it names the same bytes.
+    /// Persist workflow evidence. A snapshot becomes immutable when a later
+    /// workflow step binds it as an input. Until then it is provisional: an
+    /// agent may correct an invalid artifact in-place without being trapped by
+    /// a stale snapshot from the same state attempt.
     pub fn store_workflow_artifact(&self, artifact: &WorkflowArtifact) -> Result<WorkflowArtifact> {
         self.conn.execute(
             r#"INSERT INTO workflow_artifacts (
@@ -880,6 +882,26 @@ impl Database {
             .workflow_artifact(&id)?
             .ok_or_else(|| anyhow::anyhow!("workflow artifact disappeared after persistence"))?;
         if stored.sha256 != artifact.sha256 || stored.content != artifact.content {
+            let is_bound: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workflow_step_inputs WHERE artifact_id = ?1)",
+                [&stored.id],
+                |row| row.get(0),
+            )?;
+            if !is_bound {
+                self.conn.execute(
+                    "UPDATE workflow_artifacts SET source_path = ?2, sha256 = ?3, content = ?4, created_at = ?5 WHERE id = ?1",
+                    params![
+                        stored.id,
+                        artifact.source_path,
+                        artifact.sha256,
+                        artifact.content,
+                        artifact.created_at.to_rfc3339(),
+                    ],
+                )?;
+                return self.workflow_artifact(&stored.id)?.ok_or_else(|| {
+                    anyhow::anyhow!("workflow artifact disappeared after provisional replacement")
+                });
+            }
             bail!(
                 "workflow artifact conflict for task {}, attempt {}, state {}, kind {}",
                 artifact.task_id,

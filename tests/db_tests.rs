@@ -1394,3 +1394,45 @@ fn provider_sessions_preserve_fallbacks_and_deduplicate_retries() {
     assert!(sessions.iter().any(|session| session.provider_session_id == "oc-1"));
     assert!(sessions.iter().any(|session| session.provider_session_id == "cx-2"));
 }
+
+#[test]
+fn unbound_workflow_evidence_can_be_replaced_after_artifact_correction() {
+    let db = Database::open_in_memory_project().unwrap();
+    let task = Task::new("Correct review format", "codex", "heaves");
+    db.create_task(&task).unwrap();
+    let make_artifact = |id: &str, content: &[u8]| WorkflowArtifact {
+        id: id.into(),
+        task_id: task.id.clone(),
+        workflow_attempt: 4,
+        state: "plan_review".into(),
+        kind: "step_evidence".into(),
+        source_path: ".agent-flow/plan-review.yaml".into(),
+        sha256: format!("{:x}", Sha256::digest(content)),
+        content: content.to_vec(),
+        created_at: chrono::Utc::now(),
+    };
+
+    let malformed = make_artifact("first", b"verdict: changes_requested\n");
+    let stored = db.store_workflow_artifact(&malformed).unwrap();
+    let corrected = make_artifact(
+        "corrected",
+        b"verdict: changes_requested\nfindings: >-\n  Add the missing validation.\n",
+    );
+    let replaced = db.store_workflow_artifact(&corrected).unwrap();
+    assert_eq!(replaced.id, stored.id, "the provisional record stays addressable");
+    assert_eq!(replaced.content, corrected.content);
+    assert_eq!(replaced.sha256, corrected.sha256);
+
+    db.bind_workflow_step_input(&WorkflowStepInput {
+        task_id: task.id.clone(),
+        workflow_attempt: 5,
+        state: "planning".into(),
+        name: "plan_review".into(),
+        artifact_id: replaced.id,
+        expected_sha256: replaced.sha256,
+        created_at: chrono::Utc::now(),
+    })
+    .unwrap();
+    let later_change = make_artifact("later", b"verdict: approved\n");
+    assert!(db.store_workflow_artifact(&later_change).is_err());
+}
