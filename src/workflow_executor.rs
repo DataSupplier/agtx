@@ -1259,10 +1259,21 @@ pub fn decide_workflow_plan(
             findings,
         );
         let policy = project_workflow.policy_for_state(workflow, &decision.state.state)?;
-        let command = build_policy_agent_command(
-            runtime.agent_registry.get(&task.agent).as_ref(),
-            &task.agent,
+        let planner_ops = runtime.agent_registry.get(&task.agent);
+        // OpenCode's `--prompt` is a composer prefill, not a submitted
+        // interactive turn.  More importantly, reviewer findings are free
+        // text and must never be interpolated into the shell command used to
+        // switch away from Codex.  Use the same verified-launch gate as the
+        // ordinary planning entry point: launch bare, wait for the new agent,
+        // then paste and submit the revision request.
+        let can_embed = crate::agent::spec::can_launch_with_prompt(
+            planner_ops.prompt_injection(),
             &prompt,
+        );
+        let command = build_policy_agent_command(
+            planner_ops.as_ref(),
+            &task.agent,
+            if can_embed { &prompt } else { "" },
             policy.as_ref(),
             Some(Path::new(worktree)),
         );
@@ -1272,6 +1283,16 @@ pub fn decide_workflow_plan(
             &previous_agent,
             &command,
         )?;
+        if !can_embed {
+            let _ = wait_for_agent_ready(
+                runtime.tmux_ops,
+                &target,
+                Some(&task.agent),
+                runtime.config.auto_trust,
+            );
+            runtime.tmux_ops.paste_text(&target, &prompt)?;
+            runtime.tmux_ops.send_key(&target, "C-m")?;
+        }
         record_agent_prompt(
             db,
             &task,
@@ -4829,6 +4850,8 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
         let mut mock_registry = MockAgentRegistry::new();
         mock_registry.expect_get().returning(|_| {
             let mut ops = MockAgentOperations::new();
+            ops.expect_prompt_injection()
+                .return_const(crate::agent::PromptInjection::Unknown);
             ops.expect_build_interactive_command()
                 .returning(|prompt| format!("claude '{}'", prompt));
             Arc::new(ops) as Arc<dyn AgentOperations>
