@@ -13348,16 +13348,6 @@ pub(crate) fn planning_artifact_path(
     Ok(Path::new(worktree_path).join(template.replace("{task_id}", task_id)))
 }
 
-/// Read the explicit revision marker from a plan artifact.  It is intentionally
-/// format-light so teams can use Markdown with a YAML-style header or body.
-pub(crate) fn plan_revision(contents: &[u8]) -> Option<i32> {
-    let text = std::str::from_utf8(contents).ok()?;
-    text.lines().find_map(|line| {
-        let value = line.trim().strip_prefix("plan_revision:")?.trim();
-        value.parse::<i32>().ok().filter(|revision| *revision > 0)
-    })
-}
-
 /// Check if the research artifact exists for a task.
 /// Tries both zero-padded (e.g. "01") and non-padded (e.g. "1") {phase} substitution.
 fn research_artifact_exists(

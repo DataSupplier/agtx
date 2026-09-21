@@ -3,7 +3,7 @@ use rusqlite::{params, Connection, Transaction};
 use std::path::Path;
 
 use super::models::{
-    DependencyState, MobileDevice, Notification, NotificationKind, PhaseStatus, Project, Task,
+    DependencyState, MobileDevice, Notification, NotificationKind, PhaseStatus, Project, ProviderSession, Task,
     TaskExecutionEvent, TaskRuntime, TaskStatus, TaskStepReport, TransitionRequest,
     WorkflowArtifact, WorkflowStepInput, WorkflowTaskState, WorkflowTransitionRecord,
 };
@@ -241,6 +241,21 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_task_step_reports_task
                 ON task_step_reports(task_id, created_at);
+            CREATE TABLE IF NOT EXISTS provider_sessions (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                workflow_attempt INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                workflow_session_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                provider_session_id TEXT NOT NULL,
+                agent TEXT,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                UNIQUE(task_id, workflow_attempt, state, provider, provider_session_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_provider_sessions_workflow
+                ON provider_sessions(task_id, workflow_attempt, state, started_at);
             -- Complete immutable workflow evidence. The execution journal keeps a
             -- bounded text snapshot; this table is the recovery-safe source.
             CREATE TABLE IF NOT EXISTS workflow_artifacts (
@@ -1084,6 +1099,29 @@ impl Database {
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    /// Append a provider-native session.  This deliberately never overwrites a
+    /// prior session: one workflow entry can survive retries and fallbacks.
+    pub fn record_provider_session(&self, session: &ProviderSession) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO provider_sessions (id, task_id, workflow_attempt, state, workflow_session_id, provider, provider_session_id, agent, started_at, ended_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![session.id, session.task_id, session.workflow_attempt, session.state, session.workflow_session_id, session.provider, session.provider_session_id, session.agent, session.started_at.to_rfc3339(), session.ended_at.map(|value| value.to_rfc3339())],
+        )?;
+        Ok(())
+    }
+
+    pub fn provider_sessions(&self, task_id: &str) -> Result<Vec<ProviderSession>> {
+        let mut stmt = self.conn.prepare("SELECT * FROM provider_sessions WHERE task_id = ?1 ORDER BY started_at, id")?;
+        let rows = stmt.query_map([task_id], |row| {
+            let parse = |column: &str| -> rusqlite::Result<chrono::DateTime<chrono::Utc>> {
+                chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(column)?)
+                    .map(|value| value.with_timezone(&chrono::Utc))
+                    .map_err(|error| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error)))
+            };
+            Ok(ProviderSession { id: row.get("id")?, task_id: row.get("task_id")?, workflow_attempt: row.get("workflow_attempt")?, state: row.get("state")?, workflow_session_id: row.get("workflow_session_id")?, provider: row.get("provider")?, provider_session_id: row.get("provider_session_id")?, agent: row.get("agent")?, started_at: parse("started_at")?, ended_at: row.get::<_, Option<String>>("ended_at")?.and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok().map(|dt| dt.with_timezone(&chrono::Utc))) })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// Persist the worktree created during admission together with its frozen

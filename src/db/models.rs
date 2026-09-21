@@ -359,6 +359,22 @@ impl TaskStepReport {
     }
 }
 
+/// A native agent-provider session attached to one AGTX workflow-state entry.
+/// Multiple rows are retained for retries and fallback hand-offs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderSession {
+    pub id: String,
+    pub task_id: String,
+    pub workflow_attempt: i64,
+    pub state: String,
+    pub workflow_session_id: String,
+    pub provider: String,
+    pub provider_session_id: String,
+    pub agent: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+}
+
 /// Complete, immutable evidence retained for a workflow step. This is the
 /// machine-readable source used when a later step needs to recover an exact
 /// input; [`TaskStepReport`] remains the bounded, human-facing journal.

@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use crate::agent::AgentRegistry;
 use crate::config::{MergedConfig, WorkflowPlugin};
 use crate::db::{
-    Database, Task, TaskExecutionEvent, TaskStatus, TaskStepReport, WorkflowArtifact,
+    Database, ProviderSession, Task, TaskExecutionEvent, TaskStatus, TaskStepReport, WorkflowArtifact,
     WorkflowStepInput, WorkflowTaskState, WorkflowTransitionRecord,
 };
 use crate::git::GitOperations;
@@ -23,7 +23,7 @@ use crate::tmux::TmuxOperations;
 use crate::tui::app::{
     agtx_task_env, archive_workflow_artifact, build_policy_agent_command,
     ensure_project_tmux_session, ensure_review_addresses_failed_validation, generate_task_slug,
-    plan_revision, planning_artifact_path, resolve_prompt, switch_agent_in_tmux,
+    planning_artifact_path, resolve_prompt, switch_agent_in_tmux,
     wait_for_agent_ready, workflow_artifact_path, workflow_artifact_sha256,
     workflow_artifact_value,
 };
@@ -62,40 +62,6 @@ fn bounded_journal_text(text: &str) -> String {
     bounded
 }
 
-/// Read a simple top-level workflow-artifact field from immutable bytes.
-///
-/// This mirrors the deliberately small parser used for live workflow files,
-/// but ensures a later prompt is derived from the exact stored snapshot rather
-/// than whatever happens to be in the worktree now.
-fn workflow_artifact_content_value(content: &[u8], field: &str) -> Result<String> {
-    let content = std::str::from_utf8(content)
-        .map_err(|error| anyhow::anyhow!("workflow artifact is not UTF-8: {error}"))?;
-    let prefix = format!("{field}:");
-    let lines: Vec<_> = content.lines().collect();
-    let Some((index, value)) = lines.iter().enumerate().find_map(|(index, line)| {
-        line.trim()
-            .strip_prefix(&prefix)
-            .map(|value| (index, value.trim()))
-    }) else {
-        anyhow::bail!("workflow artifact needs a non-empty {field}: value");
-    };
-    let value = if matches!(value, ">" | ">-" | ">+" | "|" | "|-" | "|+") {
-        lines[index + 1..]
-            .iter()
-            .take_while(|line| {
-                line.trim().is_empty() || line.starts_with(' ') || line.starts_with('\t')
-            })
-            .map(|line| line.trim())
-            .filter(|line| !line.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n")
-    } else {
-        value.trim_matches(['\'', '"']).to_string()
-    };
-    (!value.is_empty())
-        .then_some(value)
-        .ok_or_else(|| anyhow::anyhow!("workflow artifact needs a non-empty {field}: value"))
-}
 /// Save exactly the prompt that was delivered to an agent for a particular
 /// state entry. This is intentionally separate from transitions: a launch
 /// may be retried without entering a different state, and both deliveries are
@@ -113,6 +79,9 @@ fn record_agent_prompt(
     report.prompt_sha256 = Some(format!("{:x}", Sha256::digest(prompt.as_bytes())));
     report.prompt_text = Some(bounded_journal_text(prompt));
     db.upsert_task_step_report(&report)?;
+    if let Some(worktree) = task.worktree_path.as_deref() {
+        record_provider_session_if_known(db, task, state, workflow_attempt, agent, worktree);
+    }
 
     let mut event = TaskExecutionEvent::new(&task.id, "agent_prompt_delivered");
     event.workflow_attempt = Some(workflow_attempt);
@@ -121,6 +90,75 @@ fn record_agent_prompt(
     event.outcome = Some("started".to_string());
     event.message = Some("Agent prompt delivered to the task session".to_string());
     db.record_task_execution_event(&event)
+}
+
+/// Attach a provider-native session when the provider exposes one. Hook-based
+/// agents (Codex/Claude) report their current id; OpenCode is discovered from
+/// its local SQLite session store by worktree. Rows are append-only so a
+/// fallback or relaunch remains visible to usage analysis.
+fn record_provider_session_if_known(
+    db: &Database, task: &Task, state: &str, attempt: i64, agent: &str, worktree: &str,
+) {
+    let hook_id = crate::agent::hook_status::read_status(Path::new(worktree), &task.id, chrono::Utc::now().timestamp())
+        .and_then(|status| status.session_id);
+    let opencode_id = if agent == "opencode" {
+        let data_home = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp/agtx-opencode"));
+        opencode_session_id_for_worktree(&data_home, worktree)
+    } else { None };
+    let Some(provider_session_id) = hook_id.or(opencode_id) else { return; };
+    record_provider_session(db, task, state, attempt, agent, provider_session_id);
+}
+
+/// Look up the newest OpenCode native session for this worktree without ever
+/// mutating the provider's local database.  A failed/missing local store is
+/// normal for a just-launched session and is deliberately best-effort.
+fn opencode_session_id_for_worktree(data_home: &Path, worktree: &str) -> Option<String> {
+    let database = data_home.join("opencode").join("opencode.db");
+    let conn = rusqlite::Connection::open_with_flags(
+        database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ).ok()?;
+    conn.query_row(
+        "SELECT id FROM session_v2 WHERE directory = ?1 ORDER BY time_updated DESC LIMIT 1",
+        [worktree],
+        |row| row.get(0),
+    ).ok()
+}
+
+fn record_provider_session(
+    db: &Database,
+    task: &Task,
+    state: &str,
+    attempt: i64,
+    agent: &str,
+    provider_session_id: String,
+) {
+    let _ = db.record_provider_session(&ProviderSession {
+        id: uuid::Uuid::new_v4().to_string(), task_id: task.id.clone(), workflow_attempt: attempt,
+        state: state.into(), workflow_session_id: format!("agtx:{}:{}:{}", task.id, attempt, state),
+        provider: agent.into(), provider_session_id, agent: Some(agent.into()), started_at: chrono::Utc::now(), ended_at: None,
+    });
+}
+
+/// Record the file bytes present when AGTX hands a state to an agent.  This is
+/// the freshness boundary for automation: a later submission is accepted only
+/// after the agent changed the artifact.  It replaces the fragile
+/// agent-authored `workflow_attempt` marker.
+fn record_artifact_baseline(
+    db: &Database,
+    task: &Task,
+    state: &str,
+    workflow_attempt: i64,
+    artifact: &Path,
+) -> Result<()> {
+    let mut report = TaskStepReport::new(&task.id, workflow_attempt, state);
+    report.artifact_path = Some(artifact.display().to_string());
+    report.artifact_sha256 = std::fs::read(artifact)
+        .ok()
+        .map(|bytes| format!("{:x}", Sha256::digest(bytes)));
+    db.upsert_task_step_report(&report)
 }
 
 /// Preserve the durable artifact, the agent's optional explicit final report,
@@ -133,6 +171,9 @@ fn record_step_evidence(
     artifact: &Path,
     runtime: &WorkflowRuntime,
 ) -> Result<WorkflowArtifact> {
+    if let Some(worktree) = task.worktree_path.as_deref() {
+        record_provider_session_if_known(db, task, &state.state, state.state_attempt, agent, worktree);
+    }
     let bytes = std::fs::read(artifact).map_err(|error| {
         anyhow::anyhow!(
             "Could not read workflow evidence '{}' for the execution journal: {error}",
@@ -896,12 +937,9 @@ pub fn start_workflow_planning(
     // revision as well as the current attempt.  The SHA-256 deliberately is
     // absent: it belongs to the bytes the executor reads after the plan is
     // saved, and cannot be predicted or copied into the plan artifact.
-    let next_plan_revision = current.plan_revision + 1;
     let prompt = format!(
-        "{}\n\nAuthoritative planning metadata from AGTX: write plan_revision: {next_plan_revision} and workflow_attempt: {n}. The recorded plan revision before this planning run is {}. Do not infer either value from a missing/stale artifact or terminal scrollback. Do not add, predict, or copy a plan SHA-256 into the plan artifact; AGTX hashes the exact saved bytes after submission.\n\nCurrent workflow attempt: {n}. Your output artifact MUST contain the line: workflow_attempt: {n}",
+        "{}\n\nAGTX owns revision, workflow-attempt, and SHA-256 metadata in its database. Write only the plan content at the required path; do not add, infer, or copy orchestration metadata into the artifact.",
         resolve_prompt(&Some(plugin.clone()), "planning", &task.content_text(), &task.id, task.cycle),
-        current.plan_revision,
-        n = planning_attempt,
     );
     let slug = generate_task_slug(&task.id, &task.title);
     let window_name = format!("task-{slug}");
@@ -986,6 +1024,13 @@ pub fn start_workflow_planning(
         &planner,
         &prompt,
     )?;
+    record_artifact_baseline(
+        db,
+        &task,
+        &planning_state,
+        planning_attempt,
+        &planning_artifact_path(&worktree, plugin, &task.id)?,
+    )?;
 
     task.status = TaskStatus::Planning;
     task.agent = planner;
@@ -1030,15 +1075,9 @@ pub fn submit_workflow_plan(
     let path = planning_artifact_path(&worktree, plugin, &task.id)?;
     let contents = std::fs::read(&path)
         .map_err(|_| anyhow::anyhow!("Missing planning artifact: {}", path.display()))?;
-    let revision = plan_revision(&contents).ok_or_else(|| {
-        anyhow::anyhow!("Planning artifact must contain 'plan_revision: <positive integer>'")
-    })?;
-    if revision <= current.plan_revision {
-        anyhow::bail!(
-            "Plan revision {revision} is not newer than recorded revision {}",
-            current.plan_revision
-        );
-    }
+    // Revision is allocated by AGTX when this exact byte snapshot is accepted;
+    // planners never author workflow metadata.
+    let revision = current.plan_revision + 1;
     let mut evidenced = current.clone();
     evidenced.plan_revision = revision;
     evidenced.plan_hash = Some(format!("{:x}", Sha256::digest(&contents)));
@@ -1060,17 +1099,15 @@ pub fn submit_workflow_plan(
         ".agent-flow/plan-review.yaml",
     );
     let prompt = format!(
-        "You are the plan reviewer for task {}. Review only {} (revision {}, SHA-256 {}). Do not implement code. This plan was produced during planning attempt {producer_attempt}; its embedded workflow_attempt must remain that producer attempt. Do not request changes solely because it differs from your review attempt. Check it against the task, identify concrete changes if needed, then write {} in this task worktree containing: verdict: approved or verdict: changes_requested (exactly one of these two strings), findings: with your specific, concrete findings -- especially when requesting changes, since the planner will receive this exact persisted artifact to revise the plan -- and final_report: a concise reviewer handoff summary.\n\nAuthoritative review metadata from AGTX: write workflow_attempt: {n}. Do not copy the plan's workflow_attempt or SHA-256 into the review artifact; the plan SHA-256 above identifies the immutable input AGTX recorded.\n\nCurrent review workflow attempt: {n}. Your output artifact MUST contain the line: workflow_attempt: {n}",
+        "You are the plan reviewer for task {}. Review only {} (AGTX revision {}, immutable artifact {}). Do not implement code. Check it against the task, identify all concrete changes currently needed, then write {} in this task worktree containing: verdict: approved or verdict: changes_requested (exactly one of these two strings), findings: a non-empty folded scalar with specific, concrete findings, and final_report: a concise reviewer handoff summary. AGTX owns all revision, attempt, and SHA-256 metadata; do not write any of them into the review artifact.",
         task.id,
         path.strip_prefix(&worktree).unwrap_or(&path).display(),
         revision,
-        evidenced.plan_hash.as_deref().unwrap_or_default(),
+        "stored internally",
         review_artifact_path
             .strip_prefix(&worktree)
             .unwrap_or(&review_artifact_path)
             .display(),
-        producer_attempt = current.state_attempt,
-        n = handoff.state.state_attempt,
     );
     let target = task
         .session_name
@@ -1183,16 +1220,19 @@ pub fn decide_workflow_plan(
                 message: "Plan changes require a persisted plan-review artifact; write the review before returning to Planning".into(),
             });
         }
-        let review_evidence =
-            record_step_evidence(db, &task, &current, &previous_agent, &review_path, runtime)?;
-        let findings = match workflow_artifact_content_value(&review_evidence.content, "findings") {
+        // Validate the mutable file *before* promoting its bytes into the
+        // immutable evidence slot.  A malformed review must remain editable,
+        // not strand the workflow behind an unreplaceable snapshot.
+        let findings = match workflow_artifact_value(&review_path, "findings") {
             Ok(findings) => findings,
             Err(_) => {
                 return Ok(WorkflowStepOutcome::Blocked {
-                    message: "Plan changes require non-empty findings in the persisted plan-review artifact".into(),
+                    message: "Plan changes require a non-empty scalar findings value in plan-review.yaml".into(),
                 });
             }
         };
+        let review_evidence =
+            record_step_evidence(db, &task, &current, &previous_agent, &review_path, runtime)?;
         db.bind_workflow_step_input(&WorkflowStepInput {
             task_id: task.id.clone(),
             workflow_attempt: decision.state.state_attempt,
@@ -1213,11 +1253,10 @@ pub fn decide_workflow_plan(
             });
         };
         let findings: String = findings.chars().take(12 * 1024).collect();
-        let next_plan_revision = current.plan_revision + 1;
         let prompt = format!(
-            "Plan review requested changes for task {}. Revise .agtx/plans/{}.md and do not implement code. The exact review input is artifact {} with SHA-256 {}; its recorded findings follow:\n---\n{}\n---\n\nAuthoritative revision metadata from AGTX: write plan_revision: {next_plan_revision} and workflow_attempt: {n}. Do not infer either value from the existing plan, review artifact, or terminal scrollback. Do not add, predict, or copy a plan SHA-256 into the plan artifact; AGTX hashes the exact saved bytes after submission.\n\nWhen complete, save the artifact for another Shift+V submission.\n\nCurrent planning workflow attempt: {n}. Your output artifact MUST contain the line: workflow_attempt: {n}",
+            "Plan review requested changes for task {}. Revise .agtx/plans/{}.md and do not implement code. The exact review input is AGTX artifact {}; its recorded findings follow:\n---\n{}\n---\n\nAGTX owns revision, workflow-attempt, and SHA-256 metadata. Write only the revised plan content; do not add or infer orchestration fields. When complete, save the artifact for another Shift+V submission.",
             task.id, task.id, review_evidence.id,
-            review_evidence.sha256, findings, n = decision.state.state_attempt,
+            findings,
         );
         let policy = project_workflow.policy_for_state(workflow, &decision.state.state)?;
         let command = build_policy_agent_command(
@@ -1292,6 +1331,15 @@ pub fn submit_plan_review(
             artifact.display()
         ),
     };
+    // A rejected review must carry usable scalar findings before its mutable
+    // bytes are promoted to immutable evidence.  `decide_workflow_plan` has
+    // the same guard for manual decisions; keep the automated entry point
+    // equally atomic.
+    if !approve && workflow_artifact_value(&artifact, "findings").is_err() {
+        return Ok(WorkflowStepOutcome::Blocked {
+            message: "Plan changes require a non-empty scalar findings value in plan-review.yaml".into(),
+        });
+    }
     record_step_evidence(db, &task, &current, &task.agent, &artifact, runtime)?;
     decide_workflow_plan(
         workflow,
@@ -1342,13 +1390,9 @@ pub fn start_workflow_implementation(
         .destination_agent
         .clone()
         .ok_or_else(|| anyhow::anyhow!("Implementation state has no bound agent"))?;
-    let approved_revision = current.approved_plan_revision.unwrap_or_default();
     let prompt = format!(
-        "{}\n\nApproved plan revision: {}\nApproved plan SHA-256: {}\n\nCurrent workflow attempt: {n}. Your output artifact MUST contain the line: workflow_attempt: {n}",
+        "{}\n\nAGTX has bound the approved plan internally. Do not write revision, workflow-attempt, or SHA-256 metadata into your result artifact.",
         resolve_prompt(&Some(plugin.clone()), "running", &task.content_text(), &task.id, task.cycle),
-        approved_revision,
-        current.approved_plan_hash.as_deref().unwrap_or_default(),
-        n = implementation.state.state_attempt,
     );
     let policy = project_workflow.policy_for_state(workflow, &implementation.state.state)?;
     let agent_ops = runtime.agent_registry.get(&implementer);
@@ -1495,9 +1539,8 @@ pub fn submit_workflow_implementation(
         .clone()
         .ok_or_else(|| anyhow::anyhow!("Engineering review state has no bound agent"))?;
     let prompt = format!(
-        "{}\n\nCurrent workflow attempt: {n}. Your output artifact MUST contain the line: workflow_attempt: {n}",
+        "{}\n\nAGTX owns workflow-attempt and SHA-256 metadata. Do not write orchestration metadata into your result artifact.",
         resolve_prompt(&Some(plugin.clone()), "review", &task.content_text(), &task.id, task.cycle),
-        n = review.state.state_attempt,
     );
     let target = task
         .session_name
@@ -1603,10 +1646,9 @@ pub fn submit_engineering_review(
         .clone()
         .ok_or_else(|| anyhow::anyhow!("Task session is unavailable"))?;
     let prompt = format!(
-        "{}\n\nEngineering-review verdict: {verdict}. Evidence: {}. Follow the declared role policy; do not commit, push, create a PR, merge, or bypass controls.\n\nCurrent workflow attempt: {n}. Your output artifact MUST contain the line: workflow_attempt: {n}",
+        "{}\n\nEngineering-review verdict: {verdict}. Evidence: {}. Follow the declared role policy; do not commit, push, create a PR, merge, or bypass controls.\nAGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artifact.",
         resolve_prompt(&Some(plugin.clone()), phase, &task.content_text(), &task.id, task.cycle),
         artifact.strip_prefix(&worktree).unwrap_or(&artifact).display(),
-        n = transition.state.state_attempt,
     );
     let policy = project_workflow.policy_for_state(workflow, &transition.state.state)?;
     let command = build_policy_agent_command(
@@ -1703,7 +1745,7 @@ pub fn submit_final_validation(
         .clone()
         .ok_or_else(|| anyhow::anyhow!("Task session is unavailable"))?;
     let prompt = format!(
-        "{}\n\nFinal-validation verdict: {verdict}. Evidence: {}.{} Follow the declared role policy; do not merge feature/poc into main.\n\nCurrent workflow attempt: {n}. Your output artifact MUST contain the line: workflow_attempt: {n}",
+        "{}\n\nFinal-validation verdict: {verdict}. Evidence: {}.{} Follow the declared role policy; do not merge feature/poc into main. AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artifact.",
         resolve_prompt(&Some(plugin.clone()), phase, &task.content_text(), &task.id, task.cycle),
         artifact.strip_prefix(&worktree).unwrap_or(&artifact).display(),
         if passed {
@@ -1714,7 +1756,6 @@ pub fn submit_final_validation(
                 workflow_artifact_sha256(&artifact)?,
             )
         },
-        n = transition.state.state_attempt,
     );
     let policy = project_workflow.policy_for_state(workflow, &transition.state.state)?;
     let command = build_policy_agent_command(
@@ -1877,14 +1918,14 @@ pub fn complete_feature_integration(
 pub enum AutomationDecision {
     /// Nothing actionable yet: no legal transition, an agent state with no
     /// artifact on disk yet, or an artifact left over from a previous entry
-    /// into this same state (a stale `workflow_attempt`). Automation should
+    /// into this same state (unchanged since AGTX launched that state). Automation should
     /// simply check again later.
     Wait,
     /// The named action is ready to fire.
     Advance(String),
-    /// An artifact exists, matches the task's current `state_attempt`, but
+    /// An artifact exists but
     /// cannot be trusted as evidence: bad YAML, a missing required field, or
-    /// (for planning) a `plan_revision` that has not actually advanced.
+    /// has malformed content or a missing required field.
     InvalidArtifact(String),
     /// Evidence is valid but this specific outcome is never auto-advanced.
     /// Either a fixed rule (final validation's `failed` verdict: a human must
@@ -1952,33 +1993,23 @@ fn tail_lines(text: &str, max_lines: usize) -> String {
     lines[start..].join("\n")
 }
 
-/// Read `workflow_attempt` from a workflow evidence file the same way
-/// `workflow_artifact_value` reads `verdict`/`plan_revision`. `None` covers
-/// both "the field is absent" and "the value does not parse as an
-/// integer" -- both are treated identically by `assess`: a fresh agent
-/// session simply has not written a valid attempt marker yet.
-fn artifact_workflow_attempt(path: &Path) -> Option<i64> {
-    workflow_artifact_value(path, "workflow_attempt")
-        .ok()?
-        .parse::<i64>()
-        .ok()
-}
-
-/// Shared freshness gate for every artifact-backed state: `None` means the
-/// artifact is present and stamped with the task's current `state_attempt`,
-/// so the caller should go on to interpret its contents. `Some(decision)` is
-/// the answer `assess` should return immediately, without reading further.
-fn artifact_freshness(artifact: &Path, state: &WorkflowTaskState) -> Option<AutomationDecision> {
+/// Shared freshness gate for every artifact-backed state.  AGTX records when
+/// it launched the state; an unchanged pre-existing file is never accepted.
+fn artifact_freshness(
+    artifact: &Path,
+    state: &WorkflowTaskState,
+    task: &Task,
+    db: &Database,
+) -> Option<AutomationDecision> {
     if !artifact.is_file() {
         return Some(AutomationDecision::Wait);
     }
-    match artifact_workflow_attempt(artifact) {
-        Some(attempt) if attempt == state.state_attempt => None,
-        // Missing/unparseable attempt field, or an attempt number left over
-        // from a previous entry into this state: treated exactly like a
-        // missing file, never as an error.
-        _ => Some(AutomationDecision::Wait),
-    }
+    let launched_at = db.task_step_reports(&task.id).ok()?.into_iter().find(|report| {
+        report.workflow_attempt == state.state_attempt && report.state == state.state
+    })?.updated_at;
+    let modified_at = std::fs::metadata(artifact).ok()?.modified().ok()?;
+    let modified_at: chrono::DateTime<chrono::Utc> = modified_at.into();
+    (modified_at <= launched_at).then_some(AutomationDecision::Wait)
 }
 
 /// Determine what automation should do about `task`, currently sitting in
@@ -2005,7 +2036,7 @@ pub fn assess(
             return AutomationDecision::Wait;
         };
         return apply_human_gates(
-            assess_feature_integration(worktree, plugin, task, state),
+            assess_feature_integration(worktree, plugin, task, state, db),
             project,
             plugin,
             task,
@@ -2045,11 +2076,11 @@ pub fn assess(
     };
 
     let decision = match state.state.as_str() {
-        "planning" => assess_planning(worktree, plugin, task, state),
-        "plan_review" => assess_plan_review(worktree, plugin, task, state),
-        "engineering_review" => assess_engineering_review(worktree, plugin, task, state),
-        "final_validation" => assess_final_validation(worktree, plugin, task, state),
-        "implementing" | "running" => assess_implementation(worktree, plugin, task, state),
+        "planning" => assess_planning(worktree, plugin, task, state, db),
+        "plan_review" => assess_plan_review(worktree, plugin, task, state, db),
+        "engineering_review" => assess_engineering_review(worktree, plugin, task, state, db),
+        "final_validation" => assess_final_validation(worktree, plugin, task, state, db),
+        "implementing" | "running" => assess_implementation(worktree, plugin, task, state, db),
         // A role state this function does not yet know an artifact mapping
         // for. Nothing to read, so nothing to report.
         _ => AutomationDecision::Wait,
@@ -2101,36 +2132,21 @@ fn apply_human_gates(
     AutomationDecision::HumanGate(reason)
 }
 
-/// Mirrors `submit_workflow_plan`'s own evidence check: a plan artifact is
-/// only meaningful once its `plan_revision` has actually moved past the
-/// last recorded one.
+/// Mirrors `submit_workflow_plan`'s own evidence check. Revision allocation is
+/// database-owned and happens only when this snapshot is accepted.
 fn assess_planning(
     worktree: &str,
     plugin: &WorkflowPlugin,
     task: &Task,
     state: &WorkflowTaskState,
+    db: &Database,
 ) -> AutomationDecision {
     let path = match planning_artifact_path(worktree, plugin, &task.id) {
         Ok(path) => path,
         Err(_) => return AutomationDecision::Wait,
     };
-    if let Some(decision) = artifact_freshness(&path, state) {
+    if let Some(decision) = artifact_freshness(&path, state, task, db) {
         return decision;
-    }
-    let contents = match std::fs::read(&path) {
-        Ok(contents) => contents,
-        Err(_) => return AutomationDecision::Wait,
-    };
-    let Some(revision) = plan_revision(&contents) else {
-        return AutomationDecision::InvalidArtifact(
-            "Planning artifact must contain 'plan_revision: <positive integer>'".to_string(),
-        );
-    };
-    if revision <= state.plan_revision {
-        return AutomationDecision::InvalidArtifact(format!(
-            "Plan revision {revision} is not newer than recorded revision {}",
-            state.plan_revision
-        ));
     }
     AutomationDecision::Advance("submit_plan".to_string())
 }
@@ -2145,6 +2161,7 @@ fn assess_plan_review(
     plugin: &WorkflowPlugin,
     task: &Task,
     state: &WorkflowTaskState,
+    db: &Database,
 ) -> AutomationDecision {
     let artifact = workflow_artifact_path(
         worktree,
@@ -2152,7 +2169,7 @@ fn assess_plan_review(
         &task.id,
         ".agent-flow/plan-review.yaml",
     );
-    if let Some(decision) = artifact_freshness(&artifact, state) {
+    if let Some(decision) = artifact_freshness(&artifact, state, task, db) {
         return decision;
     }
     let verdict = match workflow_artifact_value(&artifact, "verdict") {
@@ -2175,6 +2192,7 @@ fn assess_engineering_review(
     plugin: &WorkflowPlugin,
     task: &Task,
     state: &WorkflowTaskState,
+    db: &Database,
 ) -> AutomationDecision {
     let artifact = workflow_artifact_path(
         worktree,
@@ -2182,7 +2200,7 @@ fn assess_engineering_review(
         &task.id,
         ".agent-flow/engineering-review.yaml",
     );
-    if let Some(decision) = artifact_freshness(&artifact, state) {
+    if let Some(decision) = artifact_freshness(&artifact, state, task, db) {
         return decision;
     }
     let verdict = match workflow_artifact_value(&artifact, "verdict") {
@@ -2213,6 +2231,7 @@ fn assess_final_validation(
     plugin: &WorkflowPlugin,
     task: &Task,
     state: &WorkflowTaskState,
+    db: &Database,
 ) -> AutomationDecision {
     let artifact = workflow_artifact_path(
         worktree,
@@ -2220,7 +2239,7 @@ fn assess_final_validation(
         &task.id,
         ".agent-flow/final-validation.yaml",
     );
-    if let Some(decision) = artifact_freshness(&artifact, state) {
+    if let Some(decision) = artifact_freshness(&artifact, state, task, db) {
         return decision;
     }
     let verdict = match workflow_artifact_value(&artifact, "verdict") {
@@ -2245,6 +2264,7 @@ fn assess_feature_integration(
     plugin: &WorkflowPlugin,
     task: &Task,
     state: &WorkflowTaskState,
+    db: &Database,
 ) -> AutomationDecision {
     let artifact = workflow_artifact_path(
         worktree,
@@ -2252,7 +2272,7 @@ fn assess_feature_integration(
         &task.id,
         ".agent-flow/integration-ready.yaml",
     );
-    if let Some(decision) = artifact_freshness(&artifact, state) {
+    if let Some(decision) = artifact_freshness(&artifact, state, task, db) {
         return decision;
     }
     let verdict = match workflow_artifact_value(&artifact, "verdict") {
@@ -2278,6 +2298,7 @@ fn assess_implementation(
     plugin: &WorkflowPlugin,
     task: &Task,
     state: &WorkflowTaskState,
+    db: &Database,
 ) -> AutomationDecision {
     let artifact = workflow_artifact_path(
         worktree,
@@ -2285,7 +2306,7 @@ fn assess_implementation(
         &task.id,
         ".agent-flow/implementation-result.yaml",
     );
-    match artifact_freshness(&artifact, state) {
+    match artifact_freshness(&artifact, state, task, db) {
         Some(decision) => decision,
         None => AutomationDecision::Advance("implementation_complete".to_string()),
     }
@@ -2341,7 +2362,7 @@ mod tests {
         let source_dir = tempfile::tempdir().unwrap();
         let project_dir = tempfile::tempdir().unwrap();
         let source = source_dir.path().join("plan.md");
-        std::fs::write(&source, "plan_revision: 1\nkeep this exactly\n").unwrap();
+        std::fs::write(&source, "keep this exact metadata-free plan\n").unwrap();
 
         let first = backup_plan(&source, project_dir.path(), "Recover planning!").unwrap();
         let second = backup_plan(&source, project_dir.path(), "Recover planning!").unwrap();
@@ -2541,6 +2562,12 @@ mod tests {
         task
     }
 
+    fn record_launch_for_test(db: &Database, task: &Task, state: &WorkflowTaskState) {
+        let mut report = TaskStepReport::new(&task.id, state.state_attempt, &state.state);
+        report.updated_at = chrono::Utc::now();
+        db.upsert_task_step_report(&report).unwrap();
+    }
+
     #[test]
     fn assess_advances_a_backlog_task_once_dependencies_resolve() {
         let graph = assess_workflow();
@@ -2574,7 +2601,7 @@ mod tests {
         std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
         std::fs::write(
             worktree.path().join(".agent-flow/engineering-review.yaml"),
-            "verdict: approved_for_validation\nworkflow_attempt: 3\n",
+            "verdict: approved_for_validation\n",
         )
         .unwrap();
         let task = admitted_task(worktree.path());
@@ -2619,7 +2646,7 @@ mod tests {
                 .join(".agent-flow")
                 .join(&task.id)
                 .join("implementation-result.yaml"),
-            "workflow_attempt: 1\n",
+            "result: completed\n",
         )
         .unwrap();
         let mut state = WorkflowTaskState::new(&task.id, "running", "main");
@@ -2655,7 +2682,7 @@ mod tests {
                 .join(".agent-flow")
                 .join(&task.id)
                 .join("implementation-result.yaml"),
-            "workflow_attempt: 1\n",
+            "result: completed\n",
         )
         .unwrap();
         let state = WorkflowTaskState::new(&task.id, "running", "main");
@@ -2666,22 +2693,22 @@ mod tests {
     }
 
     #[test]
-    fn assess_waits_on_an_artifact_stamped_with_a_stale_attempt() {
+    fn assess_waits_on_an_unchanged_artifact_from_before_launch() {
         let graph = assess_workflow();
         let plugin = plugin_for_tests(graph.clone());
         let worktree = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
-        // Left over from a prior entry into this state: valid content, but
-        // stamped with an attempt number that is not the task's current one.
+        // Left over from a prior entry into this state.
         std::fs::write(
             worktree.path().join(".agent-flow/engineering-review.yaml"),
-            "verdict: approved_for_validation\nworkflow_attempt: 1\n",
+            "verdict: approved_for_validation\n",
         )
         .unwrap();
         let task = admitted_task(worktree.path());
         let mut state = WorkflowTaskState::new(&task.id, "engineering_review", "main");
         state.state_attempt = 2;
         let db = Database::open_in_memory_project().unwrap();
+        record_launch_for_test(&db, &task, &state);
 
         let decision = assess(&graph, &project(), &plugin, &task, &state, &db);
         assert_eq!(decision, AutomationDecision::Wait);
@@ -2696,7 +2723,7 @@ mod tests {
         // Attempt matches, but there is no `verdict:` line at all.
         std::fs::write(
             worktree.path().join(".agent-flow/engineering-review.yaml"),
-            "workflow_attempt: 1\n",
+            "result: completed\n",
         )
         .unwrap();
         let task = admitted_task(worktree.path());
@@ -2715,7 +2742,7 @@ mod tests {
         std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
         std::fs::write(
             worktree.path().join(".agent-flow/final-validation.yaml"),
-            "verdict: failed\nworkflow_attempt: 1\n",
+            "verdict: failed\n",
         )
         .unwrap();
         let task = admitted_task(worktree.path());
@@ -2737,7 +2764,7 @@ mod tests {
         std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
         std::fs::write(
             worktree.path().join(".agent-flow/integration-ready.yaml"),
-            "verdict: ready_for_integration\nworkflow_attempt: 4\n",
+            "verdict: ready_for_integration\n",
         )
         .unwrap();
         let task = admitted_task(worktree.path());
@@ -2767,7 +2794,7 @@ mod tests {
         let artifact = worktree.path().join(".agent-flow/engineering-review.yaml");
         std::fs::write(
             &artifact,
-            "verdict: approved_for_validation\nworkflow_attempt: 1\n",
+            "verdict: approved_for_validation\n",
         )
         .unwrap();
         let task = admitted_task(worktree.path());
@@ -2775,6 +2802,8 @@ mod tests {
 
         // First pass: state_attempt 1 matches the artifact's workflow_attempt.
         let first_state = WorkflowTaskState::new(&task.id, "engineering_review", "main");
+        // The first pass sees newly written output. The second launch records
+        // the existing file as its baseline and must wait for a real rewrite.
         assert_eq!(
             assess(&graph, &project(), &plugin, &task, &first_state, &db),
             AutomationDecision::Advance("start_final_validation".to_string())
@@ -2785,6 +2814,7 @@ mod tests {
         // untouched leftover from the first pass.
         let mut second_state = WorkflowTaskState::new(&task.id, "engineering_review", "main");
         second_state.state_attempt = 2;
+        record_launch_for_test(&db, &task, &second_state);
         assert_eq!(
             assess(&graph, &project(), &plugin, &task, &second_state, &db),
             AutomationDecision::Wait
@@ -2843,7 +2873,7 @@ mod tests {
         std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
         std::fs::write(
             worktree.path().join(".agent-flow/plan-review.yaml"),
-            "verdict: approved\nworkflow_attempt: 1\n",
+            "verdict: approved\n",
         )
         .unwrap();
         let task = admitted_task(worktree.path());
@@ -2868,7 +2898,7 @@ mod tests {
         std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
         std::fs::write(
             worktree.path().join(".agent-flow/plan-review.yaml"),
-            "verdict: approved\nworkflow_attempt: 1\n",
+            "verdict: approved\n",
         )
         .unwrap();
         let task = admitted_task(worktree.path());
@@ -2898,7 +2928,7 @@ mod tests {
         std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
         std::fs::write(
             worktree.path().join(".agent-flow/plan-review.yaml"),
-            "verdict: approved\nworkflow_attempt: 1\n",
+            "verdict: approved\n",
         )
         .unwrap();
         let task = admitted_task(worktree.path());
@@ -2921,7 +2951,7 @@ mod tests {
         std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
         std::fs::write(
             worktree.path().join(".agent-flow/plan-review.yaml"),
-            "verdict: changes_requested\nfindings: Missing tests for the new endpoint.\nworkflow_attempt: 1\n",
+            "verdict: changes_requested\nfindings: Missing tests for the new endpoint.\n",
         )
         .unwrap();
         let task = admitted_task(worktree.path());
@@ -2949,20 +2979,21 @@ mod tests {
     }
 
     #[test]
-    fn assess_plan_review_waits_on_an_artifact_stamped_with_a_stale_attempt() {
+    fn assess_plan_review_waits_on_an_unchanged_artifact_from_before_launch() {
         let graph = assess_plan_review_workflow();
         let plugin = plugin_for_tests(graph.clone());
         let worktree = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
         std::fs::write(
             worktree.path().join(".agent-flow/plan-review.yaml"),
-            "verdict: approved\nworkflow_attempt: 1\n",
+            "verdict: approved\n",
         )
         .unwrap();
         let task = admitted_task(worktree.path());
         let mut state = WorkflowTaskState::new(&task.id, "plan_review", "main");
         state.state_attempt = 2;
         let db = Database::open_in_memory_project().unwrap();
+        record_launch_for_test(&db, &task, &state);
 
         let decision = assess(&graph, &project(), &plugin, &task, &state, &db);
         assert_eq!(decision, AutomationDecision::Wait);
@@ -2976,7 +3007,7 @@ mod tests {
         std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
         std::fs::write(
             worktree.path().join(".agent-flow/plan-review.yaml"),
-            "verdict: looks_fine_i_guess\nworkflow_attempt: 1\n",
+            "verdict: looks_fine_i_guess\n",
         )
         .unwrap();
         let task = admitted_task(worktree.path());
@@ -3024,6 +3055,56 @@ mod launch_tests {
             copy_back: Default::default(),
             auto_dismiss: Vec::new(),
         }
+    }
+
+    #[test]
+    fn discovers_newest_opencode_session_v2_for_worktree() {
+        let data_home = tempfile::tempdir().unwrap();
+        let store = data_home.path().join("opencode");
+        std::fs::create_dir_all(&store).unwrap();
+        let conn = rusqlite::Connection::open(store.join("opencode.db")).unwrap();
+        conn.execute("CREATE TABLE session_v2 (id TEXT, directory TEXT, time_updated INTEGER)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO session_v2 (id, directory, time_updated) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["older", "C:/work/task", 10_i64],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO session_v2 (id, directory, time_updated) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["newest", "C:/work/task", 20_i64],
+        ).unwrap();
+
+        assert_eq!(
+            opencode_session_id_for_worktree(data_home.path(), "C:/work/task"),
+            Some("newest".to_string())
+        );
+        assert_eq!(opencode_session_id_for_worktree(data_home.path(), "C:/work/other"), None);
+    }
+
+    #[test]
+    fn records_hook_reported_codex_or_claude_session_without_overwriting_prior_rows() {
+        let worktree = tempfile::tempdir().unwrap();
+        let task = crate::db::Task::new("Session mapping", "codex", "proj");
+        let db = Database::open_in_memory_project().unwrap();
+        db.create_task(&task).unwrap();
+        let status = crate::agent::hook_status::AgentHookStatus {
+            ts: chrono::Utc::now().timestamp(),
+            state: crate::agent::hook_status::HookState::Waiting,
+            session_id: Some("codex-native-session".into()),
+            transcript_path: None,
+            message: None,
+            tool: None,
+            agent: "codex".into(),
+        };
+        crate::agent::hook_status::write_status(worktree.path(), &task.id, &status).unwrap();
+
+        record_provider_session_if_known(
+            &db, &task, "planning", 4, "codex", &worktree.path().to_string_lossy(),
+        );
+        let sessions = db.provider_sessions(&task.id).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].provider_session_id, "codex-native-session");
+        assert_eq!(sessions[0].workflow_session_id, format!("agtx:{}:4:planning", task.id));
     }
 
     fn merged_config() -> MergedConfig {
@@ -3187,7 +3268,7 @@ mod launch_tests {
             effort: Some("medium".into()),
             ..Default::default()
         };
-        let prompt = "Implement: do the work\n\nApproved plan revision: 2\nApproved plan SHA-256: abc123\n\nCurrent workflow attempt: 2. Your output artifact MUST contain the line: workflow_attempt: 2".to_string();
+        let prompt = "Implement: do the work\n\nAGTX has bound the approved plan internally. Do not write revision, workflow-attempt, or SHA-256 metadata into your result artifact.".to_string();
         let expected = format!(
             "claude --model sonnet --effort medium --permission-mode dontAsk --allowed-tools '{}' -- '{}'",
             claude_allowed_tools(&policy),
@@ -3253,7 +3334,7 @@ mod launch_tests {
 
         let mut task = crate::db::Task::new("Implement thing", "codex", "proj");
         // Comfortably past MAX_LAUNCH_PROMPT_BYTES (4 KiB).
-        task.description = Some("x".repeat(200_000));
+        task.description = Some("x".repeat(2_000_000));
         task.worktree_path = Some("C:/work/wt".into());
 
         let mut db = Database::open_in_memory_project().unwrap();
@@ -3301,7 +3382,7 @@ mod launch_tests {
         mock_tmux
             .expect_send_key()
             .returning(move |_, key| {
-                if key == "Enter" {
+                if key == "C-m" {
                     *sent_enter_clone.lock().unwrap() = true;
                 }
                 Ok(())
@@ -3358,7 +3439,7 @@ mod launch_tests {
             .clone()
             .expect("paste_text should have delivered the deferred prompt");
         assert!(
-            pasted.contains(&"x".repeat(200_000)),
+            pasted.contains(&"x".repeat(2_000_000)),
             "paste_text should carry the full oversized prompt"
         );
         assert!(
@@ -3523,8 +3604,7 @@ mod launch_tests {
             "Review: review the change
 
 Engineering-review verdict: approved_for_validation. Evidence: {artifact_rel}. Follow the declared role policy; do not commit, push, create a PR, merge, or bypass controls.
-
-Current workflow attempt: 2. Your output artifact MUST contain the line: workflow_attempt: 2"
+AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artifact."
         );
         let inner = format!(
             "claude --model opus --permission-mode dontAsk --allowed-tools '{}' -- '{}'",
@@ -3594,7 +3674,8 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             .roles
             .insert("validator".into(), WorkflowRolePolicy::default());
 
-        let plugin = plugin(graph.clone());
+        let mut plugin = plugin(graph.clone());
+        plugin.artifacts.planning = Some(".agtx/plans/{task_id}.md".into());
 
         let worktree = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
@@ -3681,8 +3762,8 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             .clone()
             .expect("switch_agent_in_tmux should paste the new command");
         assert!(
-            sent.contains("Current workflow attempt: 2. Your output artifact MUST contain the line: workflow_attempt: 2"),
-            "expected the destination state_attempt (2) in the launched prompt, got: {sent}"
+            sent.contains("AGTX owns workflow-attempt and SHA-256 metadata"),
+            "expected metadata-free artifact instruction in the launched prompt, got: {sent}"
         );
     }
 
@@ -3773,7 +3854,8 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             .roles
             .insert("planner".into(), WorkflowRolePolicy::default());
 
-        let plugin = plugin(graph.clone());
+        let mut plugin = plugin(graph.clone());
+        plugin.artifacts.planning = Some(".agtx/plans/{task_id}.md".into());
 
         let worktree = tempfile::tempdir().unwrap();
         let mut task = crate::db::Task::new("Plan thing", "claude", "proj");
@@ -3798,15 +3880,21 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
                 assert_state_already_persisted(&db_path_for_check, &task_id_for_check, "planning");
                 let command = command.expect("planner launch must carry its prompt");
                 assert!(
-                    command.contains("Authoritative planning metadata from AGTX: write plan_revision: 1 and workflow_attempt: 3"),
-                    "planner fallback metadata must be explicit in the launch prompt, got: {command}"
+                    command.contains("AGTX owns revision, workflow-attempt, and SHA-256 metadata"),
+                    "planner launch must prohibit agent-authored orchestration metadata, got: {command}"
                 );
                 assert!(
-                    command.contains("Do not add, predict, or copy a plan SHA-256 into the plan artifact"),
-                    "planner prompt must make the executor-owned hash boundary explicit, got: {command}"
+                    command.contains("Write only the plan content"),
+                    "planner prompt must prohibit orchestration fields, got: {command}"
                 );
                 Ok(())
             });
+        let captured_prompt = Arc::new(Mutex::new(None));
+        let captured_prompt_clone = captured_prompt.clone();
+        mock_tmux.expect_send_keys().returning(move |_, text| {
+            *captured_prompt_clone.lock().unwrap() = Some(text.to_string());
+            Ok(())
+        });
 
         let mut mock_registry = MockAgentRegistry::new();
         mock_registry.expect_get().returning(|_| {
@@ -3905,7 +3993,7 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
         std::fs::write(
             worktree.path().join(".agent-flow/plan.yaml"),
-            "plan_revision: 1\n",
+            "# Metadata-free plan\n\nImplement the requested behaviour.\n",
         )
         .unwrap();
 
@@ -3917,7 +4005,8 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         let db_path = db_dir.path().join("wf.db");
         let mut db = Database::open_project_at_path(&db_path).unwrap();
         db.create_task(&task).unwrap();
-        let current = WorkflowTaskState::new(&task.id, "planning", "main");
+        let mut current = WorkflowTaskState::new(&task.id, "planning", "main");
+        current.plan_revision = 7;
         let record = WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "planning");
         db.record_workflow_admission(&task, &current, &record)
             .unwrap();
@@ -3939,6 +4028,7 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
                 );
                 Ok(())
             });
+        mock_tmux.expect_send_keys().returning(|_, _| Ok(()));
         mock_tmux.expect_send_key().returning(|_, _| Ok(()));
         let command_checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let command_checks_for_mock = Arc::clone(&command_checks);
@@ -3981,6 +4071,11 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         assert_eq!(
             db.get_workflow_task_state(&task.id).unwrap().unwrap().state,
             "plan_review"
+        );
+        assert_eq!(
+            db.get_workflow_task_state(&task.id).unwrap().unwrap().plan_revision,
+            8,
+            "AGTX allocates current_revision + 1 without parsing planner metadata"
         );
     }
 
@@ -4041,7 +4136,7 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
         std::fs::write(
             worktree.path().join(".agent-flow/plan.yaml"),
-            "plan_revision: 1\n",
+            "# Metadata-free plan\n\nImplement the requested behaviour.\n",
         )
         .unwrap();
 
@@ -4063,6 +4158,12 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             .expect_send_keys()
             .withf(|_, cmd: &str| cmd == "/exit")
             .returning(|_, _| Ok(()));
+        let captured_prompt = Arc::new(Mutex::new(None));
+        let captured_prompt_clone = captured_prompt.clone();
+        mock_tmux.expect_send_keys().returning(move |_, text| {
+            *captured_prompt_clone.lock().unwrap() = Some(text.to_string());
+            Ok(())
+        });
         mock_tmux.expect_send_key().returning(|_, _| Ok(()));
         let command_checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let command_checks_for_mock = Arc::clone(&command_checks);
@@ -4076,12 +4177,6 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         mock_tmux
             .expect_capture_pane()
             .returning(|_| Ok(String::new()));
-        let captured_prompt = Arc::new(Mutex::new(None));
-        let captured_prompt_clone = captured_prompt.clone();
-        mock_tmux.expect_paste_text().returning(move |_, text| {
-            *captured_prompt_clone.lock().unwrap() = Some(text.to_string());
-            Ok(())
-        });
 
         let mut mock_registry = MockAgentRegistry::new();
         mock_registry
@@ -4123,8 +4218,8 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             "prompt must not still reference the old flat path"
         );
         assert!(
-            prompt.contains("Authoritative review metadata from AGTX: write workflow_attempt: 2"),
-            "reviewer prompt must give a fallback agent the exact review attempt, got: {prompt}"
+            prompt.contains("AGTX owns all revision, attempt, and SHA-256 metadata"),
+            "reviewer prompt must prohibit agent-authored orchestration metadata, got: {prompt}"
         );
     }
 
@@ -4795,7 +4890,7 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
         std::fs::write(
             worktree.path().join(".agent-flow/plan-review.yaml"),
-            "verdict: changes_requested\nfindings: Add input validation for the new endpoint before revising further.\nworkflow_attempt: 1\n",
+            "verdict: changes_requested\nfindings: Add input validation for the new endpoint before revising further.\n",
         )
         .unwrap();
 
@@ -4860,12 +4955,12 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
             "planner prompt must identify the exact persisted review artifact, got: {sent}"
         );
         assert!(
-            sent.contains("Authoritative revision metadata from AGTX: write plan_revision: 1 and workflow_attempt: 2"),
-            "revision handoff must give a replacement planner exact metadata, got: {sent}"
+            sent.contains("AGTX owns revision, workflow-attempt, and SHA-256 metadata"),
+            "revision handoff must prohibit agent-authored orchestration metadata, got: {sent}"
         );
         assert!(
-            sent.contains("Do not add, predict, or copy a plan SHA-256 into the plan artifact"),
-            "revision handoff must keep hashing executor-owned, got: {sent}"
+            sent.contains("Write only the revised plan content"),
+            "revision handoff must prohibit orchestration fields, got: {sent}"
         );
     }
 
@@ -4883,7 +4978,7 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         // `verdict` present, no `findings:` line at all.
         std::fs::write(
             worktree.path().join(".agent-flow/plan-review.yaml"),
-            "verdict: changes_requested\nworkflow_attempt: 1\n",
+            "verdict: changes_requested\n",
         )
         .unwrap();
 
@@ -4913,6 +5008,13 @@ Current workflow attempt: 2. Your output artifact MUST contain the line: workflo
         let outcome =
             submit_plan_review(&graph, &project, &plugin, task.clone(), &mut db, &runtime).unwrap();
         assert!(matches!(outcome, WorkflowStepOutcome::Blocked { .. }));
+        assert!(
+            db.task_step_reports(&task.id)
+                .unwrap()
+                .iter()
+                .all(|report| report.artifact_sha256.is_none()),
+            "invalid findings must not become immutable evidence"
+        );
         assert!(
             db.workflow_step_inputs(&task.id, 2, "planning")
                 .unwrap()
