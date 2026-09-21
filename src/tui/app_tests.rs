@@ -12566,6 +12566,21 @@ fn test_switch_agent_sends_ctrl_d_as_last_resort() {
 }
 
 #[test]
+fn workflow_artifact_value_reads_non_empty_yaml_sequence() {
+    let temp = tempfile::tempdir().unwrap();
+    let artifact = temp.path().join("plan-review.yaml");
+    std::fs::write(
+        &artifact,
+        "verdict: changes_requested\nfindings:\n  - id: enum-input-normalization\n    severity: blocker\n    required_change: Add explicit normalization.\n  - id: hard-delete-policy\n    severity: blocker\n    required_change: Use soft delete.\n",
+    )
+    .unwrap();
+
+    let findings = workflow_artifact_value(&artifact, "findings").unwrap();
+    assert!(findings.contains("enum-input-normalization"));
+    assert!(findings.contains("hard-delete-policy"));
+}
+
+#[test]
 #[cfg(feature = "test-mocks")]
 fn test_switch_agent_always_sends_new_agent_cmd() {
     // Even in worst case (shell never found), new agent cmd is sent

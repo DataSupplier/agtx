@@ -1227,7 +1227,7 @@ pub fn decide_workflow_plan(
             Ok(findings) => findings,
             Err(_) => {
                 return Ok(WorkflowStepOutcome::Blocked {
-                    message: "Plan changes require a non-empty scalar findings value in plan-review.yaml".into(),
+                    message: "Plan changes require non-empty findings in plan-review.yaml".into(),
                 });
             }
         };
@@ -1337,7 +1337,7 @@ pub fn submit_plan_review(
     // equally atomic.
     if !approve && workflow_artifact_value(&artifact, "findings").is_err() {
         return Ok(WorkflowStepOutcome::Blocked {
-            message: "Plan changes require a non-empty scalar findings value in plan-review.yaml".into(),
+            message: "Plan changes require non-empty findings in plan-review.yaml".into(),
         });
     }
     record_step_evidence(db, &task, &current, &task.agent, &artifact, runtime)?;

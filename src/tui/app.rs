@@ -12124,7 +12124,7 @@ pub(crate) fn workflow_artifact_value(path: &Path, field: &str) -> Result<String
     // Agents naturally use YAML's folded/literal scalar notation for prose
     // evidence. Read the indented continuation rather than mistaking `>-` or
     // `|` for the value itself.
-    let value = if matches!(value, ">" | ">-" | ">+" | "|" | "|-" | "|+") {
+    let indented_lines = || {
         lines[index + 1..]
             .iter()
             .take_while(|line| {
@@ -12133,7 +12133,20 @@ pub(crate) fn workflow_artifact_value(path: &Path, field: &str) -> Result<String
             .map(|line| line.trim())
             .filter(|line| !line.is_empty())
             .collect::<Vec<_>>()
-            .join(" ")
+    };
+    let value = if matches!(value, ">" | ">-" | ">+" | "|" | "|-" | "|+") {
+        indented_lines().join(" ")
+    } else if value.is_empty() {
+        // Reviewers occasionally use a normal YAML sequence for findings.
+        // Accept a non-empty sequence as durable evidence too: its compact
+        // text form can still be handed verbatim to the next agent, while an
+        // empty/malformed field remains safely blocked.
+        let lines = indented_lines();
+        if lines.first().is_some_and(|line| line.starts_with("- ")) {
+            lines.join(" ")
+        } else {
+            String::new()
+        }
     } else {
         value.trim_matches(['\'', '"']).to_string()
     };
