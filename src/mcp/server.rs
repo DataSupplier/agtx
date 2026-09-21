@@ -777,7 +777,8 @@ impl AgtxMcpServer {
         match self.open_project_db_for(params.project_id.as_deref()) {
             Ok(db) => match db.get_task(&params.task_id) {
                 Ok(Some(_)) => {
-                    let mut req = TransitionRequest::new(&params.task_id, "start_workflow_planning");
+                    let mut req =
+                        TransitionRequest::new(&params.task_id, "start_workflow_planning");
                     req.require_plan_approval = params.require_plan_approval;
                     let request_id = req.id.clone();
                     match db.create_transition_request(&req) {
@@ -1127,10 +1128,12 @@ impl AgtxMcpServer {
                     return serde_json::to_string_pretty(&response)
                         .unwrap_or_else(|e| format!("Error serializing: {}", e));
                 }
-                Ok(Some(_)) => return format!(
+                Ok(Some(_)) => {
+                    return format!(
                     "Identity conflict: task ID {} already exists with a different export payload",
                     task.id
-                ),
+                )
+                }
                 Ok(None) => {}
                 Err(e) => return format!("Error checking task identity: {}", e),
             }
@@ -1292,10 +1295,12 @@ impl AgtxMcpServer {
                         &task.referenced_tasks,
                         &task.base_branch,
                     ) => {}
-                Ok(Some(_)) => return format!(
+                Ok(Some(_)) => {
+                    return format!(
                     "Identity conflict: task ID {} already exists with a different export payload",
                     task.id
-                ),
+                )
+                }
                 Ok(None) => new_tasks.push(task.clone()),
                 Err(e) => return format!("Error checking task identity: {}", e),
             }

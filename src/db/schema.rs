@@ -3,9 +3,10 @@ use rusqlite::{params, Connection, Transaction};
 use std::path::Path;
 
 use super::models::{
-    DependencyState, MobileDevice, Notification, NotificationKind, PhaseStatus, Project, ProviderSession, Task,
-    TaskExecutionEvent, TaskRuntime, TaskStatus, TaskStepReport, TransitionRequest,
-    WorkflowArtifact, WorkflowStepInput, WorkflowTaskState, WorkflowTransitionRecord,
+    DependencyState, MobileDevice, Notification, NotificationKind, PhaseStatus, Project,
+    ProviderSession, Task, TaskExecutionEvent, TaskRuntime, TaskStatus, TaskStepReport,
+    TransitionRequest, WorkflowArtifact, WorkflowStepInput, WorkflowTaskState,
+    WorkflowTransitionRecord,
 };
 
 /// Database wrapper for SQLite operations
@@ -1134,16 +1135,40 @@ impl Database {
     }
 
     pub fn provider_sessions(&self, task_id: &str) -> Result<Vec<ProviderSession>> {
-        let mut stmt = self.conn.prepare("SELECT * FROM provider_sessions WHERE task_id = ?1 ORDER BY started_at, id")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM provider_sessions WHERE task_id = ?1 ORDER BY started_at, id",
+        )?;
         let rows = stmt.query_map([task_id], |row| {
             let parse = |column: &str| -> rusqlite::Result<chrono::DateTime<chrono::Utc>> {
                 chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(column)?)
                     .map(|value| value.with_timezone(&chrono::Utc))
-                    .map_err(|error| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error)))
+                    .map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
             };
-            Ok(ProviderSession { id: row.get("id")?, task_id: row.get("task_id")?, workflow_attempt: row.get("workflow_attempt")?, state: row.get("state")?, workflow_session_id: row.get("workflow_session_id")?, provider: row.get("provider")?, provider_session_id: row.get("provider_session_id")?, agent: row.get("agent")?, started_at: parse("started_at")?, ended_at: row.get::<_, Option<String>>("ended_at")?.and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok().map(|dt| dt.with_timezone(&chrono::Utc))) })
+            Ok(ProviderSession {
+                id: row.get("id")?,
+                task_id: row.get("task_id")?,
+                workflow_attempt: row.get("workflow_attempt")?,
+                state: row.get("state")?,
+                workflow_session_id: row.get("workflow_session_id")?,
+                provider: row.get("provider")?,
+                provider_session_id: row.get("provider_session_id")?,
+                agent: row.get("agent")?,
+                started_at: parse("started_at")?,
+                ended_at: row.get::<_, Option<String>>("ended_at")?.and_then(|value| {
+                    chrono::DateTime::parse_from_rfc3339(&value)
+                        .ok()
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                }),
+            })
         })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     /// Persist the worktree created during admission together with its frozen

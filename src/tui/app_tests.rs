@@ -5745,7 +5745,10 @@ fn test_write_skills_to_worktree_mcp_opencode_preserves_existing_settings() {
 
     let content = std::fs::read_to_string(dir.path().join("opencode.json")).unwrap();
     let v: serde_json::Value = serde_json::from_str(&content).unwrap();
-    assert_eq!(v["model"], "deepseek/deepseek-flash", "model must survive redeploy");
+    assert_eq!(
+        v["model"], "deepseek/deepseek-flash",
+        "model must survive redeploy"
+    );
     assert_eq!(
         v["provider"]["deepseek"]["options"]["apiKey"], "{env:DEEPSEEK_API_KEY}",
         "provider config must survive redeploy"
@@ -5779,7 +5782,10 @@ fn test_write_skills_to_worktree_mcp_opencode_idempotent_on_repeat() {
         serde_json::from_str(&first).unwrap(),
         serde_json::from_str(&second).unwrap(),
     );
-    assert_eq!(v1, v2, "repeated redeploys of an unchanged config must not drift");
+    assert_eq!(
+        v1, v2,
+        "repeated redeploys of an unchanged config must not drift"
+    );
 }
 
 /// `permission_mode: None` (today's default) generates no rules at all --
@@ -5792,7 +5798,10 @@ fn test_opencode_permission_rules_none_by_default() {
         ..Default::default()
     };
     let rules = opencode_permission_rules(&policy, true);
-    assert!(rules.is_empty(), "no permission_mode must generate no rules");
+    assert!(
+        rules.is_empty(),
+        "no permission_mode must generate no rules"
+    );
 }
 
 /// `permission_mode = "autonomous"` translates `write_paths`,
@@ -5809,7 +5818,9 @@ fn test_opencode_permission_rules_autonomous_translates_role_policy() {
     let rules = opencode_permission_rules(&policy, true);
 
     let has = |action: &str, resource: &str, effect: &str| {
-        rules.iter().any(|r| r["action"] == action && r["resource"] == resource && r["effect"] == effect)
+        rules
+            .iter()
+            .any(|r| r["action"] == action && r["resource"] == resource && r["effect"] == effect)
     };
     assert!(
         !rules.iter().any(|r| r["action"] == "external_directory"),
@@ -5822,7 +5833,9 @@ fn test_opencode_permission_rules_autonomous_translates_role_policy() {
     assert!(has("bash", "pnpm test*", "allow"));
     assert!(has("network", "*", "allow"));
     assert!(
-        !rules.iter().any(|r| r["resource"] == "*" && r["action"] != "network"),
+        !rules
+            .iter()
+            .any(|r| r["resource"] == "*" && r["action"] != "network"),
         "must never emit a blanket allow rule"
     );
 }
@@ -5847,7 +5860,9 @@ fn test_opencode_permission_rules_subagents_independent_of_autonomous() {
         ..Default::default()
     };
     let rules = opencode_permission_rules(&explicit_deny, false);
-    assert!(rules.iter().any(|r| r["action"] == "subagent" && r["effect"] == "deny"));
+    assert!(rules
+        .iter()
+        .any(|r| r["action"] == "subagent" && r["effect"] == "deny"));
 
     let explicit_allow = WorkflowRolePolicy {
         allow_subagents: Some(true),
@@ -5889,7 +5904,10 @@ fn test_write_opencode_permission_profile_replaces_generated_slice_without_accum
     let after_planner: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(wt.join("opencode.json")).unwrap()).unwrap();
     let perms = after_planner["permissions"].as_array().unwrap();
-    assert!(perms.contains(&project_rule), "project's own rule must survive");
+    assert!(
+        perms.contains(&project_rule),
+        "project's own rule must survive"
+    );
     assert!(
         perms.iter().any(|r| r["resource"] == ".agtx/plans/**"),
         "planner's generated rule must be present"
@@ -5907,7 +5925,10 @@ fn test_write_opencode_permission_profile_replaces_generated_slice_without_accum
     let after_implementer: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(wt.join("opencode.json")).unwrap()).unwrap();
     let perms = after_implementer["permissions"].as_array().unwrap();
-    assert!(perms.contains(&project_rule), "project's own rule must still survive");
+    assert!(
+        perms.contains(&project_rule),
+        "project's own rule must still survive"
+    );
     assert!(
         perms.iter().any(|r| r["resource"] == "api/**"),
         "implementer's generated rule must be present"

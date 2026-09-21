@@ -580,9 +580,7 @@ fn validate_agent_option(kind: &str, value: &str) -> anyhow::Result<()> {
             character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '/')
         })
     {
-        bail!(
-            "workflow {kind} must contain only ASCII letters, digits, '-', '_', '.', or '/'"
-        );
+        bail!("workflow {kind} must contain only ASCII letters, digits, '-', '_', '.', or '/'");
     }
     Ok(())
 }

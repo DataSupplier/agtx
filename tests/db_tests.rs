@@ -1,9 +1,10 @@
 use sha2::{Digest, Sha256};
 
 use agtx::db::{
-    Database, DependencyState, Notification, NotificationKind, PhaseStatus, Project, ProviderSession, Task,
-    TaskExecutionEvent, TaskRuntime, TaskStatus, TaskStepReport, TransitionRequest,
-    WorkflowArtifact, WorkflowStepInput, WorkflowTaskState, WorkflowTransitionRecord,
+    Database, DependencyState, Notification, NotificationKind, PhaseStatus, Project,
+    ProviderSession, Task, TaskExecutionEvent, TaskRuntime, TaskStatus, TaskStepReport,
+    TransitionRequest, WorkflowArtifact, WorkflowStepInput, WorkflowTaskState,
+    WorkflowTransitionRecord,
 };
 
 // === TaskStatus Tests ===
@@ -1381,18 +1382,32 @@ fn test_dependency_state_helpers() {
 fn provider_sessions_preserve_fallbacks_and_deduplicate_retries() {
     let db = Database::open_in_memory_project().unwrap();
     let base = |id: &str, native: &str, provider: &str| ProviderSession {
-        id: id.into(), task_id: "task-1".into(), workflow_attempt: 3, state: "planning".into(),
-        workflow_session_id: "agtx:task-1:3:planning".into(), provider: provider.into(),
-        provider_session_id: native.into(), agent: Some(provider.into()), started_at: chrono::Utc::now(), ended_at: None,
+        id: id.into(),
+        task_id: "task-1".into(),
+        workflow_attempt: 3,
+        state: "planning".into(),
+        workflow_session_id: "agtx:task-1:3:planning".into(),
+        provider: provider.into(),
+        provider_session_id: native.into(),
+        agent: Some(provider.into()),
+        started_at: chrono::Utc::now(),
+        ended_at: None,
     };
-    db.record_provider_session(&base("one", "oc-1", "opencode")).unwrap();
-    db.record_provider_session(&base("retry", "oc-1", "opencode")).unwrap();
-    db.record_provider_session(&base("fallback", "cx-2", "codex")).unwrap();
+    db.record_provider_session(&base("one", "oc-1", "opencode"))
+        .unwrap();
+    db.record_provider_session(&base("retry", "oc-1", "opencode"))
+        .unwrap();
+    db.record_provider_session(&base("fallback", "cx-2", "codex"))
+        .unwrap();
     let sessions = db.provider_sessions("task-1").unwrap();
     assert_eq!(sessions.len(), 2);
     assert_eq!(sessions[0].workflow_session_id, "agtx:task-1:3:planning");
-    assert!(sessions.iter().any(|session| session.provider_session_id == "oc-1"));
-    assert!(sessions.iter().any(|session| session.provider_session_id == "cx-2"));
+    assert!(sessions
+        .iter()
+        .any(|session| session.provider_session_id == "oc-1"));
+    assert!(sessions
+        .iter()
+        .any(|session| session.provider_session_id == "cx-2"));
 }
 
 #[test]
@@ -1419,7 +1434,10 @@ fn unbound_workflow_evidence_can_be_replaced_after_artifact_correction() {
         b"verdict: changes_requested\nfindings: >-\n  Add the missing validation.\n",
     );
     let replaced = db.store_workflow_artifact(&corrected).unwrap();
-    assert_eq!(replaced.id, stored.id, "the provisional record stays addressable");
+    assert_eq!(
+        replaced.id, stored.id,
+        "the provisional record stays addressable"
+    );
     assert_eq!(replaced.content, corrected.content);
     assert_eq!(replaced.sha256, corrected.sha256);
 

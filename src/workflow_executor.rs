@@ -15,17 +15,16 @@ use sha2::{Digest, Sha256};
 use crate::agent::AgentRegistry;
 use crate::config::{MergedConfig, WorkflowPlugin};
 use crate::db::{
-    Database, ProviderSession, Task, TaskExecutionEvent, TaskStatus, TaskStepReport, WorkflowArtifact,
-    WorkflowStepInput, WorkflowTaskState, WorkflowTransitionRecord,
+    Database, ProviderSession, Task, TaskExecutionEvent, TaskStatus, TaskStepReport,
+    WorkflowArtifact, WorkflowStepInput, WorkflowTaskState, WorkflowTransitionRecord,
 };
 use crate::git::GitOperations;
 use crate::tmux::TmuxOperations;
 use crate::tui::app::{
     agtx_task_env, archive_workflow_artifact, build_policy_agent_command,
     ensure_project_tmux_session, ensure_review_addresses_failed_validation, generate_task_slug,
-    planning_artifact_path, resolve_prompt, switch_agent_in_tmux,
-    wait_for_agent_ready, workflow_artifact_path, workflow_artifact_sha256,
-    workflow_artifact_value,
+    planning_artifact_path, resolve_prompt, switch_agent_in_tmux, wait_for_agent_ready,
+    workflow_artifact_path, workflow_artifact_sha256, workflow_artifact_value,
 };
 use crate::workflow::{GuardContext, WorkflowDefinition, WorkflowProjectConfig};
 
@@ -97,17 +96,30 @@ fn record_agent_prompt(
 /// its local SQLite session store by worktree. Rows are append-only so a
 /// fallback or relaunch remains visible to usage analysis.
 fn record_provider_session_if_known(
-    db: &Database, task: &Task, state: &str, attempt: i64, agent: &str, worktree: &str,
+    db: &Database,
+    task: &Task,
+    state: &str,
+    attempt: i64,
+    agent: &str,
+    worktree: &str,
 ) {
-    let hook_id = crate::agent::hook_status::read_status(Path::new(worktree), &task.id, chrono::Utc::now().timestamp())
-        .and_then(|status| status.session_id);
+    let hook_id = crate::agent::hook_status::read_status(
+        Path::new(worktree),
+        &task.id,
+        chrono::Utc::now().timestamp(),
+    )
+    .and_then(|status| status.session_id);
     let opencode_id = if agent == "opencode" {
         let data_home = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/tmp/agtx-opencode"));
         opencode_session_id_for_worktree(&data_home, worktree)
-    } else { None };
-    let Some(provider_session_id) = hook_id.or(opencode_id) else { return; };
+    } else {
+        None
+    };
+    let Some(provider_session_id) = hook_id.or(opencode_id) else {
+        return;
+    };
     record_provider_session(db, task, state, attempt, agent, provider_session_id);
 }
 
@@ -116,15 +128,15 @@ fn record_provider_session_if_known(
 /// normal for a just-launched session and is deliberately best-effort.
 fn opencode_session_id_for_worktree(data_home: &Path, worktree: &str) -> Option<String> {
     let database = data_home.join("opencode").join("opencode.db");
-    let conn = rusqlite::Connection::open_with_flags(
-        database,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    ).ok()?;
+    let conn =
+        rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
     conn.query_row(
         "SELECT id FROM session_v2 WHERE directory = ?1 ORDER BY time_updated DESC LIMIT 1",
         [worktree],
         |row| row.get(0),
-    ).ok()
+    )
+    .ok()
 }
 
 fn record_provider_session(
@@ -136,9 +148,16 @@ fn record_provider_session(
     provider_session_id: String,
 ) {
     let _ = db.record_provider_session(&ProviderSession {
-        id: uuid::Uuid::new_v4().to_string(), task_id: task.id.clone(), workflow_attempt: attempt,
-        state: state.into(), workflow_session_id: format!("agtx:{}:{}:{}", task.id, attempt, state),
-        provider: agent.into(), provider_session_id, agent: Some(agent.into()), started_at: chrono::Utc::now(), ended_at: None,
+        id: uuid::Uuid::new_v4().to_string(),
+        task_id: task.id.clone(),
+        workflow_attempt: attempt,
+        state: state.into(),
+        workflow_session_id: format!("agtx:{}:{}:{}", task.id, attempt, state),
+        provider: agent.into(),
+        provider_session_id,
+        agent: Some(agent.into()),
+        started_at: chrono::Utc::now(),
+        ended_at: None,
     });
 }
 
@@ -171,9 +190,18 @@ fn record_step_evidence(
     artifact: &Path,
     runtime: &WorkflowRuntime,
 ) -> Result<WorkflowArtifact> {
-    if let Some(worktree) = task.worktree_path.as_deref() {
-        record_provider_session_if_known(db, task, &state.state, state.state_attempt, agent, worktree);
-    }
+    let evidence = snapshot_step_evidence(task, state, artifact)?;
+    persist_step_evidence(db, task, state, agent, artifact, evidence, runtime)
+}
+
+/// Read an artifact into an immutable candidate without writing workflow
+/// state.  This is deliberately separate from persistence so a failed agent
+/// hand-off cannot strand an otherwise retryable state with partial evidence.
+fn snapshot_step_evidence(
+    task: &Task,
+    state: &WorkflowTaskState,
+    artifact: &Path,
+) -> Result<WorkflowArtifact> {
     let bytes = std::fs::read(artifact).map_err(|error| {
         anyhow::anyhow!(
             "Could not read workflow evidence '{}' for the execution journal: {error}",
@@ -192,8 +220,34 @@ fn record_step_evidence(
         content: bytes.clone(),
         created_at: chrono::Utc::now(),
     };
+    Ok(evidence)
+}
+
+/// Persist a snapshot that was read before an external hand-off.  The caller
+/// must only invoke this after the receiving agent has been verified running:
+/// an unsuccessful tmux switch must leave no provisional evidence behind.
+fn persist_step_evidence(
+    db: &Database,
+    task: &Task,
+    state: &WorkflowTaskState,
+    agent: &str,
+    artifact: &Path,
+    evidence: WorkflowArtifact,
+    runtime: &WorkflowRuntime,
+) -> Result<WorkflowArtifact> {
+    if let Some(worktree) = task.worktree_path.as_deref() {
+        record_provider_session_if_known(
+            db,
+            task,
+            &state.state,
+            state.state_attempt,
+            agent,
+            worktree,
+        );
+    }
+    let artifact_text = String::from_utf8_lossy(&evidence.content);
+    let artifact_hash = evidence.sha256.clone();
     let evidence = db.store_workflow_artifact(&evidence)?;
-    let artifact_text = String::from_utf8_lossy(&bytes);
     let mut report = TaskStepReport::new(&task.id, state.state_attempt, &state.state);
     report.agent = Some(agent.to_string());
     report.artifact_path = Some(artifact.display().to_string());
@@ -221,6 +275,40 @@ fn record_step_evidence(
     ));
     db.record_task_execution_event(&event)?;
     Ok(evidence)
+}
+
+/// Perform the external half of a hand-off without allowing its failure to
+/// become invisible.  Callers persist workflow evidence only after this
+/// returns successfully, so this event is the sole durable footprint of a
+/// failed launch and an automation tick can safely retry the same state.
+fn switch_agent_or_record_failure(
+    db: &Database,
+    task: &Task,
+    state: &WorkflowTaskState,
+    source_agent: &str,
+    destination_agent: &str,
+    target: &str,
+    command: &str,
+    runtime: &WorkflowRuntime,
+) -> Result<()> {
+    match switch_agent_in_tmux(runtime.tmux_ops.as_ref(), target, source_agent, command) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let mut event = TaskExecutionEvent::new(&task.id, "agent_handoff_failed");
+            event.workflow_attempt = Some(state.state_attempt);
+            event.state = Some(state.state.clone());
+            event.agent = Some(destination_agent.to_string());
+            event.outcome = Some("retryable".to_string());
+            event.message = Some(error.to_string());
+            event.metadata_json = Some(serde_json::json!({
+                "source_agent": source_agent,
+                "destination_agent": destination_agent,
+                "tmux_target": target,
+            }).to_string());
+            let _ = db.record_task_execution_event(&event);
+            Err(error)
+        }
+    }
 }
 
 /// Restore the immutable inputs bound to the current workflow-state attempt.
@@ -1125,12 +1213,28 @@ pub fn submit_workflow_plan(
         policy.as_ref(),
         Some(Path::new(&worktree)),
     );
-    let plan_evidence = record_step_evidence(db, &task, &current, &task.agent, &path, runtime)?;
-    switch_agent_in_tmux(
-        runtime.tmux_ops.as_ref(),
-        &target,
+    // Snapshot before the switch so the reviewer receives one exact revision,
+    // but do not persist it yet.  A failed tmux hand-off is recoverable and
+    // must not leave immutable evidence in the still-current planning state.
+    let plan_evidence = snapshot_step_evidence(&task, &current, &path)?;
+    switch_agent_or_record_failure(
+        db,
+        &task,
+        &current,
         &previous_agent,
+        &reviewer,
+        &target,
         &command,
+        runtime,
+    )?;
+    let plan_evidence = persist_step_evidence(
+        db,
+        &task,
+        &current,
+        &task.agent,
+        &path,
+        plan_evidence,
+        runtime,
     )?;
     record_agent_prompt(
         db,
@@ -1231,21 +1335,11 @@ pub fn decide_workflow_plan(
                 });
             }
         };
-        let review_evidence =
-            record_step_evidence(db, &task, &current, &previous_agent, &review_path, runtime)?;
-        db.bind_workflow_step_input(&WorkflowStepInput {
-            task_id: task.id.clone(),
-            workflow_attempt: decision.state.state_attempt,
-            state: decision.state.state.clone(),
-            name: "plan_review".to_string(),
-            artifact_id: review_evidence.id.clone(),
-            expected_sha256: review_evidence.sha256.clone(),
-            created_at: chrono::Utc::now(),
-        })?;
-        // Verify the exact review snapshot is present before the planner sees
-        // its prompt. A conflicting mutable file is a recoverable error, not
-        // an invitation to revise against an unverified review.
-        restore_workflow_step_inputs(db, &task, &decision.state)?;
+        // Keep the review in memory until the planner process has actually
+        // launched.  Persisting it first used to leave a bound-looking
+        // `step_evidence` row behind whenever tmux failed, turning a retry
+        // into an artifact conflict instead of a clean hand-off.
+        let review_evidence = snapshot_step_evidence(&task, &current, &review_path)?;
 
         let Some(target) = task.session_name.clone() else {
             return Ok(WorkflowStepOutcome::Blocked {
@@ -1266,10 +1360,8 @@ pub fn decide_workflow_plan(
         // switch away from Codex.  Use the same verified-launch gate as the
         // ordinary planning entry point: launch bare, wait for the new agent,
         // then paste and submit the revision request.
-        let can_embed = crate::agent::spec::can_launch_with_prompt(
-            planner_ops.prompt_injection(),
-            &prompt,
-        );
+        let can_embed =
+            crate::agent::spec::can_launch_with_prompt(planner_ops.prompt_injection(), &prompt);
         let command = build_policy_agent_command(
             planner_ops.as_ref(),
             &task.agent,
@@ -1277,12 +1369,34 @@ pub fn decide_workflow_plan(
             policy.as_ref(),
             Some(Path::new(worktree)),
         );
-        switch_agent_in_tmux(
-            runtime.tmux_ops.as_ref(),
-            &target,
+        switch_agent_or_record_failure(
+            db,
+            &task,
+            &current,
             &previous_agent,
+            &task.agent,
+            &target,
             &command,
+            runtime,
         )?;
+        let review_evidence = persist_step_evidence(
+            db,
+            &task,
+            &current,
+            &previous_agent,
+            &review_path,
+            review_evidence,
+            runtime,
+        )?;
+        db.bind_workflow_step_input(&WorkflowStepInput {
+            task_id: task.id.clone(),
+            workflow_attempt: decision.state.state_attempt,
+            state: decision.state.state.clone(),
+            name: "plan_review".to_string(),
+            artifact_id: review_evidence.id.clone(),
+            expected_sha256: review_evidence.sha256.clone(),
+            created_at: chrono::Utc::now(),
+        })?;
         if !can_embed {
             let _ = wait_for_agent_ready(
                 runtime.tmux_ops,
@@ -1361,7 +1475,13 @@ pub fn submit_plan_review(
             message: "Plan changes require non-empty findings in plan-review.yaml".into(),
         });
     }
-    record_step_evidence(db, &task, &current, &task.agent, &artifact, runtime)?;
+    // Approval has no external process hand-off, so it can promote the review
+    // immediately. A requested revision does switch agents; its exact snapshot
+    // is deliberately held by `decide_workflow_plan` until that switch is
+    // acknowledged, otherwise a failed launch strands provisional evidence.
+    if approve {
+        record_step_evidence(db, &task, &current, &task.agent, &artifact, runtime)?;
+    }
     decide_workflow_plan(
         workflow,
         project_workflow,
@@ -2025,9 +2145,14 @@ fn artifact_freshness(
     if !artifact.is_file() {
         return Some(AutomationDecision::Wait);
     }
-    let launched_at = db.task_step_reports(&task.id).ok()?.into_iter().find(|report| {
-        report.workflow_attempt == state.state_attempt && report.state == state.state
-    })?.updated_at;
+    let launched_at = db
+        .task_step_reports(&task.id)
+        .ok()?
+        .into_iter()
+        .find(|report| {
+            report.workflow_attempt == state.state_attempt && report.state == state.state
+        })?
+        .updated_at;
     let modified_at = std::fs::metadata(artifact).ok()?.modified().ok()?;
     let modified_at: chrono::DateTime<chrono::Utc> = modified_at.into();
     (modified_at <= launched_at).then_some(AutomationDecision::Wait)
@@ -2813,11 +2938,7 @@ mod tests {
         let worktree = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
         let artifact = worktree.path().join(".agent-flow/engineering-review.yaml");
-        std::fs::write(
-            &artifact,
-            "verdict: approved_for_validation\n",
-        )
-        .unwrap();
+        std::fs::write(&artifact, "verdict: approved_for_validation\n").unwrap();
         let task = admitted_task(worktree.path());
         let db = Database::open_in_memory_project().unwrap();
 
@@ -3084,22 +3205,30 @@ mod launch_tests {
         let store = data_home.path().join("opencode");
         std::fs::create_dir_all(&store).unwrap();
         let conn = rusqlite::Connection::open(store.join("opencode.db")).unwrap();
-        conn.execute("CREATE TABLE session_v2 (id TEXT, directory TEXT, time_updated INTEGER)", [])
-            .unwrap();
+        conn.execute(
+            "CREATE TABLE session_v2 (id TEXT, directory TEXT, time_updated INTEGER)",
+            [],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO session_v2 (id, directory, time_updated) VALUES (?1, ?2, ?3)",
             rusqlite::params!["older", "C:/work/task", 10_i64],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO session_v2 (id, directory, time_updated) VALUES (?1, ?2, ?3)",
             rusqlite::params!["newest", "C:/work/task", 20_i64],
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(
             opencode_session_id_for_worktree(data_home.path(), "C:/work/task"),
             Some("newest".to_string())
         );
-        assert_eq!(opencode_session_id_for_worktree(data_home.path(), "C:/work/other"), None);
+        assert_eq!(
+            opencode_session_id_for_worktree(data_home.path(), "C:/work/other"),
+            None
+        );
     }
 
     #[test]
@@ -3120,12 +3249,20 @@ mod launch_tests {
         crate::agent::hook_status::write_status(worktree.path(), &task.id, &status).unwrap();
 
         record_provider_session_if_known(
-            &db, &task, "planning", 4, "codex", &worktree.path().to_string_lossy(),
+            &db,
+            &task,
+            "planning",
+            4,
+            "codex",
+            &worktree.path().to_string_lossy(),
         );
         let sessions = db.provider_sessions(&task.id).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].provider_session_id, "codex-native-session");
-        assert_eq!(sessions[0].workflow_session_id, format!("agtx:{}:4:planning", task.id));
+        assert_eq!(
+            sessions[0].workflow_session_id,
+            format!("agtx:{}:4:planning", task.id)
+        );
     }
 
     fn merged_config() -> MergedConfig {
@@ -3392,22 +3529,18 @@ mod launch_tests {
             .returning(|_| Ok("ready".to_string()));
         let captured_paste = Arc::new(Mutex::new(None));
         let captured_paste_clone = captured_paste.clone();
-        mock_tmux
-            .expect_paste_text()
-            .returning(move |_, text| {
-                *captured_paste_clone.lock().unwrap() = Some(text.to_string());
-                Ok(())
-            });
+        mock_tmux.expect_paste_text().returning(move |_, text| {
+            *captured_paste_clone.lock().unwrap() = Some(text.to_string());
+            Ok(())
+        });
         let sent_enter = Arc::new(Mutex::new(false));
         let sent_enter_clone = sent_enter.clone();
-        mock_tmux
-            .expect_send_key()
-            .returning(move |_, key| {
-                if key == "C-m" {
-                    *sent_enter_clone.lock().unwrap() = true;
-                }
-                Ok(())
-            });
+        mock_tmux.expect_send_key().returning(move |_, key| {
+            if key == "C-m" {
+                *sent_enter_clone.lock().unwrap() = true;
+            }
+            Ok(())
+        });
 
         let mut mock_registry = MockAgentRegistry::new();
         mock_registry.expect_get().returning(|_| {
@@ -3961,11 +4094,11 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
         assert_eq!(db.workflow_transition_history(&task.id).unwrap().len(), 3);
     }
 
-    /// A failed reviewer launch must not advance the durable lane. This keeps
-    /// automation from observing `plan_review` while a competing handoff owns
-    /// the shared tmux pane.
+    /// A failed reviewer launch must leave no evidence or input binding behind.
+    /// This keeps automation from observing `plan_review` while a competing
+    /// handoff owns the shared tmux pane, and makes its next attempt clean.
     #[test]
-    fn submit_workflow_plan_launches_reviewer_before_persisting_the_lane() {
+    fn submit_workflow_plan_leaves_no_evidence_when_reviewer_launch_fails() {
         let graph = WorkflowDefinition {
             initial_state: "planning".into(),
             states: vec![
@@ -4047,19 +4180,22 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
                         .state,
                     "planning"
                 );
+                assert!(
+                    db.workflow_artifacts_for_task(&task_id_for_check)
+                        .unwrap()
+                        .is_empty(),
+                    "a reviewer-launch attempt must not persist planning evidence before the replacement process is verified"
+                );
                 Ok(())
             });
         mock_tmux.expect_send_keys().returning(|_, _| Ok(()));
         mock_tmux.expect_send_key().returning(|_, _| Ok(()));
-        let command_checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let command_checks_for_mock = Arc::clone(&command_checks);
-        mock_tmux.expect_pane_current_command().returning(move |_| {
-            if command_checks_for_mock.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                Some("bash".to_string())
-            } else {
-                Some("claude".to_string())
-            }
-        });
+        // The outgoing planner has exited, but the receiving reviewer never
+        // becomes a process in the pane. This reproduces the observed tmux
+        // hand-off timeout without relying on a real terminal.
+        mock_tmux
+            .expect_pane_current_command()
+            .returning(|_| Some("bash".to_string()));
         mock_tmux
             .expect_capture_pane()
             .returning(|_| Ok(String::new()));
@@ -4085,19 +4221,30 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             flags: &flags,
         };
 
-        let outcome =
+        let error =
             submit_workflow_plan(&graph, &project, &plugin, task.clone(), &mut db, &runtime)
-                .unwrap();
-        assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
+                .expect_err("a reviewer that never launches must fail the hand-off");
+        assert!(error.to_string().contains("did not start a process"));
         assert_eq!(
             db.get_workflow_task_state(&task.id).unwrap().unwrap().state,
-            "plan_review"
+            "planning"
         );
         assert_eq!(
-            db.get_workflow_task_state(&task.id).unwrap().unwrap().plan_revision,
-            8,
-            "AGTX allocates current_revision + 1 without parsing planner metadata"
+            db.get_workflow_task_state(&task.id)
+                .unwrap()
+                .unwrap()
+                .plan_revision,
+            7,
+            "a failed hand-off must not allocate a plan revision"
         );
+        assert!(db.workflow_artifacts_for_task(&task.id).unwrap().is_empty());
+        assert!(db
+            .workflow_step_inputs(&task.id, 2, "plan_review")
+            .unwrap()
+            .is_empty());
+        assert!(db.task_execution_events(&task.id).unwrap().iter().any(|event| {
+            event.event_type == "agent_handoff_failed" && event.outcome.as_deref() == Some("retryable")
+        }));
     }
 
     /// `submit_workflow_plan`'s reviewer prompt used to hardcode a flat
@@ -4243,7 +4390,9 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             "reviewer prompt must prohibit agent-authored orchestration metadata, got: {prompt}"
         );
         assert!(
-            prompt.contains("Classify every finding as BLOCKING, REQUIRED-NONBLOCKING, or SUGGESTION"),
+            prompt.contains(
+                "Classify every finding as BLOCKING, REQUIRED-NONBLOCKING, or SUGGESTION"
+            ),
             "reviewer prompt must require calibrated finding classifications, got: {prompt}"
         );
         assert!(
@@ -4993,6 +5142,74 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             sent.contains("Write only the revised plan content"),
             "revision handoff must prohibit orchestration fields, got: {sent}"
         );
+    }
+
+    /// A failed return to Planning must leave no review evidence or input
+    /// binding behind. Otherwise the next automation tick can conflict with
+    /// the first failed hand-off instead of retrying it safely.
+    #[test]
+    fn submit_plan_review_changes_requested_leaves_no_evidence_when_planner_launch_fails() {
+        let (graph, project, plugin) = changes_requested_fixtures();
+        let agent_registry = mock_agent_registry_for_argv_launch();
+        let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
+
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
+        std::fs::write(
+            worktree.path().join(".agent-flow/plan-review.yaml"),
+            "verdict: changes_requested\nfindings: Validate malformed input before persistence.\n",
+        )
+        .unwrap();
+        let mut task = crate::db::Task::new("Review thing", "claude", "proj");
+        task.worktree_path = Some(worktree.path().to_string_lossy().to_string());
+        task.session_name = Some("proj:task-review".into());
+
+        let mut db = Database::open_in_memory_project().unwrap();
+        db.create_task(&task).unwrap();
+        let current = WorkflowTaskState::new(&task.id, "plan_review", "main");
+        let record = WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "plan_review");
+        db.record_workflow_admission(&task, &current, &record)
+            .unwrap();
+
+        let mut mock_tmux = MockTmuxOperations::new();
+        mock_tmux.expect_send_keys().returning(|_, _| Ok(()));
+        mock_tmux.expect_send_key().returning(|_, _| Ok(()));
+        // The reviewer exits, but the planner never appears in the pane.
+        mock_tmux
+            .expect_pane_current_command()
+            .returning(|_| Some("bash".to_string()));
+        mock_tmux
+            .expect_capture_pane()
+            .returning(|_| Ok(String::new()));
+        mock_tmux.expect_paste_text().times(0);
+        let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(mock_tmux);
+        let config = merged_config();
+        let flags = feature_flags();
+        let runtime = WorkflowRuntime {
+            tmux_ops: &tmux_ops,
+            agent_registry: &agent_registry,
+            git_ops: &git_ops,
+            tmux_project_name: "proj",
+            project_path: Path::new("C:/work/project"),
+            config: &config,
+            flags: &flags,
+        };
+
+        let error = submit_plan_review(&graph, &project, &plugin, task.clone(), &mut db, &runtime)
+            .expect_err("a planner that never launches must fail the hand-off");
+        assert!(error.to_string().contains("did not start a process"));
+        assert_eq!(
+            db.get_workflow_task_state(&task.id).unwrap().unwrap().state,
+            "plan_review"
+        );
+        assert!(db.workflow_artifacts_for_task(&task.id).unwrap().is_empty());
+        assert!(db
+            .workflow_step_inputs(&task.id, 2, "planning")
+            .unwrap()
+            .is_empty());
+        assert!(db.task_execution_events(&task.id).unwrap().iter().any(|event| {
+            event.event_type == "agent_handoff_failed" && event.outcome.as_deref() == Some("retryable")
+        }));
     }
 
     #[test]

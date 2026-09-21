@@ -12392,8 +12392,11 @@ fn opencode_permission_rules(
         // instead, precisely because those are hand-reviewed and identical
         // across every worktree -- see OPENCODE_PERMISSION_PROFILE.md.
         for path in &role_policy.write_paths {
-            rules.push(serde_json::json!({ "action": "edit", "resource": path, "effect": "allow" }));
-            rules.push(serde_json::json!({ "action": "write", "resource": path, "effect": "allow" }));
+            rules
+                .push(serde_json::json!({ "action": "edit", "resource": path, "effect": "allow" }));
+            rules.push(
+                serde_json::json!({ "action": "write", "resource": path, "effect": "allow" }),
+            );
         }
         for command in &role_policy.allowed_commands {
             rules.push(serde_json::json!({
@@ -12403,7 +12406,9 @@ fn opencode_permission_rules(
             }));
         }
         if network {
-            rules.push(serde_json::json!({ "action": "network", "resource": "*", "effect": "allow" }));
+            rules.push(
+                serde_json::json!({ "action": "network", "resource": "*", "effect": "allow" }),
+            );
         }
     }
     if role_policy.allow_subagents == Some(false) {
@@ -12418,7 +12423,10 @@ fn opencode_permission_rules(
 /// hand-written rules. One file per worktree, not committed -- matches
 /// `.agtx/status/` in spirit.
 fn opencode_permission_sidecar_path(worktree: &Path) -> PathBuf {
-    worktree.join(".agtx").join("state").join("opencode-permissions.json")
+    worktree
+        .join(".agtx")
+        .join("state")
+        .join("opencode-permissions.json")
 }
 
 /// Merge this role's generated OpenCode permission rules into the worktree's
@@ -12428,7 +12436,11 @@ fn opencode_permission_sidecar_path(worktree: &Path) -> PathBuf {
 /// OPENCODE_PERMISSION_PROFILE.md Phase 3. Best-effort: a read/parse/write
 /// failure here must not abort the launch, so every step is silently
 /// swallowed, matching the rest of this file's config-writer convention.
-fn write_opencode_permission_profile(worktree: &Path, role_policy: &WorkflowRolePolicy, network: bool) {
+fn write_opencode_permission_profile(
+    worktree: &Path,
+    role_policy: &WorkflowRolePolicy,
+    network: bool,
+) {
     let rules = opencode_permission_rules(role_policy, network);
     let cfg_path = worktree.join("opencode.json");
     let mut root = std::fs::read_to_string(&cfg_path)
@@ -12439,7 +12451,11 @@ fn write_opencode_permission_profile(worktree: &Path, role_policy: &WorkflowRole
     // The interactive CLI reads its selected model from configuration. Keep
     // the workflow's short aliases compatible with the project provider
     // names, while preserving explicitly provider-qualified policy values.
-    if let Some(model) = role_policy.model.as_deref().filter(|value| !value.is_empty()) {
+    if let Some(model) = role_policy
+        .model
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
         let model = match model {
             "deepseek-flash" => "deepseek/deepseek-flash",
             "glm-5.3-flash" => "glm/glm-5.3-flash",
@@ -15164,7 +15180,10 @@ fn write_mcp_config(
                 "type": "local",
                 "command": [&agtx_bin, "mcp-serve", &project_path_str]
             });
-            let _ = std::fs::write(&path, serde_json::to_string_pretty(&root).unwrap_or_default());
+            let _ = std::fs::write(
+                &path,
+                serde_json::to_string_pretty(&root).unwrap_or_default(),
+            );
         }
     }
 }
