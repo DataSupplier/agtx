@@ -5939,6 +5939,46 @@ fn test_write_opencode_permission_profile_replaces_generated_slice_without_accum
     );
 }
 
+/// A project may intentionally contain a rule identical to one AGTX generated
+/// for the prior role. Removing by set membership erased both copies, leaving a
+/// task worktree with a large misleading `opencode.json` deletion.
+#[test]
+fn test_write_opencode_permission_profile_preserves_duplicate_project_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let wt = dir.path();
+    let shared_rule = serde_json::json!({
+        "action": "bash", "effect": "allow", "resource": "pnpm test*"
+    });
+    std::fs::write(
+        wt.join("opencode.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "permissions": [shared_rule.clone(), shared_rule.clone()]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let sidecar = opencode_permission_sidecar_path(wt);
+    std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+    std::fs::write(
+        &sidecar,
+        serde_json::to_string(&vec![shared_rule.clone()]).unwrap(),
+    )
+    .unwrap();
+
+    write_opencode_permission_profile(wt, &WorkflowRolePolicy::default(), false);
+
+    let value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(wt.join("opencode.json")).unwrap()).unwrap();
+    let remaining = value["permissions"].as_array().unwrap();
+    assert_eq!(
+        remaining
+            .iter()
+            .filter(|rule| **rule == shared_rule)
+            .count(),
+        1,
+        "only AGTX's prior insertion may be removed; the project copy survives"
+    );
+}
 /// OpenCode must not silently fall through to an unconfigured interactive
 /// command when a role policy is resolved: `build_policy_agent_command`
 /// should write the permission profile into the worktree's `opencode.json`

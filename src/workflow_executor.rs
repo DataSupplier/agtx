@@ -300,11 +300,14 @@ fn switch_agent_or_record_failure(
             event.agent = Some(destination_agent.to_string());
             event.outcome = Some("retryable".to_string());
             event.message = Some(error.to_string());
-            event.metadata_json = Some(serde_json::json!({
-                "source_agent": source_agent,
-                "destination_agent": destination_agent,
-                "tmux_target": target,
-            }).to_string());
+            event.metadata_json = Some(
+                serde_json::json!({
+                    "source_agent": source_agent,
+                    "destination_agent": destination_agent,
+                    "tmux_target": target,
+                })
+                .to_string(),
+            );
             let _ = db.record_task_execution_event(&event);
             Err(error)
         }
@@ -1695,12 +1698,28 @@ pub fn submit_workflow_implementation(
         policy.as_ref(),
         Some(Path::new(&worktree)),
     );
-    record_step_evidence(db, &task, &current, &task.agent, &artifact, runtime)?;
-    // The reviewer must actually be running in the shared tmux pane before the
-    // durable lane advances -- otherwise automation can observe
-    // `engineering_review` while a failed hand-off has left the pane at a bare
-    // shell (or still owned by the implementer). See `switch_agent_in_tmux`.
-    switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command)?;
+    let evidence = snapshot_step_evidence(&task, &current, &artifact)?;
+    // A failed hand-off must leave the current state fully retryable: retain the
+    // evidence snapshot in memory, launch first, then persist it after launch.
+    switch_agent_or_record_failure(
+        db,
+        &task,
+        &current,
+        &task.agent,
+        &reviewer,
+        &target,
+        &command,
+        runtime,
+    )?;
+    persist_step_evidence(
+        db,
+        &task,
+        &current,
+        &task.agent,
+        &artifact,
+        evidence,
+        runtime,
+    )?;
     db.advance_workflow_state_chain(&[
         (&implemented.state, &implemented.transition),
         (&review.state, &review.transition),
@@ -1799,11 +1818,27 @@ pub fn submit_engineering_review(
         policy.as_ref(),
         Some(Path::new(&worktree)),
     );
-    record_step_evidence(db, &task, &current, &task.agent, &artifact, runtime)?;
-    // The next agent must actually be running in the shared tmux pane before
-    // the durable lane advances -- see `switch_agent_in_tmux` and the
-    // analogous ordering in `submit_workflow_implementation`.
-    switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command)?;
+    let evidence = snapshot_step_evidence(&task, &current, &artifact)?;
+    // Preserve no immutable evidence until the receiving role is confirmed.
+    switch_agent_or_record_failure(
+        db,
+        &task,
+        &current,
+        &task.agent,
+        &next_agent,
+        &target,
+        &command,
+        runtime,
+    )?;
+    persist_step_evidence(
+        db,
+        &task,
+        &current,
+        &task.agent,
+        &artifact,
+        evidence,
+        runtime,
+    )?;
     db.advance_workflow_state(&transition.state, &transition.transition)?;
     record_agent_prompt(
         db,
@@ -1915,11 +1950,27 @@ pub fn submit_final_validation(
         );
         archive_workflow_artifact(&review_artifact, "superseded-after-validation-failure")?;
     }
-    record_step_evidence(db, &task, &current, &task.agent, &artifact, runtime)?;
-    // The next agent must actually be running in the shared tmux pane before
-    // the durable lane advances -- see `switch_agent_in_tmux` and the
-    // analogous ordering in `submit_workflow_implementation`.
-    switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command)?;
+    let evidence = snapshot_step_evidence(&task, &current, &artifact)?;
+    // Preserve no immutable evidence until the receiving role is confirmed.
+    switch_agent_or_record_failure(
+        db,
+        &task,
+        &current,
+        &task.agent,
+        &next_agent,
+        &target,
+        &command,
+        runtime,
+    )?;
+    persist_step_evidence(
+        db,
+        &task,
+        &current,
+        &task.agent,
+        &artifact,
+        evidence,
+        runtime,
+    )?;
     db.advance_workflow_state(&transition.state, &transition.transition)?;
     record_agent_prompt(
         db,
@@ -4242,9 +4293,14 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             .workflow_step_inputs(&task.id, 2, "plan_review")
             .unwrap()
             .is_empty());
-        assert!(db.task_execution_events(&task.id).unwrap().iter().any(|event| {
-            event.event_type == "agent_handoff_failed" && event.outcome.as_deref() == Some("retryable")
-        }));
+        assert!(db
+            .task_execution_events(&task.id)
+            .unwrap()
+            .iter()
+            .any(|event| {
+                event.event_type == "agent_handoff_failed"
+                    && event.outcome.as_deref() == Some("retryable")
+            }));
     }
 
     /// `submit_workflow_plan`'s reviewer prompt used to hardcode a flat
@@ -5207,9 +5263,14 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             .workflow_step_inputs(&task.id, 2, "planning")
             .unwrap()
             .is_empty());
-        assert!(db.task_execution_events(&task.id).unwrap().iter().any(|event| {
-            event.event_type == "agent_handoff_failed" && event.outcome.as_deref() == Some("retryable")
-        }));
+        assert!(db
+            .task_execution_events(&task.id)
+            .unwrap()
+            .iter()
+            .any(|event| {
+                event.event_type == "agent_handoff_failed"
+                    && event.outcome.as_deref() == Some("retryable")
+            }));
     }
 
     #[test]

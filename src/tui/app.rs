@@ -12472,9 +12472,20 @@ fn write_opencode_permission_profile(
 
     let mut permissions: Vec<serde_json::Value> =
         root["permissions"].as_array().cloned().unwrap_or_default();
-    // Remove exactly the entries agtx generated last time (by value match),
-    // never a project-authored rule that merely looks similar.
-    permissions.retain(|entry| !previous.contains(entry));
+    // Remove only one occurrence for every rule AGTX generated last time.
+    // A value-only `retain` removed every equal entry, including a
+    // project-authored rule that happened to match the generated profile.
+    // Treat the sidecar as a multiset instead: it owns precisely one prior
+    // insertion per stored item and leaves duplicate project rules intact.
+    let mut previous_remaining = previous;
+    permissions.retain(|entry| {
+        if let Some(index) = previous_remaining.iter().position(|prior| prior == entry) {
+            previous_remaining.remove(index);
+            false
+        } else {
+            true
+        }
+    });
     permissions.extend(rules.iter().cloned());
     root["permissions"] = serde_json::Value::Array(permissions);
 
