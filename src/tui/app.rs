@@ -10665,6 +10665,9 @@ fn create_pr_with_content(
     let worktree = task.worktree_path.as_deref().unwrap_or(".");
     let worktree_path = Path::new(worktree);
 
+    // agtx's OpenCode permission profile is launch-time state, not task work.
+    crate::opencode_profile::strip_opencode_permission_profile(worktree_path);
+
     // Stage all changes
     git_ops.add_all(worktree_path)?;
 
@@ -10704,6 +10707,9 @@ fn push_changes_to_existing_pr(
 ) -> Result<String> {
     let worktree = task.worktree_path.as_deref().unwrap_or(".");
     let worktree_path = Path::new(worktree);
+
+    // agtx's OpenCode permission profile is launch-time state, not task work.
+    crate::opencode_profile::strip_opencode_permission_profile(worktree_path);
 
     // Stage all changes
     git_ops.add_all(worktree_path)?;
@@ -12423,10 +12429,7 @@ fn opencode_permission_rules(
 /// hand-written rules. One file per worktree, not committed -- matches
 /// `.agtx/status/` in spirit.
 fn opencode_permission_sidecar_path(worktree: &Path) -> PathBuf {
-    worktree
-        .join(".agtx")
-        .join("state")
-        .join("opencode-permissions.json")
+    crate::opencode_profile::sidecar_path(worktree)
 }
 
 /// Merge this role's generated OpenCode permission rules into the worktree's
@@ -12443,9 +12446,10 @@ fn write_opencode_permission_profile(
 ) {
     let rules = opencode_permission_rules(role_policy, network);
     let cfg_path = worktree.join("opencode.json");
-    let mut root = std::fs::read_to_string(&cfg_path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+    let current_text = std::fs::read_to_string(&cfg_path).ok();
+    let mut root = current_text
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
         .filter(|v| v.is_object())
         .unwrap_or_else(|| serde_json::json!({}));
     // The interactive CLI reads its selected model from configuration. Keep
@@ -12464,11 +12468,14 @@ fn write_opencode_permission_profile(
         root["model"] = serde_json::Value::String(model.to_owned());
     }
 
-    let sidecar_path = opencode_permission_sidecar_path(worktree);
-    let previous: Vec<serde_json::Value> = std::fs::read_to_string(&sidecar_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    // No sidecar yet means agtx has not touched this worktree's file: remember it
+    // verbatim so the pre-commit strip can restore it byte-for-byte.
+    let previous = crate::opencode_profile::read_sidecar(worktree);
+    let original_text = match &previous {
+        Some(sidecar) => sidecar.original_text.clone(),
+        None => current_text.clone(),
+    };
+    let previous_rules = previous.map(|sidecar| sidecar.rules).unwrap_or_default();
 
     let mut permissions: Vec<serde_json::Value> =
         root["permissions"].as_array().cloned().unwrap_or_default();
@@ -12477,24 +12484,26 @@ fn write_opencode_permission_profile(
     // project-authored rule that happened to match the generated profile.
     // Treat the sidecar as a multiset instead: it owns precisely one prior
     // insertion per stored item and leaves duplicate project rules intact.
-    let mut previous_remaining = previous;
-    permissions.retain(|entry| {
-        if let Some(index) = previous_remaining.iter().position(|prior| prior == entry) {
-            previous_remaining.remove(index);
-            false
-        } else {
-            true
+    crate::opencode_profile::remove_generated(&mut permissions, &previous_rules);
+    // Never insert a rule that is already present. OpenCode rules are
+    // last-match-wins, so a duplicate adds nothing, and skipping it keeps the
+    // file from growing even if a generated slice ever leaked into a commit.
+    // Only rules actually inserted are recorded, so removal stays exact.
+    let mut inserted = Vec::new();
+    for rule in rules {
+        if !permissions.contains(&rule) {
+            permissions.push(rule.clone());
+            inserted.push(rule);
         }
-    });
-    permissions.extend(rules.iter().cloned());
+    }
     root["permissions"] = serde_json::Value::Array(permissions);
 
-    if let Some(parent) = sidecar_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(
-        &sidecar_path,
-        serde_json::to_string_pretty(&rules).unwrap_or_default(),
+    crate::opencode_profile::write_sidecar(
+        worktree,
+        &crate::opencode_profile::ProfileSidecar {
+            rules: inserted,
+            original_text,
+        },
     );
     let _ = std::fs::write(
         &cfg_path,

@@ -5979,6 +5979,150 @@ fn test_write_opencode_permission_profile_preserves_duplicate_project_rule() {
         "only AGTX's prior insertion may be removed; the project copy survives"
     );
 }
+
+fn opencode_implementer_role() -> WorkflowRolePolicy {
+    WorkflowRolePolicy {
+        permission_mode: Some("autonomous".into()),
+        model: Some("glm-5.3-flash".into()),
+        write_paths: vec!["api/**".into()],
+        allowed_commands: vec!["pytest".into()],
+        ..Default::default()
+    }
+}
+
+/// The generated profile is launch-time state. Before a task commit it must be
+/// removed so the file is byte-for-byte what the project checked in -- the
+/// regression was the task's `git add -A` committing the generated rules and
+/// merging them into the target branch, where every later task appended more.
+#[test]
+fn test_strip_opencode_permission_profile_restores_the_original_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let wt = dir.path();
+    // Deliberately not serde's formatting: the strip must not reformat the file.
+    let original = "{\n    \"model\": \"deepseek/deepseek-flash\",\n    \"permissions\": [\n        { \"action\": \"external_directory\", \"resource\": \"/workspace/**\", \"effect\": \"allow\" }\n    ]\n}\n";
+    std::fs::write(wt.join("opencode.json"), original).unwrap();
+
+    write_opencode_permission_profile(wt, &opencode_implementer_role(), true);
+    let during = std::fs::read_to_string(wt.join("opencode.json")).unwrap();
+    assert!(during.contains("api/**") && during.contains("glm/glm-5.3-flash"));
+
+    assert!(crate::opencode_profile::strip_opencode_permission_profile(
+        wt
+    ));
+    assert_eq!(
+        std::fs::read_to_string(wt.join("opencode.json")).unwrap(),
+        original
+    );
+    assert!(!opencode_permission_sidecar_path(wt).exists());
+}
+
+/// Several roles in one worktree, then a strip: still exactly the original.
+#[test]
+fn test_strip_after_multiple_role_launches_restores_the_original() {
+    let dir = tempfile::tempdir().unwrap();
+    let wt = dir.path();
+    let original = "{\"model\": \"deepseek/deepseek-flash\", \"permissions\": []}";
+    std::fs::write(wt.join("opencode.json"), original).unwrap();
+    let planner = WorkflowRolePolicy {
+        permission_mode: Some("autonomous".into()),
+        write_paths: vec![".agtx/plans/**".into()],
+        ..Default::default()
+    };
+    write_opencode_permission_profile(wt, &planner, true);
+    write_opencode_permission_profile(wt, &opencode_implementer_role(), true);
+    write_opencode_permission_profile(wt, &planner, false);
+
+    crate::opencode_profile::strip_opencode_permission_profile(wt);
+    assert_eq!(
+        std::fs::read_to_string(wt.join("opencode.json")).unwrap(),
+        original
+    );
+}
+
+/// A file that already carries leaked generated rules (from before this fix)
+/// must not grow: identical rules are not inserted again, and the strip then
+/// leaves the file as it found it.
+#[test]
+fn test_already_present_rules_are_not_appended_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let wt = dir.path();
+    write_opencode_permission_profile(wt, &opencode_implementer_role(), false);
+    crate::opencode_profile::strip_opencode_permission_profile(wt);
+    // Simulate the old leak: the generated rules are now part of the file.
+    write_opencode_permission_profile(wt, &opencode_implementer_role(), false);
+    let leaked = std::fs::read_to_string(wt.join("opencode.json")).unwrap();
+    std::fs::remove_file(opencode_permission_sidecar_path(wt)).unwrap();
+
+    for _ in 0..3 {
+        write_opencode_permission_profile(wt, &opencode_implementer_role(), false);
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(wt.join("opencode.json")).unwrap()).unwrap();
+    let leaked_value: serde_json::Value = serde_json::from_str(&leaked).unwrap();
+    assert_eq!(
+        value["permissions"].as_array().unwrap().len(),
+        leaked_value["permissions"].as_array().unwrap().len(),
+        "repeated launches must not grow the permissions array"
+    );
+    crate::opencode_profile::strip_opencode_permission_profile(wt);
+    assert_eq!(
+        std::fs::read_to_string(wt.join("opencode.json")).unwrap(),
+        leaked
+    );
+}
+
+/// The task's own edits to opencode.json are real work and must survive the
+/// strip; only agtx's rules and model come out.
+#[test]
+fn test_strip_keeps_changes_the_task_made() {
+    let dir = tempfile::tempdir().unwrap();
+    let wt = dir.path();
+    std::fs::write(
+        wt.join("opencode.json"),
+        "{\"model\": \"deepseek/deepseek-flash\", \"permissions\": []}",
+    )
+    .unwrap();
+    write_opencode_permission_profile(wt, &opencode_implementer_role(), false);
+    let mut value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(wt.join("opencode.json")).unwrap()).unwrap();
+    value["provider"] = serde_json::json!({"extra": {"npm": "x"}});
+    std::fs::write(wt.join("opencode.json"), value.to_string()).unwrap();
+
+    crate::opencode_profile::strip_opencode_permission_profile(wt);
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(wt.join("opencode.json")).unwrap()).unwrap();
+    assert_eq!(after["provider"]["extra"]["npm"], "x");
+    assert_eq!(after["model"], "deepseek/deepseek-flash");
+    assert!(after["permissions"].as_array().unwrap().is_empty());
+}
+
+/// Sidecars written before this change are a bare array of rules.
+#[test]
+fn test_strip_accepts_a_legacy_sidecar_and_is_a_no_op_without_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let wt = dir.path();
+    assert!(!crate::opencode_profile::strip_opencode_permission_profile(
+        wt
+    ));
+
+    let generated = serde_json::json!({"action": "bash", "resource": "pytest*", "effect": "allow"});
+    let project = serde_json::json!({"action": "external_directory", "resource": "/tmp/*", "effect": "allow"});
+    std::fs::write(
+        wt.join("opencode.json"),
+        serde_json::json!({"permissions": [project.clone(), generated.clone()]}).to_string(),
+    )
+    .unwrap();
+    let sidecar = opencode_permission_sidecar_path(wt);
+    std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+    std::fs::write(&sidecar, serde_json::json!([generated]).to_string()).unwrap();
+
+    assert!(crate::opencode_profile::strip_opencode_permission_profile(
+        wt
+    ));
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(wt.join("opencode.json")).unwrap()).unwrap();
+    assert_eq!(after["permissions"], serde_json::json!([project]));
+}
 /// OpenCode must not silently fall through to an unconfigured interactive
 /// command when a role policy is resolved: `build_policy_agent_command`
 /// should write the permission profile into the worktree's `opencode.json`

@@ -5,6 +5,7 @@ pub mod db;
 pub mod git;
 pub mod insights_export;
 pub mod mcp;
+pub mod opencode_profile;
 pub mod skills;
 pub mod tmux;
 pub mod tui;

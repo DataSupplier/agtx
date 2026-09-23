@@ -2059,6 +2059,9 @@ pub fn complete_feature_integration(
             files.join(", ")
         );
     }
+    // agtx's own OpenCode permission profile is launch-time runtime state, not
+    // task work: never let it be committed and merged into the target branch.
+    crate::opencode_profile::strip_opencode_permission_profile(Path::new(&worktree));
     if runtime.git_ops.has_changes(Path::new(&worktree)) {
         runtime.git_ops.add_all(Path::new(&worktree))?;
         runtime.git_ops.commit(
