@@ -374,13 +374,12 @@ fn test_remove_worktree_prunes_after_a_failed_removal() {
 }
 
 /// Removal must unlink a symlink, never follow it into the directory it points
-/// at. This is the precondition for sharing a `node_modules` across worktrees:
-/// if cleanup followed the link, finishing one task would destroy the install
-/// every other worktree depends on — and the project's own.
+/// at. This protects any externally managed directory from cleanup traversal.
 ///
-/// The test that must never be deleted. Assert on the *shared content*, not on
-/// the worktree being gone: a version that deleted the target would still
-/// remove the worktree and still return Ok.
+/// Assert on the external content, not only on the worktree being gone: a
+/// version that deleted the target would still remove the worktree and return
+/// success.
+#[cfg(unix)]
 #[test]
 fn test_remove_worktree_does_not_follow_symlinks_out_of_the_worktree() {
     let temp_dir = setup_git_repo();
@@ -412,6 +411,7 @@ fn test_remove_worktree_does_not_follow_symlinks_out_of_the_worktree() {
 
 /// The same property for the plain recursive delete, which is what a background
 /// trash sweep would use if tranche 2 is ever built.
+#[cfg(unix)]
 #[test]
 fn test_remove_dir_all_does_not_follow_symlinks() {
     let temp_dir = TempDir::new().unwrap();

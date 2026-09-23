@@ -293,7 +293,10 @@ pub fn initialize_worktree(
         }
     }
 
-    link_shared_dependency_directories(project_path, worktree_path, &mut warnings);
+    // Dependencies are deliberately not linked from the project checkout.
+    // Each worktree must own its node_modules/virtual store so concurrent
+    // agents cannot mutate one another's install. Projects that need
+    // dependencies should provision them through their init_script.
     if let Some(script) = init_script {
         let script = script.trim();
         if !script.is_empty() {
@@ -320,80 +323,6 @@ pub fn initialize_worktree(
     warnings
 }
 
-/// Link installed dependency trees from the project checkout into a task
-/// worktree. Git deliberately excludes `node_modules`, but frontend validation
-/// must run against the same lockfile-resolved install as the project root.
-///
-/// The links are created only when the source exists and the worktree has no
-/// entry at that path. They are never copied (which would be slow and mutable)
-/// and cleanup unlinks them without following the shared target.
-fn link_shared_dependency_directories(
-    project_path: &Path,
-    worktree_path: &Path,
-    warnings: &mut Vec<String>,
-) {
-    let mut relative_paths = vec![PathBuf::from("node_modules")];
-    if let Ok(entries) = std::fs::read_dir(project_path) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() && path.join("package.json").is_file() {
-                relative_paths.push(PathBuf::from(entry.file_name()).join("node_modules"));
-            }
-        }
-    }
-
-    for relative in relative_paths {
-        let source = project_path.join(&relative);
-        let destination = worktree_path.join(&relative);
-        if !source.is_dir() || destination.exists() {
-            continue;
-        }
-        if let Some(parent) = destination.parent() {
-            if let Err(error) = std::fs::create_dir_all(parent) {
-                warnings.push(format!(
-                    "Failed to prepare shared dependency link '{}': {error}",
-                    relative.display()
-                ));
-                continue;
-            }
-        }
-        // A dangling link does not satisfy `exists`; replace only that link,
-        // never a real worktree directory.
-        if destination.symlink_metadata().is_ok() {
-            if let Err(error) = std::fs::remove_file(&destination) {
-                warnings.push(format!(
-                    "Failed to replace stale dependency link '{}': {error}",
-                    relative.display()
-                ));
-                continue;
-            }
-        }
-        if let Err(error) = create_directory_link(&source, &destination) {
-            warnings.push(format!(
-                "Failed to link shared dependency directory '{}': {error}",
-                relative.display()
-            ));
-        }
-    }
-}
-
-#[cfg(unix)]
-fn create_directory_link(source: &Path, destination: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(source, destination)
-}
-
-#[cfg(windows)]
-fn create_directory_link(source: &Path, destination: &Path) -> std::io::Result<()> {
-    std::os::windows::fs::symlink_dir(source, destination)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn create_directory_link(_source: &Path, _destination: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "directory links are unsupported on this platform",
-    ))
-}
 /// Copy an agent config directory into a worktree without overwriting tracked
 /// checkout files, and skipping [`AGENT_CONFIG_SKIP_FILES`] at every depth.
 ///
@@ -675,9 +604,8 @@ mod tests {
             .unwrap();
         assert!(status.stdout.is_empty(), "tracked config was modified");
     }
-    #[cfg(unix)]
     #[test]
-    fn initialize_worktree_links_existing_workspace_dependencies() {
+    fn initialize_worktree_does_not_link_existing_workspace_dependencies() {
         let temp_dir = TempDir::new().unwrap();
         let project = temp_dir.path().join("project");
         let worktree = temp_dir.path().join("worktree");
@@ -690,12 +618,11 @@ mod tests {
         )
         .unwrap();
 
-        let mut warnings = Vec::new();
-        link_shared_dependency_directories(&project, &worktree, &mut warnings);
+        let warnings = initialize_worktree(&project, &worktree, None, None, &[]);
 
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
         let link = worktree.join("nuxt-app/node_modules");
-        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
-        assert!(link.join("vitest/index.js").is_file());
+        assert!(!link.exists());
+        assert!(link.symlink_metadata().is_err());
     }
 }
