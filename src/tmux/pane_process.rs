@@ -29,6 +29,35 @@ pub struct ProcInfo {
     pub argv: Vec<String>,
 }
 
+/// The `display -p` format `pane_current_command` sends: pane pid, then
+/// tmux's own command name.
+///
+/// Space-separated on purpose. tmux sanitises control characters in format
+/// output -- tmux 3.5a prints a tab as `_` -- so a tab-separated `40\tnode`
+/// arrived as the single word `40_node`, no agent was ever identified, and
+/// every hand-off failed its launch check and was retried forever.
+pub const PANE_IDENTITY_FORMAT: &str = "#{pane_pid} #{pane_current_command}";
+
+/// Split what [`PANE_IDENTITY_FORMAT`] produces into the pane pid (if tmux
+/// reported one) and tmux's command name. `None` for empty output.
+pub fn parse_pane_identity(line: &str) -> Option<(Option<u32>, &str)> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let (pid, command) = match line.split_once(' ') {
+        Some((pid, command)) => match pid.parse::<u32>() {
+            Ok(pid) => (Some(pid), command.trim()),
+            Err(_) => (None, line),
+        },
+        None => (None, line),
+    };
+    if command.is_empty() {
+        return None;
+    }
+    Some((pid, command))
+}
+
 /// Launchers whose script argument, not their own name, identifies the agent.
 const INTERPRETERS: &[&str] = &["node", "nodejs", "bun", "deno", "env"];
 
@@ -281,6 +310,17 @@ mod tests {
             ),
         ];
         assert_eq!(resolve_agent(&table, 10, AGENTS), None);
+    }
+
+    /// Regression for 2026-09-24: tmux 3.5a printed a tab separator as `_`,
+    /// so the pid and command never split and no hand-off was ever confirmed.
+    #[test]
+    fn pane_identity_uses_a_separator_tmux_prints_verbatim() {
+        assert!(!PANE_IDENTITY_FORMAT.contains('\t'));
+        assert_eq!(parse_pane_identity("40 node\n"), Some((Some(40), "node")));
+        assert_eq!(parse_pane_identity("40 sh"), Some((Some(40), "sh")));
+        assert_eq!(parse_pane_identity("bash"), Some((None, "bash")));
+        assert_eq!(parse_pane_identity("  \n"), None);
     }
 
     #[test]
