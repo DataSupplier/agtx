@@ -438,23 +438,19 @@ impl TmuxOperations for RealTmuxOps {
                 "-p",
                 "-t",
                 target,
-                "#{pane_pid}\t#{pane_current_command}",
+                super::pane_process::PANE_IDENTITY_FORMAT,
             ])
             .output()
             .ok()?;
         if !output.status.success() {
             return None;
         }
-        let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let (pane_pid, reported) = line.split_once('\t').unwrap_or(("", line.as_str()));
-        let reported = reported.trim();
-        if reported.is_empty() {
-            return None;
-        }
+        let line = String::from_utf8_lossy(&output.stdout).to_string();
+        let (pane_pid, reported) = super::pane_process::parse_pane_identity(&line)?;
         // Resolve the agent from the pane's foreground job. Where `/proc` is
         // unavailable the table is empty and tmux's own answer is kept.
         let table = super::pane_process::read_proc_table();
-        let resolved = pane_pid.parse::<u32>().ok().and_then(|pid| {
+        let resolved = pane_pid.and_then(|pid| {
             if table.is_empty() {
                 return None;
             }
