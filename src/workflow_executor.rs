@@ -72,14 +72,37 @@ fn record_agent_prompt(
     workflow_attempt: i64,
     agent: &str,
     prompt: &str,
+    confirmed_session: Option<&str>,
 ) -> Result<()> {
     let mut report = TaskStepReport::new(&task.id, workflow_attempt, state);
     report.agent = Some(agent.to_string());
     report.prompt_sha256 = Some(format!("{:x}", Sha256::digest(prompt.as_bytes())));
     report.prompt_text = Some(bounded_journal_text(prompt));
     db.upsert_task_step_report(&report)?;
-    if let Some(worktree) = task.worktree_path.as_deref() {
-        record_provider_session_if_known(db, task, state, workflow_attempt, agent, worktree);
+    // A confirmed session is the one that demonstrably holds this state's
+    // prompt; recovery resumes exactly it. Without confirmation fall back to
+    // the provider's newest session for the worktree, as before.
+    match confirmed_session {
+        Some(session) => record_provider_session(
+            db,
+            task,
+            state,
+            workflow_attempt,
+            agent,
+            session.to_string(),
+        ),
+        None => {
+            if let Some(worktree) = task.worktree_path.as_deref() {
+                record_provider_session_if_known(
+                    db,
+                    task,
+                    state,
+                    workflow_attempt,
+                    agent,
+                    worktree,
+                );
+            }
+        }
     }
 
     let mut event = TaskExecutionEvent::new(&task.id, "agent_prompt_delivered");
@@ -87,7 +110,10 @@ fn record_agent_prompt(
     event.state = Some(state.to_string());
     event.agent = Some(agent.to_string());
     event.outcome = Some("started".to_string());
-    event.message = Some("Agent prompt delivered to the task session".to_string());
+    event.message = Some(match confirmed_session {
+        Some(session) => format!("Agent prompt delivered and confirmed in session {session}"),
+        None => "Agent prompt delivered to the task session".to_string(),
+    });
     db.record_task_execution_event(&event)
 }
 
@@ -256,39 +282,244 @@ fn persist_step_evidence(
     Ok(evidence)
 }
 
-/// Perform the external half of a hand-off without allowing its failure to
-/// become invisible.  Callers persist workflow evidence only after this
-/// returns successfully, so this event is the sole durable footprint of a
-/// failed launch and an automation tick can safely retry the same state.
-fn switch_agent_or_record_failure(
+/// How many automation ticks a hand-off waits for the source agent to finish
+/// its turn before handing over anyway (~12s per tick, so about five minutes).
+/// The exit confirmation in `switch_agent_in_tmux` still refuses to type into
+/// an agent that does not leave, so giving up the wait cannot mis-deliver.
+const MAX_IDLE_DEFERRALS: usize = 25;
+
+/// One workflow hand-off: the pane `target` passes from whichever agent is
+/// running in it to `destination_agent`, which must end up holding `prompt`.
+struct Handoff<'a> {
+    /// The workflow state and attempt the hand-off happens in, for the journal.
+    journal_state: &'a str,
+    journal_attempt: i64,
+    /// The agent the task record says owns the pane.
+    source_agent: &'a str,
+    destination_agent: &'a str,
+    target: &'a str,
+    worktree: &'a str,
+    command: &'a str,
+    prompt: &'a str,
+    /// The prompt is pasted after launch rather than carried in `command`.
+    paste_prompt: bool,
+}
+
+fn record_handoff_event(
     db: &Database,
     task: &Task,
-    state: &WorkflowTaskState,
-    source_agent: &str,
-    destination_agent: &str,
-    target: &str,
-    command: &str,
+    handoff: &Handoff,
+    event_type: &str,
+    outcome: &str,
+    message: String,
+) {
+    let mut event = TaskExecutionEvent::new(&task.id, event_type);
+    event.workflow_attempt = Some(handoff.journal_attempt);
+    event.state = Some(handoff.journal_state.to_string());
+    event.agent = Some(handoff.destination_agent.to_string());
+    event.outcome = Some(outcome.to_string());
+    event.message = Some(message);
+    event.metadata_json = Some(
+        serde_json::json!({
+            "source_agent": handoff.source_agent,
+            "destination_agent": handoff.destination_agent,
+            "tmux_target": handoff.target,
+        })
+        .to_string(),
+    );
+    let _ = db.record_task_execution_event(&event);
+}
+
+/// The agent spec name whose process the pane is running, if any.
+fn agent_in_pane(runtime: &WorkflowRuntime, target: &str) -> Option<&'static str> {
+    let command = runtime.tmux_ops.pane_current_command(target)?;
+    let command = command.trim();
+    crate::agent::AGENT_SPECS
+        .iter()
+        .find(|spec| spec.process_names.iter().any(|name| *name == command))
+        .map(|spec| spec.name)
+}
+
+/// Hand a task pane to the next agent and deliver its prompt, verifying every
+/// step the 2026-09-24 incidents showed can silently fail:
+///
+///  1. the agent in the pane has finished its turn (an artifact is written
+///     mid-turn; hand-off keystrokes in a busy agent become chat input),
+///  2. the previous process has exited and the *destination* process runs
+///     (`switch_agent_in_tmux`, which reads real process identity),
+///  3. a pasted prompt is sent only once the destination is ready, and
+///  4. the destination's own session recorded the prompt.
+///
+/// Any failure is journalled and returned as a retryable error *before* the
+/// caller persists evidence or advances the workflow state, so the next
+/// automation tick repeats the hand-off instead of trusting a lost prompt.
+/// Returns the destination's provider session id when delivery was confirmed.
+fn hand_off_and_deliver(
+    db: &Database,
+    task: &Task,
+    handoff: &Handoff,
     runtime: &WorkflowRuntime,
-) -> Result<()> {
-    match switch_agent_in_tmux(runtime.tmux_ops.as_ref(), target, source_agent, command) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let mut event = TaskExecutionEvent::new(&task.id, "agent_handoff_failed");
-            event.workflow_attempt = Some(state.state_attempt);
-            event.state = Some(state.state.clone());
-            event.agent = Some(destination_agent.to_string());
-            event.outcome = Some("retryable".to_string());
-            event.message = Some(error.to_string());
-            event.metadata_json = Some(
-                serde_json::json!({
-                    "source_agent": source_agent,
-                    "destination_agent": destination_agent,
-                    "tmux_target": target,
+) -> Result<Option<String>> {
+    // The pane may not run what the task record says -- e.g. a previous
+    // attempt already launched the destination before failing to confirm
+    // delivery. Exit whatever is really there, with its own exit command.
+    let running = agent_in_pane(runtime, handoff.target);
+    let current = running.unwrap_or(handoff.source_agent);
+
+    if let Some(running) = running {
+        let busy =
+            runtime
+                .session_probe
+                .turn_activity(running, Path::new(handoff.worktree), &task.id)
+                == Some(crate::agent::native_session::TurnActivity::Busy);
+        if busy {
+            let deferrals = db
+                .task_execution_events(&task.id)
+                .map(|events| {
+                    events
+                        .iter()
+                        .filter(|event| {
+                            event.event_type == "agent_handoff_deferred"
+                                && event.state.as_deref() == Some(handoff.journal_state)
+                                && event.workflow_attempt == Some(handoff.journal_attempt)
+                        })
+                        .count()
                 })
-                .to_string(),
+                .unwrap_or(0);
+            if deferrals < MAX_IDLE_DEFERRALS {
+                let message = format!(
+                    "'{running}' is still working in tmux pane '{}'; hand-off to '{}' deferred until its turn ends",
+                    handoff.target, handoff.destination_agent
+                );
+                record_handoff_event(
+                    db,
+                    task,
+                    handoff,
+                    "agent_handoff_deferred",
+                    "retryable",
+                    message.clone(),
+                );
+                bail!(message);
+            }
+            record_handoff_event(
+                db,
+                task,
+                handoff,
+                "agent_handoff_idle_timeout",
+                "proceeding",
+                format!("'{running}' still reported a turn in progress after {deferrals} deferrals; handing off anyway"),
             );
-            let _ = db.record_task_execution_event(&event);
-            Err(error)
+        }
+    }
+
+    let since = std::time::SystemTime::now();
+    if let Err(error) = switch_agent_in_tmux(
+        runtime.tmux_ops.as_ref(),
+        handoff.target,
+        current,
+        handoff.destination_agent,
+        handoff.command,
+    ) {
+        record_handoff_event(
+            db,
+            task,
+            handoff,
+            "agent_handoff_failed",
+            "retryable",
+            error.to_string(),
+        );
+        return Err(error);
+    }
+    deliver_to_launched_agent(db, task, handoff, since, runtime)
+}
+
+/// Steps 3 and 4 of [`hand_off_and_deliver`], shared with fresh-window
+/// launches: wait for readiness before a paste, then confirm the prompt
+/// reached the destination agent's own session.
+fn deliver_to_launched_agent(
+    db: &Database,
+    task: &Task,
+    handoff: &Handoff,
+    since: std::time::SystemTime,
+    runtime: &WorkflowRuntime,
+) -> Result<Option<String>> {
+    use crate::agent::native_session::Delivery;
+
+    if handoff.paste_prompt {
+        let ready = wait_for_agent_ready(
+            runtime.tmux_ops,
+            handoff.target,
+            Some(handoff.destination_agent),
+            runtime.config.auto_trust,
+        );
+        if ready.is_none() {
+            let message = format!(
+                "'{}' never became ready in tmux pane '{}'; prompt not pasted",
+                handoff.destination_agent, handoff.target
+            );
+            record_handoff_event(
+                db,
+                task,
+                handoff,
+                "agent_handoff_failed",
+                "retryable",
+                message.clone(),
+            );
+            bail!(message);
+        }
+        runtime
+            .tmux_ops
+            .paste_text(handoff.target, handoff.prompt)?;
+        runtime.tmux_ops.send_key(handoff.target, "C-m")?;
+    }
+
+    let marker = crate::agent::native_session::prompt_marker(handoff.prompt);
+    let worktree = Path::new(handoff.worktree);
+    let timeout = runtime.session_probe.delivery_timeout();
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match runtime.session_probe.find_delivered_prompt(
+            handoff.destination_agent,
+            worktree,
+            &marker,
+            since,
+        ) {
+            Delivery::Confirmed(session) => return Ok(Some(session)),
+            Delivery::Unverifiable => {
+                record_handoff_event(
+                    db,
+                    task,
+                    handoff,
+                    "agent_prompt_unverified",
+                    "unverified",
+                    format!(
+                        "'{}' keeps no readable session store here; prompt delivery could not be confirmed",
+                        handoff.destination_agent
+                    ),
+                );
+                return Ok(None);
+            }
+            Delivery::Missing if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(500).min(timeout));
+            }
+            Delivery::Missing => {
+                let message = format!(
+                    "prompt for '{}' did not appear in its session within {}s (tmux pane '{}' reports '{}')",
+                    handoff.destination_agent,
+                    timeout.as_secs(),
+                    handoff.target,
+                    runtime.tmux_ops.pane_current_command(handoff.target).unwrap_or_default()
+                );
+                record_handoff_event(
+                    db,
+                    task,
+                    handoff,
+                    "agent_prompt_unconfirmed",
+                    "retryable",
+                    message.clone(),
+                );
+                bail!(message);
+            }
         }
     }
 }
@@ -538,6 +769,9 @@ pub struct WorkflowRuntime<'a> {
     pub project_path: &'a Path,
     pub config: &'a MergedConfig,
     pub flags: &'a crate::FeatureFlags,
+    /// Reads the providers' own session stores to tell whether an agent is
+    /// mid-turn and whether a prompt reached the intended agent.
+    pub session_probe: &'a dyn crate::agent::native_session::SessionProbe,
 }
 
 /// The outcome of an extracted workflow step.
@@ -1032,60 +1266,74 @@ pub fn start_workflow_planning(
     // so it must use the post-readiness paste path even on a planner relaunch.
     let can_embed =
         crate::agent::spec::can_launch_with_prompt(agent_ops.prompt_injection(), &prompt);
-    if restarting && runtime.tmux_ops.window_exists(&target).unwrap_or(false) {
-        let command = build_policy_agent_command(
-            agent_ops.as_ref(),
-            &planner,
-            if can_embed { &prompt } else { "" },
-            policy.as_ref(),
-            Some(Path::new(&worktree)),
-        );
-        switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command)?;
-        if !can_embed {
-            let _ = wait_for_agent_ready(
-                runtime.tmux_ops,
-                &target,
-                Some(&planner),
-                runtime.config.auto_trust,
+    let confirmed_session =
+        if restarting && runtime.tmux_ops.window_exists(&target).unwrap_or(false) {
+            let command = build_policy_agent_command(
+                agent_ops.as_ref(),
+                &planner,
+                if can_embed { &prompt } else { "" },
+                policy.as_ref(),
+                Some(Path::new(&worktree)),
             );
-            runtime.tmux_ops.paste_text(&target, &prompt)?;
-            runtime.tmux_ops.send_key(&target, "C-m")?;
-        }
-    } else {
-        // A prompt embedded directly in the launch command becomes part of
-        // one tmux client/server message; large enough (see
-        // `MAX_LAUNCH_PROMPT_BYTES`'s doc comment for the measured ceiling)
-        // and tmux itself rejects it with "command too long" before the
-        // window is ever created. Past that ceiling, launch with no prompt
-        // and deliver it afterward via paste_text (stdin, no such limit)
-        // instead — same approach already used by the TUI's agent-switch
-        // launch flow.
-        let command = build_policy_agent_command(
-            agent_ops.as_ref(),
-            &planner,
-            if can_embed { &prompt } else { "" },
-            policy.as_ref(),
-            Some(Path::new(&worktree)),
-        );
-        runtime.tmux_ops.create_window(
-            runtime.tmux_project_name,
-            &window_name,
-            &worktree,
-            Some(command),
-            true,
-            &agtx_task_env(&task.id, &worktree),
-        )?;
-        if !can_embed {
-            let _ = wait_for_agent_ready(
-                runtime.tmux_ops,
-                &target,
-                Some(&planner),
-                runtime.config.auto_trust,
+            hand_off_and_deliver(
+                db,
+                &task,
+                &Handoff {
+                    journal_state: &planning_state,
+                    journal_attempt: planning_attempt,
+                    source_agent: &task.agent,
+                    destination_agent: &planner,
+                    target: &target,
+                    worktree: &worktree,
+                    command: &command,
+                    prompt: &prompt,
+                    paste_prompt: !can_embed,
+                },
+                runtime,
+            )?
+        } else {
+            // A prompt embedded directly in the launch command becomes part of
+            // one tmux client/server message; large enough (see
+            // `MAX_LAUNCH_PROMPT_BYTES`'s doc comment for the measured ceiling)
+            // and tmux itself rejects it with "command too long" before the
+            // window is ever created. Past that ceiling, launch with no prompt
+            // and deliver it afterward via paste_text (stdin, no such limit)
+            // instead — same approach already used by the TUI's agent-switch
+            // launch flow.
+            let command = build_policy_agent_command(
+                agent_ops.as_ref(),
+                &planner,
+                if can_embed { &prompt } else { "" },
+                policy.as_ref(),
+                Some(Path::new(&worktree)),
             );
-            runtime.tmux_ops.paste_text(&target, &prompt)?;
-            runtime.tmux_ops.send_key(&target, "C-m")?;
-        }
-    }
+            let since = std::time::SystemTime::now();
+            runtime.tmux_ops.create_window(
+                runtime.tmux_project_name,
+                &window_name,
+                &worktree,
+                Some(command.clone()),
+                true,
+                &agtx_task_env(&task.id, &worktree),
+            )?;
+            deliver_to_launched_agent(
+                db,
+                &task,
+                &Handoff {
+                    journal_state: &planning_state,
+                    journal_attempt: planning_attempt,
+                    source_agent: &task.agent,
+                    destination_agent: &planner,
+                    target: &target,
+                    worktree: &worktree,
+                    command: &command,
+                    prompt: &prompt,
+                    paste_prompt: !can_embed,
+                },
+                since,
+                runtime,
+            )?
+        };
     record_agent_prompt(
         db,
         &task,
@@ -1093,6 +1341,7 @@ pub fn start_workflow_planning(
         planning_attempt,
         &planner,
         &prompt,
+        confirmed_session.as_deref(),
     )?;
     record_artifact_baseline(
         db,
@@ -1199,14 +1448,20 @@ pub fn submit_workflow_plan(
     // but do not persist it yet.  A failed tmux hand-off is recoverable and
     // must not leave immutable evidence in the still-current planning state.
     let plan_evidence = snapshot_step_evidence(&task, &current, &path)?;
-    switch_agent_or_record_failure(
+    let confirmed_session = hand_off_and_deliver(
         db,
         &task,
-        &current,
-        &previous_agent,
-        &reviewer,
-        &target,
-        &command,
+        &Handoff {
+            journal_state: &current.state,
+            journal_attempt: current.state_attempt,
+            source_agent: &previous_agent,
+            destination_agent: &reviewer,
+            target: &target,
+            worktree: &worktree,
+            command: &command,
+            prompt: &prompt,
+            paste_prompt: false,
+        },
         runtime,
     )?;
     let plan_evidence = persist_step_evidence(
@@ -1225,6 +1480,7 @@ pub fn submit_workflow_plan(
         handoff.state.state_attempt,
         &reviewer,
         &prompt,
+        confirmed_session.as_deref(),
     )?;
     db.bind_workflow_step_input(&WorkflowStepInput {
         task_id: task.id.clone(),
@@ -1351,14 +1607,20 @@ pub fn decide_workflow_plan(
             policy.as_ref(),
             Some(Path::new(worktree)),
         );
-        switch_agent_or_record_failure(
+        let confirmed_session = hand_off_and_deliver(
             db,
             &task,
-            &current,
-            &previous_agent,
-            &task.agent,
-            &target,
-            &command,
+            &Handoff {
+                journal_state: &current.state,
+                journal_attempt: current.state_attempt,
+                source_agent: &previous_agent,
+                destination_agent: &task.agent,
+                target: &target,
+                worktree,
+                command: &command,
+                prompt: &prompt,
+                paste_prompt: !can_embed,
+            },
             runtime,
         )?;
         let review_evidence = persist_step_evidence(
@@ -1379,16 +1641,6 @@ pub fn decide_workflow_plan(
             expected_sha256: review_evidence.sha256.clone(),
             created_at: chrono::Utc::now(),
         })?;
-        if !can_embed {
-            let _ = wait_for_agent_ready(
-                runtime.tmux_ops,
-                &target,
-                Some(&task.agent),
-                runtime.config.auto_trust,
-            );
-            runtime.tmux_ops.paste_text(&target, &prompt)?;
-            runtime.tmux_ops.send_key(&target, "C-m")?;
-        }
         record_agent_prompt(
             db,
             &task,
@@ -1396,6 +1648,7 @@ pub fn decide_workflow_plan(
             decision.state.state_attempt,
             &task.agent,
             &prompt,
+            confirmed_session.as_deref(),
         )?;
     }
     db.advance_workflow_state(&decision.state, &decision.transition)?;
@@ -1536,7 +1789,7 @@ pub fn start_workflow_implementation(
     // completed workflow action.
     let can_embed =
         crate::agent::spec::can_launch_with_prompt(agent_ops.prompt_injection(), &prompt);
-    if session_available {
+    let confirmed_session = if session_available {
         let command = build_policy_agent_command(
             agent_ops.as_ref(),
             &implementer,
@@ -1544,17 +1797,22 @@ pub fn start_workflow_implementation(
             policy.as_ref(),
             Some(Path::new(&worktree)),
         );
-        switch_agent_in_tmux(runtime.tmux_ops.as_ref(), &target, &task.agent, &command)?;
-        if !can_embed {
-            let _ = wait_for_agent_ready(
-                runtime.tmux_ops,
-                &target,
-                Some(&implementer),
-                runtime.config.auto_trust,
-            );
-            runtime.tmux_ops.paste_text(&target, &prompt)?;
-            runtime.tmux_ops.send_key(&target, "C-m")?;
-        }
+        hand_off_and_deliver(
+            db,
+            &task,
+            &Handoff {
+                journal_state: &implementation.state.state,
+                journal_attempt: implementation.state.state_attempt,
+                source_agent: &task.agent,
+                destination_agent: &implementer,
+                target: &target,
+                worktree: &worktree,
+                command: &command,
+                prompt: &prompt,
+                paste_prompt: !can_embed,
+            },
+            runtime,
+        )?
     } else {
         ensure_project_tmux_session(
             runtime.tmux_project_name,
@@ -1572,25 +1830,33 @@ pub fn start_workflow_implementation(
             policy.as_ref(),
             Some(Path::new(&worktree)),
         );
+        let since = std::time::SystemTime::now();
         runtime.tmux_ops.create_window(
             runtime.tmux_project_name,
             &window_name,
             &worktree,
-            Some(command),
+            Some(command.clone()),
             true,
             &agtx_task_env(&task.id, &worktree),
         )?;
-        if !can_embed {
-            let _ = wait_for_agent_ready(
-                runtime.tmux_ops,
-                &target,
-                Some(&implementer),
-                runtime.config.auto_trust,
-            );
-            runtime.tmux_ops.paste_text(&target, &prompt)?;
-            runtime.tmux_ops.send_key(&target, "C-m")?;
-        }
-    }
+        deliver_to_launched_agent(
+            db,
+            &task,
+            &Handoff {
+                journal_state: &implementation.state.state,
+                journal_attempt: implementation.state.state_attempt,
+                source_agent: &task.agent,
+                destination_agent: &implementer,
+                target: &target,
+                worktree: &worktree,
+                command: &command,
+                prompt: &prompt,
+                paste_prompt: !can_embed,
+            },
+            since,
+            runtime,
+        )?
+    };
     record_agent_prompt(
         db,
         &task,
@@ -1598,6 +1864,7 @@ pub fn start_workflow_implementation(
         implementation.state.state_attempt,
         &implementer,
         &prompt,
+        confirmed_session.as_deref(),
     )?;
     db.advance_workflow_state(&implementation.state, &implementation.transition)?;
     task.status = TaskStatus::Running;
@@ -1680,14 +1947,20 @@ pub fn submit_workflow_implementation(
     let evidence = snapshot_step_evidence(&task, &current, &artifact)?;
     // A failed hand-off must leave the current state fully retryable: retain the
     // evidence snapshot in memory, launch first, then persist it after launch.
-    switch_agent_or_record_failure(
+    let confirmed_session = hand_off_and_deliver(
         db,
         &task,
-        &current,
-        &task.agent,
-        &reviewer,
-        &target,
-        &command,
+        &Handoff {
+            journal_state: &current.state,
+            journal_attempt: current.state_attempt,
+            source_agent: &task.agent,
+            destination_agent: &reviewer,
+            target: &target,
+            worktree: &worktree,
+            command: &command,
+            prompt: &prompt,
+            paste_prompt: false,
+        },
         runtime,
     )?;
     persist_step_evidence(
@@ -1710,6 +1983,7 @@ pub fn submit_workflow_implementation(
         review.state.state_attempt,
         &reviewer,
         &prompt,
+        confirmed_session.as_deref(),
     )?;
     task.status = TaskStatus::Review;
     task.agent = reviewer;
@@ -1799,14 +2073,20 @@ pub fn submit_engineering_review(
     );
     let evidence = snapshot_step_evidence(&task, &current, &artifact)?;
     // Preserve no immutable evidence until the receiving role is confirmed.
-    switch_agent_or_record_failure(
+    let confirmed_session = hand_off_and_deliver(
         db,
         &task,
-        &current,
-        &task.agent,
-        &next_agent,
-        &target,
-        &command,
+        &Handoff {
+            journal_state: &current.state,
+            journal_attempt: current.state_attempt,
+            source_agent: &task.agent,
+            destination_agent: &next_agent,
+            target: &target,
+            worktree: &worktree,
+            command: &command,
+            prompt: &prompt,
+            paste_prompt: false,
+        },
         runtime,
     )?;
     persist_step_evidence(
@@ -1826,6 +2106,7 @@ pub fn submit_engineering_review(
         transition.state.state_attempt,
         &next_agent,
         &prompt,
+        confirmed_session.as_deref(),
     )?;
     task.status = status;
     task.agent = next_agent;
@@ -1931,14 +2212,20 @@ pub fn submit_final_validation(
     }
     let evidence = snapshot_step_evidence(&task, &current, &artifact)?;
     // Preserve no immutable evidence until the receiving role is confirmed.
-    switch_agent_or_record_failure(
+    let confirmed_session = hand_off_and_deliver(
         db,
         &task,
-        &current,
-        &task.agent,
-        &next_agent,
-        &target,
-        &command,
+        &Handoff {
+            journal_state: &current.state,
+            journal_attempt: current.state_attempt,
+            source_agent: &task.agent,
+            destination_agent: &next_agent,
+            target: &target,
+            worktree: &worktree,
+            command: &command,
+            prompt: &prompt,
+            paste_prompt: false,
+        },
         runtime,
     )?;
     persist_step_evidence(
@@ -1958,6 +2245,7 @@ pub fn submit_final_validation(
         transition.state.state_attempt,
         &next_agent,
         &prompt,
+        confirmed_session.as_deref(),
     )?;
     task.status = TaskStatus::Review;
     task.agent = next_agent;
@@ -3398,6 +3686,7 @@ mod launch_tests {
             project_path: Path::new("C:/work/project"),
             config: &config,
             flags: &flags,
+            session_probe: crate::agent::native_session::default_probe(),
         };
 
         let outcome = start_workflow_implementation(
@@ -3565,6 +3854,7 @@ mod launch_tests {
             project_path: Path::new("C:/work/project"),
             config: &config,
             flags: &flags,
+            session_probe: crate::agent::native_session::default_probe(),
         };
 
         let outcome = start_workflow_implementation(
@@ -3687,14 +3977,15 @@ mod launch_tests {
             .withf(|_, cmd: &str| cmd == "/exit")
             .returning(|_, _| Ok(()));
         mock_tmux.expect_send_key().returning(|_, _| Ok(()));
-        // First poll: outgoing agent already at a shell. Every poll after
+        // First two polls (pre-switch pane check, exit check): outgoing agent
+        // already at a shell. Every poll after
         // that: the freshly launched agent, matching a real tmux pane once
         // `switch_agent_in_tmux` types the new command -- its final
         // launch-detection loop requires a *recognized* agent process name,
         // not merely any string.
         let pane_polls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         mock_tmux.expect_pane_current_command().returning(move |_| {
-            if pane_polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            if pane_polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
                 Some("bash".to_string())
             } else {
                 Some("claude".to_string())
@@ -3728,6 +4019,7 @@ mod launch_tests {
             project_path: Path::new("C:/work/project"),
             config: &config,
             flags: &flags,
+            session_probe: crate::agent::native_session::default_probe(),
         };
 
         let outcome =
@@ -3863,14 +4155,15 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             .withf(|_, cmd: &str| cmd == "/exit")
             .returning(|_, _| Ok(()));
         mock_tmux.expect_send_key().returning(|_, _| Ok(()));
-        // First poll: outgoing agent already at a shell. Every poll after
+        // First two polls (pre-switch pane check, exit check): outgoing agent
+        // already at a shell. Every poll after
         // that: the freshly launched agent, matching a real tmux pane once
         // `switch_agent_in_tmux` types the new command -- its final
         // launch-detection loop requires a *recognized* agent process name,
         // not merely any string.
         let pane_polls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         mock_tmux.expect_pane_current_command().returning(move |_| {
-            if pane_polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            if pane_polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
                 Some("bash".to_string())
             } else {
                 Some("claude".to_string())
@@ -3904,6 +4197,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             project_path: Path::new("C:/work/project"),
             config: &config,
             flags: &flags,
+            session_probe: crate::agent::native_session::default_probe(),
         };
 
         let outcome =
@@ -4073,6 +4367,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             project_path: Path::new("C:/work/project"),
             config: &config,
             flags: &flags,
+            session_probe: crate::agent::native_session::default_probe(),
         };
 
         let outcome = start_workflow_planning(
@@ -4220,6 +4515,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             project_path: Path::new("C:/work/project"),
             config: &config,
             flags: &flags,
+            session_probe: crate::agent::native_session::default_probe(),
         };
 
         let error =
@@ -4342,7 +4638,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
         let command_checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let command_checks_for_mock = Arc::clone(&command_checks);
         mock_tmux.expect_pane_current_command().returning(move |_| {
-            if command_checks_for_mock.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            if command_checks_for_mock.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
                 Some("bash".to_string())
             } else {
                 Some("claude".to_string())
@@ -4370,6 +4666,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             project_path: Path::new("C:/work/project"),
             config: &config,
             flags: &flags,
+            session_probe: crate::agent::native_session::default_probe(),
         };
 
         let outcome =
@@ -4517,7 +4814,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
         let command_checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let command_checks_for_mock = Arc::clone(&command_checks);
         mock_tmux.expect_pane_current_command().returning(move |_| {
-            if command_checks_for_mock.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            if command_checks_for_mock.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
                 Some("bash".to_string())
             } else {
                 Some("claude".to_string())
@@ -4546,6 +4843,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             project_path: Path::new("C:/work/project"),
             config: &config,
             flags: &flags,
+            session_probe: crate::agent::native_session::default_probe(),
         };
 
         let outcome = submit_workflow_implementation(
@@ -4664,7 +4962,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
         let command_checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let command_checks_for_mock = Arc::clone(&command_checks);
         mock_tmux.expect_pane_current_command().returning(move |_| {
-            if command_checks_for_mock.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            if command_checks_for_mock.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
                 Some("bash".to_string())
             } else {
                 Some("claude".to_string())
@@ -4693,6 +4991,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             project_path: Path::new("C:/work/project"),
             config: &config,
             flags: &flags,
+            session_probe: crate::agent::native_session::default_probe(),
         };
 
         let outcome =
@@ -4800,7 +5099,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
         let command_checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let command_checks_for_mock = Arc::clone(&command_checks);
         mock_tmux.expect_pane_current_command().returning(move |_| {
-            if command_checks_for_mock.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            if command_checks_for_mock.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
                 Some("bash".to_string())
             } else {
                 Some("claude".to_string())
@@ -4829,6 +5128,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             project_path: Path::new("C:/work/project"),
             config: &config,
             flags: &flags,
+            session_probe: crate::agent::native_session::default_probe(),
         };
 
         let outcome =
@@ -4893,6 +5193,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             project_path: Path::new("C:/work/project"),
             config: &config,
             flags: &flags,
+            session_probe: crate::agent::native_session::default_probe(),
         };
 
         // Artifact-driven path.
@@ -5043,7 +5344,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
         mock_tmux.expect_send_keys().returning(|_, _| Ok(()));
         mock_tmux.expect_send_key().returning(|_, _| Ok(()));
         mock_tmux.expect_pane_current_command().returning(move |_| {
-            if command_checks_for_mock.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            if command_checks_for_mock.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
                 Some("bash".to_string())
             } else {
                 Some("claude".to_string())
@@ -5101,6 +5402,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             project_path: Path::new("C:/work/project"),
             config: &config,
             flags: &flags,
+            session_probe: crate::agent::native_session::default_probe(),
         };
 
         let outcome =
@@ -5199,6 +5501,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             project_path: Path::new("C:/work/project"),
             config: &config,
             flags: &flags,
+            session_probe: crate::agent::native_session::default_probe(),
         };
 
         let error = submit_plan_review(&graph, &project, &plugin, task.clone(), &mut db, &runtime)
@@ -5262,6 +5565,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             project_path: Path::new("C:/work/project"),
             config: &config,
             flags: &flags,
+            session_probe: crate::agent::native_session::default_probe(),
         };
 
         let outcome =
@@ -5323,6 +5627,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             project_path: Path::new("C:/work/project"),
             config: &config,
             flags: &flags,
+            session_probe: crate::agent::native_session::default_probe(),
         };
 
         let outcome = decide_workflow_plan(
@@ -5344,5 +5649,264 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             .recv_timeout(std::time::Duration::from_millis(100))
             .is_err());
         assert!(captured.lock().unwrap().is_none());
+    }
+}
+
+/// The verified hand-off, driven directly. Every test scripts the provider
+/// session stores and uses a tmux mock with no expectation for keystrokes the
+/// scenario must never send: a stray keystroke panics the test.
+#[cfg(test)]
+#[cfg(feature = "test-mocks")]
+mod handoff_tests {
+    use super::*;
+    use crate::agent::native_session::{Delivery, SessionProbe, TurnActivity};
+    use crate::agent::{AgentRegistry, MockAgentRegistry};
+    use crate::config::{GlobalConfig, MergedConfig, ProjectConfig};
+    use crate::git::MockGitOperations;
+    use crate::tmux::MockTmuxOperations;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ScriptedProbe {
+        activity: Option<TurnActivity>,
+        delivery: Delivery,
+    }
+
+    impl SessionProbe for ScriptedProbe {
+        fn turn_activity(&self, _: &str, _: &Path, _: &str) -> Option<TurnActivity> {
+            self.activity
+        }
+        fn find_delivered_prompt(
+            &self,
+            _: &str,
+            _: &Path,
+            _: &str,
+            _: std::time::SystemTime,
+        ) -> Delivery {
+            self.delivery.clone()
+        }
+        fn delivery_timeout(&self) -> std::time::Duration {
+            std::time::Duration::ZERO
+        }
+    }
+
+    /// Mirrors task 16581cba: the plan reviewer (Codex) hands the pane to
+    /// the implementer (OpenCode) with the prompt carried in the launch.
+    fn handoff(command: &str) -> Handoff<'_> {
+        Handoff {
+            journal_state: "plan_review",
+            journal_attempt: 6,
+            source_agent: "codex",
+            destination_agent: "opencode",
+            target: "proj:task-16581cba",
+            worktree: "/agtx-work/worktrees/16581cba",
+            command,
+            prompt: "You are the implementer for task 16581cba. Implement only the approved plan.",
+            paste_prompt: false,
+        }
+    }
+
+    fn run(
+        mock_tmux: MockTmuxOperations,
+        probe: &ScriptedProbe,
+        db: &Database,
+        task: &Task,
+        command: &str,
+    ) -> Result<Option<String>> {
+        let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(mock_tmux);
+        let agent_registry: Arc<dyn AgentRegistry> = Arc::new(MockAgentRegistry::new());
+        let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
+        let config = MergedConfig::merge(&GlobalConfig::default(), &ProjectConfig::default());
+        let flags = crate::FeatureFlags::default();
+        let runtime = WorkflowRuntime {
+            tmux_ops: &tmux_ops,
+            agent_registry: &agent_registry,
+            git_ops: &git_ops,
+            tmux_project_name: "proj",
+            project_path: Path::new("/agtx-work/project"),
+            config: &config,
+            flags: &flags,
+            session_probe: probe,
+        };
+        hand_off_and_deliver(db, task, &handoff(command), &runtime)
+    }
+
+    fn task_and_db() -> (Task, Database) {
+        let db = Database::open_in_memory_project().unwrap();
+        let task = Task::new("PHASE1 - Setup", "codex", "proj");
+        db.create_task(&task).unwrap();
+        (task, db)
+    }
+
+    fn events(db: &Database, task: &Task, event_type: &str) -> usize {
+        db.task_execution_events(&task.id)
+            .unwrap()
+            .iter()
+            .filter(|event| event.event_type == event_type)
+            .count()
+    }
+
+    /// Pane polls answer `sequence[i]`, repeating the last entry.
+    fn pane_sequence(mock: &mut MockTmuxOperations, sequence: &'static [&'static str]) {
+        let polls = Arc::new(AtomicUsize::new(0));
+        mock.expect_pane_current_command().returning(move |_| {
+            let index = polls.fetch_add(1, Ordering::SeqCst).min(sequence.len() - 1);
+            Some(sequence[index].to_string())
+        });
+    }
+
+    /// RC1: the reviewer wrote its verdict but its turn is still running.
+    /// Nothing may be typed into the pane; the hand-off waits for the turn.
+    #[test]
+    fn handoff_waits_while_the_source_agent_is_mid_turn() {
+        let (task, db) = task_and_db();
+        let mut mock = MockTmuxOperations::new();
+        pane_sequence(&mut mock, &["codex"]);
+        mock.expect_send_key().never();
+        mock.expect_send_keys().never();
+        mock.expect_paste_text().never();
+        let probe = ScriptedProbe {
+            activity: Some(TurnActivity::Busy),
+            delivery: Delivery::Unverifiable,
+        };
+
+        let error = run(mock, &probe, &db, &task, "opencode").unwrap_err();
+
+        assert!(error.to_string().contains("deferred"), "{error}");
+        assert_eq!(events(&db, &task, "agent_handoff_deferred"), 1);
+    }
+
+    /// A turn that never reports its end cannot stall the task forever: after
+    /// the deferral budget the hand-off proceeds (still exit-verified).
+    #[test]
+    fn handoff_proceeds_after_the_idle_wait_budget_is_spent() {
+        let (task, db) = task_and_db();
+        for _ in 0..MAX_IDLE_DEFERRALS {
+            let mut event = TaskExecutionEvent::new(&task.id, "agent_handoff_deferred");
+            event.state = Some("plan_review".into());
+            event.workflow_attempt = Some(6);
+            db.record_task_execution_event(&event).unwrap();
+        }
+        let mut mock = MockTmuxOperations::new();
+        // Codex busy, then it exits to bash, then OpenCode runs.
+        pane_sequence(&mut mock, &["codex", "bash", "opencode"]);
+        mock.expect_send_key().returning(|_, _| Ok(()));
+        mock.expect_send_keys().returning(|_, _| Ok(()));
+        mock.expect_capture_pane().returning(|_| Ok(String::new()));
+        let probe = ScriptedProbe {
+            activity: Some(TurnActivity::Busy),
+            delivery: Delivery::Confirmed("ses_new".into()),
+        };
+
+        let session = run(mock, &probe, &db, &task, "opencode").unwrap();
+
+        assert_eq!(session.as_deref(), Some("ses_new"));
+        assert_eq!(events(&db, &task, "agent_handoff_idle_timeout"), 1);
+    }
+
+    /// RC2/RC3, the 16581cba incident: Codex never leaves the pane. The
+    /// launch command and prompt must never be typed into it, and Codex
+    /// must not be accepted as the launched OpenCode.
+    #[test]
+    fn a_source_agent_that_never_exits_is_never_typed_into() {
+        let (task, db) = task_and_db();
+        let mut mock = MockTmuxOperations::new();
+        pane_sequence(&mut mock, &["codex"]);
+        mock.expect_capture_pane().returning(|_| Ok(String::new()));
+        // Only the exit escalation (Ctrl+C, Ctrl+D) is allowed.
+        mock.expect_send_key()
+            .withf(|_, key: &str| key == "C-c" || key == "C-d")
+            .returning(|_, _| Ok(()));
+        mock.expect_send_keys().never();
+        mock.expect_paste_text().never();
+        let probe = ScriptedProbe {
+            activity: Some(TurnActivity::Idle),
+            delivery: Delivery::Confirmed("unused".into()),
+        };
+
+        let error = run(mock, &probe, &db, &task, "opencode").unwrap_err();
+
+        assert!(error.to_string().contains("could not confirm"), "{error}");
+        assert_eq!(events(&db, &task, "agent_handoff_failed"), 1);
+    }
+
+    /// RC3: the old agent exited but the pane then shows *another* agent
+    /// than the destination; that is not a successful launch.
+    #[test]
+    fn only_the_destination_agent_counts_as_launched() {
+        let (task, db) = task_and_db();
+        let mut mock = MockTmuxOperations::new();
+        pane_sequence(&mut mock, &["bash", "bash", "codex"]);
+        mock.expect_capture_pane().returning(|_| Ok(String::new()));
+        mock.expect_send_key().returning(|_, _| Ok(()));
+        mock.expect_send_keys().returning(|_, _| Ok(()));
+        let probe = ScriptedProbe {
+            activity: None,
+            delivery: Delivery::Confirmed("unused".into()),
+        };
+
+        let error = run(mock, &probe, &db, &task, "opencode").unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("did not start a process for 'opencode'"),
+            "{error}"
+        );
+    }
+
+    /// RC4: the destination runs, but its session never records the prompt.
+    /// The hand-off fails (retryable) instead of reporting a delivery.
+    #[test]
+    fn an_unconfirmed_prompt_fails_the_handoff() {
+        let (task, db) = task_and_db();
+        let mut mock = MockTmuxOperations::new();
+        pane_sequence(&mut mock, &["bash", "bash", "opencode"]);
+        mock.expect_capture_pane().returning(|_| Ok(String::new()));
+        mock.expect_send_key().returning(|_, _| Ok(()));
+        mock.expect_send_keys().returning(|_, _| Ok(()));
+        let probe = ScriptedProbe {
+            activity: None,
+            delivery: Delivery::Missing,
+        };
+
+        let error = run(mock, &probe, &db, &task, "opencode").unwrap_err();
+
+        assert!(
+            error.to_string().contains("did not appear in its session"),
+            "{error}"
+        );
+        assert_eq!(events(&db, &task, "agent_prompt_unconfirmed"), 1);
+    }
+
+    #[test]
+    fn a_confirmed_delivery_records_exactly_that_provider_session() {
+        let (task, db) = task_and_db();
+        let mut mock = MockTmuxOperations::new();
+        pane_sequence(&mut mock, &["bash", "bash", "opencode"]);
+        mock.expect_capture_pane().returning(|_| Ok(String::new()));
+        mock.expect_send_key().returning(|_, _| Ok(()));
+        mock.expect_send_keys().returning(|_, _| Ok(()));
+        let probe = ScriptedProbe {
+            activity: None,
+            delivery: Delivery::Confirmed("ses_implementer".into()),
+        };
+
+        let session = run(mock, &probe, &db, &task, "opencode").unwrap();
+        record_agent_prompt(
+            &db,
+            &task,
+            "implementing",
+            8,
+            "opencode",
+            "prompt",
+            session.as_deref(),
+        )
+        .unwrap();
+
+        let sessions = db.provider_sessions(&task.id).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].provider_session_id, "ses_implementer");
+        assert_eq!(sessions[0].state, "implementing");
+        assert_eq!(sessions[0].workflow_attempt, 8);
     }
 }

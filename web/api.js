@@ -191,6 +191,7 @@ export const ACTION_LABELS = {
   move_to_done: "Mark done",
   resume: "Resume",
   escalate_to_user: "Escalate",
+  resend_prompt: "Resend state prompt",
 };
 
 /// The action a swipe performs — the one thing you would most likely want from

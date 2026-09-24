@@ -32,6 +32,7 @@ pub const ACTIONS: &[&str] = &[
     "move_to_done",
     "resume",
     "escalate_to_user",
+    "resend_prompt",
 ];
 
 /// The longest a task title may be. Mirrors the wizard's own cap, so a task
@@ -64,10 +65,18 @@ pub fn allowed_actions(task: &Task, deps_satisfied: bool, caller: CallerKind) ->
             if caller == CallerKind::Orchestrator {
                 actions.push("escalate_to_user".to_string());
             }
+            if caller == CallerKind::Human && task.worktree_path.is_some() {
+                actions.push("resend_prompt".to_string());
+            }
         }
         TaskStatus::Review => {
             actions.push("move_to_done".to_string());
             actions.push("resume".to_string());
+            // Safety valve for a pane whose agent lost the current workflow
+            // state's prompt: re-deliver the stored prompt to the same agent.
+            if caller == CallerKind::Human && task.worktree_path.is_some() {
+                actions.push("resend_prompt".to_string());
+            }
         }
         TaskStatus::Done => {}
     }
@@ -154,4 +163,47 @@ pub fn validate_action(
             format!("; try one of {}", allowed.join(", "))
         }
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(status: TaskStatus, worktree: bool) -> Task {
+        let mut task = Task::new("t", "codex", "p");
+        task.status = status;
+        task.worktree_path = worktree.then(|| "/wt/t".to_string());
+        task
+    }
+
+    /// The prompt-resend safety valve is a person's tool for a task with a
+    /// live worktree; the orchestrator never gets it.
+    #[test]
+    fn resend_prompt_is_offered_to_people_for_tasks_with_a_worktree() {
+        for status in [
+            TaskStatus::Planning,
+            TaskStatus::Running,
+            TaskStatus::Review,
+        ] {
+            assert!(
+                allowed_actions(&task(status, true), true, CallerKind::Human)
+                    .contains(&"resend_prompt".to_string())
+            );
+            assert!(
+                !allowed_actions(&task(status, false), true, CallerKind::Human)
+                    .contains(&"resend_prompt".to_string())
+            );
+            assert!(
+                !allowed_actions(&task(status, true), true, CallerKind::Orchestrator)
+                    .contains(&"resend_prompt".to_string())
+            );
+        }
+        assert!(validate_action(
+            &task(TaskStatus::Done, true),
+            true,
+            CallerKind::Human,
+            "resend_prompt"
+        )
+        .is_err());
+    }
 }

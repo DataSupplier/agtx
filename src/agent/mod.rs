@@ -122,9 +122,10 @@ impl Agent {
             (spec::ResumeArgs::AppendSession(flag), Some(id)) => {
                 s.base_args.iter().copied().chain([flag, id]).collect()
             }
-            (spec::ResumeArgs::ReplaceWithSession(_) | spec::ResumeArgs::AppendSession(_), None) => {
-                s.base_args.to_vec()
-            }
+            (
+                spec::ResumeArgs::ReplaceWithSession(_) | spec::ResumeArgs::AppendSession(_),
+                None,
+            ) => s.base_args.to_vec(),
         };
         spec::compose_command(s, &args, None)
     }

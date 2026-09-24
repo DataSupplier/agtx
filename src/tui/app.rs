@@ -1048,10 +1048,11 @@ impl App {
                     task,
                     &app.state.tmux_project_name,
                     app.state.project_path.as_deref().unwrap_or(Path::new(".")),
-                    app.state.tmux_ops.as_ref(),
+                    &app.state.tmux_ops,
                     agent_ops.as_ref(),
                     app.state.db.as_ref(),
                     &app.state.config.default_agent,
+                    app.state.config.auto_trust,
                 ) {
                     eprintln!("Failed to recover task session for '{}': {e}", task.id);
                 }
@@ -6102,6 +6103,7 @@ impl App {
             project_path: &project_path,
             config: &self.state.config,
             flags: &self.state.flags,
+            session_probe: crate::agent::native_session::default_probe(),
         };
         let db = self
             .state
@@ -6129,6 +6131,7 @@ impl App {
             project_path: &project_path,
             config: &self.state.config,
             flags: &self.state.flags,
+            session_probe: crate::agent::native_session::default_probe(),
         };
         let db = self
             .state
@@ -6177,6 +6180,7 @@ impl App {
             project_path: &project_path,
             config: &self.state.config,
             flags: &self.state.flags,
+            session_probe: crate::agent::native_session::default_probe(),
         };
         let outcome = reset_workflow_to_backlog(task, db, &runtime)?;
         self.apply_workflow_step_outcome(outcome)
@@ -6250,6 +6254,7 @@ impl App {
             project_path: &project_path,
             config: &self.state.config,
             flags: &self.state.flags,
+            session_probe: crate::agent::native_session::default_probe(),
         };
         let db = self
             .state
@@ -6286,6 +6291,7 @@ impl App {
             project_path: &project_path,
             config: &self.state.config,
             flags: &self.state.flags,
+            session_probe: crate::agent::native_session::default_probe(),
         };
         let db = self
             .state
@@ -6323,6 +6329,7 @@ impl App {
             project_path: &project_path,
             config: &self.state.config,
             flags: &self.state.flags,
+            session_probe: crate::agent::native_session::default_probe(),
         };
         let db = self
             .state
@@ -6362,6 +6369,7 @@ impl App {
             project_path: &project_path,
             config: &self.state.config,
             flags: &self.state.flags,
+            session_probe: crate::agent::native_session::default_probe(),
         };
         let db = self
             .state
@@ -6408,6 +6416,7 @@ impl App {
             project_path: &project_path,
             config: &self.state.config,
             flags: &self.state.flags,
+            session_probe: crate::agent::native_session::default_probe(),
         };
         let db = self
             .state
@@ -6453,6 +6462,7 @@ impl App {
             project_path: &project_path,
             config: &self.state.config,
             flags: &self.state.flags,
+            session_probe: crate::agent::native_session::default_probe(),
         };
         let db = self
             .state
@@ -6498,6 +6508,7 @@ impl App {
             project_path: &project_path,
             config: &self.state.config,
             flags: &self.state.flags,
+            session_probe: crate::agent::native_session::default_probe(),
         };
         let db = self
             .state
@@ -6537,6 +6548,7 @@ impl App {
             project_path: &project_path,
             config: &self.state.config,
             flags: &self.state.flags,
+            session_probe: crate::agent::native_session::default_probe(),
         };
         let db = self
             .state
@@ -6576,6 +6588,7 @@ impl App {
             project_path: &project_path,
             config: &self.state.config,
             flags: &self.state.flags,
+            session_probe: crate::agent::native_session::default_probe(),
         };
         let db = self
             .state
@@ -6651,6 +6664,7 @@ impl App {
             project_path: &project_path,
             config: &self.state.config,
             flags: &self.state.flags,
+            session_probe: crate::agent::native_session::default_probe(),
         };
         let Some(db) = self.state.db.as_mut() else {
             return;
@@ -8169,6 +8183,7 @@ impl App {
                                 tmux_ops.as_ref(),
                                 &session_clone,
                                 &current_agent_clone,
+                                &running_agent_clone,
                                 &new_cmd,
                             ) {
                                 eprintln!(
@@ -8282,6 +8297,7 @@ impl App {
                                 tmux_ops.as_ref(),
                                 &session_clone,
                                 &current_agent_clone,
+                                &planning_agent_clone,
                                 &new_cmd,
                             ) {
                                 eprintln!(
@@ -8358,6 +8374,7 @@ impl App {
                                 tmux_ops.as_ref(),
                                 &session_clone,
                                 &current_agent_clone,
+                                &planning_agent_clone,
                                 &new_cmd,
                             ) {
                                 eprintln!(
@@ -8535,6 +8552,9 @@ impl App {
                 }
                 self.move_review_to_running(&req.task_id)?;
             }
+            "resend_prompt" => {
+                self.resend_current_state_prompt(&task)?;
+            }
             "escalate_to_user" => {
                 if !matches!(task.status, TaskStatus::Planning | TaskStatus::Running) {
                     anyhow::bail!(
@@ -8557,6 +8577,76 @@ impl App {
             }
         }
 
+        Ok(())
+    }
+
+    /// Deliver the current workflow state's stored prompt to the task's pane
+    /// again -- the operator's safety valve when an agent has lost the prompt
+    /// for the state it is in. Refuses rather than guesses: the pane must run
+    /// the task's own agent, and the journal copy of the prompt must be
+    /// complete. A lost window is rebuilt by `recover_task_session`, which
+    /// delivers the prompt itself when no session holds it.
+    fn resend_current_state_prompt(&mut self, task: &Task) -> Result<()> {
+        let Some(db) = &self.state.db else {
+            anyhow::bail!("No project database");
+        };
+        let Some((state, attempt, prompt)) = current_state_prompt(db, &task.id) else {
+            anyhow::bail!(
+                "No complete stored prompt for this task's current workflow state; nothing to resend"
+            );
+        };
+        let target = task
+            .session_name
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Task has no session"))?;
+        if !self.state.tmux_ops.window_exists(&target).unwrap_or(false) {
+            let agent_ops = self.state.agent_registry.get(&task.agent);
+            let project_path = self
+                .state
+                .project_path
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("."));
+            recover_task_session(
+                task,
+                &self.state.tmux_project_name,
+                &project_path,
+                &self.state.tmux_ops,
+                agent_ops.as_ref(),
+                self.state.db.as_ref(),
+                &self.state.config.default_agent,
+                self.state.config.auto_trust,
+            )?;
+            return Ok(());
+        }
+        let running = self
+            .state
+            .tmux_ops
+            .pane_current_command(&target)
+            .unwrap_or_default();
+        let owns_pane = agent::spec(&task.agent).is_some_and(|spec| {
+            spec.process_names
+                .iter()
+                .any(|name| running.trim() == *name)
+        });
+        if !owns_pane {
+            anyhow::bail!(
+                "Pane '{target}' runs '{}', not the task's agent '{}'; not resending into it",
+                running.trim(),
+                task.agent
+            );
+        }
+        self.state.tmux_ops.paste_text(&target, &prompt)?;
+        self.state.tmux_ops.send_key(&target, "C-m")?;
+        let mut event = crate::db::TaskExecutionEvent::new(&task.id, "agent_prompt_resent");
+        event.state = Some(state.clone());
+        event.workflow_attempt = Some(attempt);
+        event.agent = Some(task.agent.clone());
+        event.outcome = Some("started".to_string());
+        event.message = Some(format!(
+            "Operator re-sent the {state} (attempt {attempt}) prompt to '{}'",
+            task.agent
+        ));
+        db.record_task_execution_event(&event)?;
         Ok(())
     }
 
@@ -8865,10 +8955,11 @@ impl App {
                         task,
                         &self.state.tmux_project_name,
                         project_path,
-                        self.state.tmux_ops.as_ref(),
+                        &self.state.tmux_ops,
                         agent_ops.as_ref(),
                         self.state.db.as_ref(),
                         &self.state.config.default_agent,
+                        self.state.config.auto_trust,
                     ) {
                         self.state.warning_message = Some((
                             format!("Could not recover task session: {e}"),
@@ -9905,10 +9996,11 @@ fn recover_task_session(
     task: &Task,
     project_name: &str,
     project_path: &Path,
-    tmux_ops: &dyn TmuxOperations,
+    tmux_ops: &Arc<dyn TmuxOperations>,
     agent_ops: &dyn AgentOperations,
     db: Option<&Database>,
     default_agent: &str,
+    auto_trust: bool,
 ) -> Result<String> {
     let worktree_path = task
         .worktree_path
@@ -9927,7 +10019,7 @@ fn recover_task_session(
         .split_once(':')
         .ok_or_else(|| anyhow::anyhow!("Invalid session name format: {}", target))?;
 
-    ensure_project_tmux_session(project_name, project_path, tmux_ops);
+    ensure_project_tmux_session(project_name, project_path, tmux_ops.as_ref());
 
     // `?`, not a silent fallback: see resolve_task_workflow_policy's Ok(None)
     // vs Err contract. A resolution failure here must abort the recovery
@@ -9936,24 +10028,60 @@ fn recover_task_session(
     // `&task.agent`, not `default_agent`: the resume command must be built
     // for the agent this task's session actually runs, which can differ from
     // the project's current default if that default changed after launch.
-    let native_session =
-        resolve_recovery_session(db, &task.id, &task.agent, Path::new(worktree_path));
-    let resume_cmd = build_policy_resume_command(
-        agent_ops,
+    let recovery = resolve_recovery_session(
+        db,
+        &task.id,
         &task.agent,
-        policy.as_ref(),
-        Some(Path::new(worktree_path)),
-        native_session.as_deref(),
+        Path::new(worktree_path),
+        agent::native_session::default_probe(),
     );
+    // No session holds the current state's prompt: start the state's agent
+    // fresh under the same policy and deliver that prompt again, exactly as
+    // the original hand-off did (argv where verified, otherwise paste after
+    // the agent reports ready).
+    let (command, paste) = match &recovery.redeliver {
+        Some(prompt) => {
+            let can_embed =
+                agent::spec::can_launch_with_prompt(agent_ops.prompt_injection(), prompt);
+            let command = build_policy_agent_command(
+                agent_ops,
+                &task.agent,
+                if can_embed { prompt } else { "" },
+                policy.as_ref(),
+                Some(Path::new(worktree_path)),
+            );
+            (command, (!can_embed).then(|| prompt.clone()))
+        }
+        None => (
+            build_policy_resume_command(
+                agent_ops,
+                &task.agent,
+                policy.as_ref(),
+                Some(Path::new(worktree_path)),
+                recovery.session.as_deref(),
+            ),
+            None,
+        ),
+    };
 
     tmux_ops.create_window(
         session,
         window,
         worktree_path,
-        Some(resume_cmd),
+        Some(command),
         true,
         &agtx_task_env(&task.id, worktree_path),
     )?;
+    if let Some(prompt) = paste {
+        if wait_for_agent_ready(tmux_ops, target, Some(&task.agent), auto_trust).is_none() {
+            anyhow::bail!(
+                "recovered '{}' never became ready in '{target}'; the current state's prompt was not delivered",
+                task.agent
+            );
+        }
+        tmux_ops.paste_text(target, &prompt)?;
+        tmux_ops.send_key(target, "C-m")?;
+    }
 
     Ok(target.clone())
 }
@@ -12869,9 +12997,13 @@ pub(crate) fn spawn_send_to_agent(
             } else {
                 ""
             });
-            if let Err(error) =
-                switch_agent_in_tmux(tmux_ops.as_ref(), &target, &current_agent, &new_cmd)
-            {
+            if let Err(error) = switch_agent_in_tmux(
+                tmux_ops.as_ref(),
+                &target,
+                &current_agent,
+                &target_agent,
+                &new_cmd,
+            ) {
                 eprintln!("Failed to switch agent for task '{task_id}': {error}");
             }
             if !delivered_at_launch {
@@ -13774,13 +13906,28 @@ fn workflow_scoped_resume_command(
         .ancestors()
         .find(|path| path.join(".agtx/workflow.toml").is_file())
     else {
-        let native_session =
-            resolve_recovery_session(None, task_id, agent_name, Path::new(worktree_path));
+        let native_session = resolve_recovery_session(
+            None,
+            task_id,
+            agent_name,
+            Path::new(worktree_path),
+            agent::native_session::default_probe(),
+        )
+        .session;
         return Ok(agent_ops.build_resume_command(native_session.as_deref()));
     };
     let db = Database::open_project(project_path)?;
-    let native_session =
-        resolve_recovery_session(Some(&db), task_id, agent_name, Path::new(worktree_path));
+    // Only the session: this path rebuilds a lost window right before the
+    // caller switches agents or sends input itself, so re-sending the stored
+    // prompt here would deliver it twice.
+    let native_session = resolve_recovery_session(
+        Some(&db),
+        task_id,
+        agent_name,
+        Path::new(worktree_path),
+        agent::native_session::default_probe(),
+    )
+    .session;
     let Some(task) = db.get_task(task_id)? else {
         return Ok(agent_ops.build_resume_command(native_session.as_deref()));
     };
@@ -13794,42 +13941,130 @@ fn workflow_scoped_resume_command(
     ))
 }
 
-/// Find the provider-native session a recovered pane must resume: the one
-/// started in this task's own worktree, never the agent's globally most
-/// recent. Journals the decision so a resumed or freshly restarted pane is
-/// traceable to the session it got (or did not get).
+/// What a recovered pane should run for a task.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RecoveryTarget {
+    /// The provider session to resume, if one is known to belong here.
+    session: Option<String>,
+    /// The current workflow state's stored prompt, to deliver to a freshly
+    /// started agent because no session of this agent holds it.
+    redeliver: Option<String>,
+}
+
+/// The current workflow state's delivered prompt, if the journal holds it
+/// complete (a truncated journal copy must never be re-sent as the prompt).
+fn current_state_prompt(db: &Database, task_id: &str) -> Option<(String, i64, String)> {
+    let state = db.get_workflow_task_state(task_id).ok()??;
+    let prompt = db
+        .task_step_reports(task_id)
+        .ok()?
+        .into_iter()
+        .filter(|report| {
+            report.state == state.state && report.workflow_attempt == state.state_attempt
+        })
+        .find_map(|report| report.prompt_text)?;
+    if prompt.ends_with("[truncated by AGTX execution journal]") {
+        return None;
+    }
+    Some((state.state, state.state_attempt, prompt))
+}
+
+/// Decide what a recovered pane resumes. Never the agent's globally most
+/// recent session, and -- for a workflow task -- never a session from an
+/// earlier role: the pane must continue the conversation that holds the
+/// *current* state's prompt. On 2026-09-24 recovery resumed a reviewer pane
+/// as an implementer and an implementer pane as its planner, and both waited
+/// forever for an artifact their resumed conversation had never been asked
+/// for. When no session holds the current prompt, the agent starts fresh and
+/// the stored prompt is delivered again. Journals the decision either way.
 fn resolve_recovery_session(
     db: Option<&Database>,
     task_id: &str,
     agent_name: &str,
     worktree: &Path,
-) -> Option<String> {
+    probe: &dyn agent::native_session::SessionProbe,
+) -> RecoveryTarget {
+    use agent::native_session::Delivery;
+
     let requires_id = agent::spec(agent_name).is_some_and(|s| s.resume.requires_session_id());
     if !requires_id {
-        return None;
+        return RecoveryTarget::default();
     }
-    let session = agent::native_session::session_id_for_worktree(agent_name, worktree);
+    let state_prompt = db.and_then(|db| current_state_prompt(db, task_id));
+    let (target, message) = match &state_prompt {
+        Some((state, attempt, prompt)) => {
+            let marker = agent::native_session::prompt_marker(prompt);
+            match probe.find_delivered_prompt(
+                agent_name,
+                worktree,
+                &marker,
+                std::time::SystemTime::UNIX_EPOCH,
+            ) {
+                Delivery::Confirmed(id) => (
+                    RecoveryTarget { session: Some(id.clone()), redeliver: None },
+                    format!("Recovered pane resumes session {id}, which holds the {state} (attempt {attempt}) prompt"),
+                ),
+                Delivery::Missing => (
+                    RecoveryTarget { session: None, redeliver: Some(prompt.clone()) },
+                    format!(
+                        "No {agent_name} session in {} holds the {state} (attempt {attempt}) prompt; recovered pane starts fresh and it is delivered again",
+                        worktree.display()
+                    ),
+                ),
+                Delivery::Unverifiable => {
+                    let session = agent::native_session::session_id_for_worktree(agent_name, worktree);
+                    let message = match &session {
+                        Some(id) => format!("Recovered pane resumes the worktree's own session {id} (prompt ownership unverifiable)"),
+                        None => format!("No {agent_name} session was started in {}; recovered pane starts fresh", worktree.display()),
+                    };
+                    (RecoveryTarget { session, redeliver: None }, message)
+                }
+            }
+        }
+        None => {
+            let session = agent::native_session::session_id_for_worktree(agent_name, worktree);
+            let message = match &session {
+                Some(id) => format!("Recovered pane resumes the worktree's own session {id}"),
+                None => format!(
+                    "No {agent_name} session was started in {}; recovered pane starts fresh",
+                    worktree.display()
+                ),
+            };
+            (
+                RecoveryTarget {
+                    session,
+                    redeliver: None,
+                },
+                message,
+            )
+        }
+    };
     if let Some(db) = db {
-        let mut event = crate::db::TaskExecutionEvent::new(
-            task_id,
-            if session.is_some() {
-                "agent_session_resumed"
-            } else {
-                "agent_resume_fresh_fallback"
-            },
-        );
+        let event_type = if target.session.is_some() {
+            "agent_session_resumed"
+        } else if target.redeliver.is_some() {
+            "agent_state_prompt_redelivered"
+        } else {
+            "agent_resume_fresh_fallback"
+        };
+        let mut event = crate::db::TaskExecutionEvent::new(task_id, event_type);
+        if let Some((state, attempt, _)) = &state_prompt {
+            event.state = Some(state.clone());
+            event.workflow_attempt = Some(*attempt);
+        }
         event.agent = Some(agent_name.to_string());
-        event.outcome = Some(if session.is_some() { "resumed" } else { "fresh" }.to_string());
-        event.message = Some(match &session {
-            Some(id) => format!("Recovered pane resumes the worktree's own session {id}"),
-            None => format!(
-                "No {agent_name} session was started in {}; recovered pane starts fresh",
-                worktree.display()
-            ),
-        });
+        event.outcome = Some(
+            if target.session.is_some() {
+                "resumed"
+            } else {
+                "fresh"
+            }
+            .to_string(),
+        );
+        event.message = Some(message);
         let _ = db.record_task_execution_event(&event);
     }
-    session
+    target
 }
 
 /// Gracefully switch the agent running in a tmux window.
@@ -13848,6 +14083,7 @@ pub(crate) fn switch_agent_in_tmux(
     tmux_ops: &dyn TmuxOperations,
     target: &str,
     current_agent: &str,
+    new_agent: &str,
     new_agent_cmd: &str,
 ) -> anyhow::Result<()> {
     // 1. Send the graceful exit command for the current agent.
@@ -14013,24 +14249,43 @@ pub(crate) fn switch_agent_in_tmux(
     //    yet the old check declared victory because "codex" is a known agent
     //    name. When `found_shell` is false, a pane still reporting the
     //    previous agent's own process name does not count as launched.
+    //
+    //    When the destination agent is known, only *its* process counts as
+    //    launched. The looser "any agent, or node" reading below once accepted
+    //    a Codex that had never exited (tmux reported its Node launcher as
+    //    `node`) as the OpenCode it was being replaced by, and the next role's
+    //    prompt was then pasted into Codex.
     let previous_agent_process_names: &[&str] =
         agent::spec(current_agent).map_or(&[], |spec| spec.process_names);
+    let destination_process_names: &[&str] =
+        agent::spec(new_agent).map_or(&[], |spec| spec.process_names);
     for _ in 0..10 {
         // 10s max
         std::thread::sleep(std::time::Duration::from_secs(1));
         if let Some(cmd) = tmux_ops.pane_current_command(target) {
+            let cmd = cmd.trim();
+            if !destination_process_names.is_empty() {
+                if destination_process_names.iter().any(|name| cmd == *name) {
+                    return Ok(());
+                }
+                continue;
+            }
             let looks_like_a_known_agent =
                 AGENT_COMMANDS.iter().any(|a| cmd.contains(a)) || cmd.contains("node");
-            let still_the_previous_agent = !found_shell
-                && previous_agent_process_names
-                    .iter()
-                    .any(|name| cmd.contains(name));
+            let still_the_previous_agent = previous_agent_process_names
+                .iter()
+                .any(|name| cmd.contains(name))
+                && current_agent != new_agent;
             if looks_like_a_known_agent && !still_the_previous_agent {
                 return Ok(());
             }
         }
     }
-    anyhow::bail!("agent switch did not start a process in tmux pane '{target}'")
+    anyhow::bail!(
+        "agent switch did not start a process for '{new_agent}' in tmux pane '{target}' \
+         (pane reports '{}')",
+        tmux_ops.pane_current_command(target).unwrap_or_default()
+    )
 }
 
 /// Wait for an agent in a tmux pane to be ready for input.
