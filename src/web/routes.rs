@@ -249,6 +249,9 @@ struct TaskCard {
     branch_name: Option<String>,
     pr_number: Option<i32>,
     escalation_note: Option<String>,
+    /// `"conflicts"` or `"blocked"` while the workflow executor's merge into
+    /// the target is unresolved; the reason is in `escalation_note`.
+    integration_status: Option<String>,
     updated_at: String,
     deps_satisfied: bool,
     /// Dependency ids still short of Review/Done. The board splits Backlog on
@@ -423,6 +426,7 @@ fn card(
         branch_name: t.branch_name,
         pr_number: t.pr_number,
         escalation_note: t.escalation_note,
+        integration_status: t.integration_status,
         updated_at: t.updated_at.to_rfc3339(),
     }
 }

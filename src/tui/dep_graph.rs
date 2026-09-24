@@ -230,19 +230,23 @@ mod tests {
             referenced_tasks: refs.map(|s| s.to_string()),
             escalation_note: None,
             base_branch: None,
+            integration_status: None,
+            integration_conflicts: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
     }
 
     /// Mirror of Database::deps_satisfied for tests: deps satisfied when every
-    /// referenced task in `tasks` is Review/Done (missing => satisfied).
+    /// referenced task in `tasks` is Review/Done with no unresolved integration
+    /// (missing => satisfied).
     fn satisfied_fn(tasks: Vec<Task>) -> impl Fn(&Task) -> bool {
         move |t: &Task| {
             let refs = parse_refs(&t.referenced_tasks);
             refs.iter().all(|rid| {
                 tasks.iter().find(|x| &x.id == rid).map_or(true, |dep| {
                     matches!(dep.status, TaskStatus::Review | TaskStatus::Done)
+                        && !dep.has_unresolved_integration()
                 })
             })
         }

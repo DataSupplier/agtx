@@ -299,6 +299,18 @@ fn task_matches_export(
         && task.base_branch == *base_branch
 }
 
+/// `Task::integration_conflicts` as a list: the column stores the conflicting
+/// paths comma-separated, the MCP surface reports them one per entry.
+fn integration_conflict_list(conflicts: Option<&str>) -> Vec<String> {
+    conflicts
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 // === Response types ===
 
 #[derive(Serialize)]
@@ -324,6 +336,16 @@ struct TaskSummary {
     /// Dependency ids still short of Review/Done — empty when the task can be
     /// picked up. Names *what* to wait for, next to `deps_satisfied`'s whether.
     blocked_by: Vec<String>,
+    /// `"conflicts"` or `"blocked"` while the executor's merge into the
+    /// workflow target is unresolved (details in `escalation_note`); absent
+    /// otherwise.
+    integration_status: Option<String>,
+    /// Paths that conflict with the workflow target; empty unless
+    /// `integration_status` is `"conflicts"`.
+    integration_conflicts: Vec<String>,
+    /// Why the task needs a person: an agent's escalation, or the reason an
+    /// unresolved integration is stuck.
+    escalation_note: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -344,6 +366,12 @@ struct TaskDetail {
     referenced_tasks: Option<String>,
     base_branch: Option<String>,
     escalation_note: Option<String>,
+    /// `"conflicts"` or `"blocked"` while the executor's merge into the
+    /// workflow target is unresolved (details in `escalation_note`); absent
+    /// otherwise.
+    integration_status: Option<String>,
+    /// Paths that conflict with the workflow target.
+    integration_conflicts: Vec<String>,
     created_at: String,
     updated_at: String,
     /// Whether all referenced_tasks (dependencies) are in Review or Done.
@@ -599,6 +627,9 @@ impl AgtxMcpServer {
                                 let dep_state = db.dependency_state(&t);
                                 let deps_satisfied = dep_state.is_ready();
                                 let blocked_by = dep_state.blocked_by().to_vec();
+                                let integration_conflicts = integration_conflict_list(
+                                    t.integration_conflicts.as_deref(),
+                                );
                                 TaskSummary {
                                     id: t.id,
                                     title: t.title,
@@ -612,6 +643,9 @@ impl AgtxMcpServer {
                                     base_branch: t.base_branch,
                                     deps_satisfied,
                                     blocked_by,
+                                    integration_status: t.integration_status,
+                                    integration_conflicts,
+                                    escalation_note: t.escalation_note,
                                 }
                             })
                             .collect();
@@ -670,6 +704,8 @@ impl AgtxMcpServer {
                         .to_string()
                     });
                     let blocked_reason = hook.as_ref().and_then(|h| h.message.clone());
+                    let integration_conflicts =
+                        integration_conflict_list(t.integration_conflicts.as_deref());
 
                     let detail = TaskDetail {
                         id: t.id,
@@ -688,6 +724,8 @@ impl AgtxMcpServer {
                         referenced_tasks: t.referenced_tasks,
                         base_branch: t.base_branch,
                         escalation_note: t.escalation_note,
+                        integration_status: t.integration_status,
+                        integration_conflicts,
                         created_at: t.created_at.to_rfc3339(),
                         updated_at: t.updated_at.to_rfc3339(),
                         deps_satisfied: deps_ok,
@@ -1562,4 +1600,18 @@ fn filtered_stdio() -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
     });
 
     (rmcp_reader, rmcp_writer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::integration_conflict_list;
+
+    #[test]
+    fn integration_conflicts_are_reported_one_path_per_entry() {
+        assert_eq!(
+            integration_conflict_list(Some("a.rs, nuxt-app/b.vue,,")),
+            vec!["a.rs".to_string(), "nuxt-app/b.vue".to_string()]
+        );
+        assert!(integration_conflict_list(None).is_empty());
+    }
 }

@@ -907,6 +907,8 @@ fn test_create_pr_with_content_success() {
         referenced_tasks: None,
         escalation_note: None,
         base_branch: None,
+        integration_status: None,
+        integration_conflicts: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -1006,6 +1008,8 @@ fn test_create_pr_with_content_no_changes() {
         referenced_tasks: None,
         escalation_note: None,
         base_branch: None,
+        integration_status: None,
+        integration_conflicts: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -1064,6 +1068,8 @@ fn test_create_pr_with_content_push_failure() {
         referenced_tasks: None,
         escalation_note: None,
         base_branch: None,
+        integration_status: None,
+        integration_conflicts: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -1128,6 +1134,8 @@ fn test_push_changes_to_existing_pr_success() {
         referenced_tasks: None,
         escalation_note: None,
         base_branch: None,
+        integration_status: None,
+        integration_conflicts: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -1183,6 +1191,8 @@ fn test_push_changes_to_existing_pr_no_changes() {
         referenced_tasks: None,
         escalation_note: None,
         base_branch: None,
+        integration_status: None,
+        integration_conflicts: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -1221,6 +1231,8 @@ fn test_push_changes_to_existing_pr_no_url() {
         referenced_tasks: None,
         escalation_note: None,
         base_branch: None,
+        integration_status: None,
+        integration_conflicts: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -5745,6 +5757,13 @@ fn test_write_skills_to_worktree_mcp_codex() {
     let content = std::fs::read_to_string(&cfg).unwrap();
     assert!(content.contains("[mcp_servers.agtx]"));
     assert!(content.contains("mcp-serve"));
+    // Codex runs with `--ask-for-approval never`; without this the agent's
+    // own `move_task` (escalations included) is refused.
+    let parsed: toml::Value = toml::from_str(&content).unwrap();
+    assert_eq!(
+        parsed["mcp_servers"]["agtx"]["default_tools_approval_mode"].as_str(),
+        Some("approve")
+    );
 }
 
 #[test]
