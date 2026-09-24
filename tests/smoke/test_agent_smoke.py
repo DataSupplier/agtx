@@ -268,13 +268,13 @@ class Checks(unittest.TestCase):
         "• Implementation complete. Summary written to .agtx/execute.md.",
         "",
         "› Use /skills to list available skills",
-        "  gpt-5.6-sol default · /private/tmp/…",
+        "  gpt-6-luna default · /private/tmp/…",
     ])
     CODEX_PARKED = "\n".join([
         "• Implementation complete. Summary written to .agtx/execute.md.",
         "",
         "› $agtx-review",
-        "  gpt-5.6-sol default · /private/tmp/…",
+        "  gpt-6-luna default · /private/tmp/…",
     ])
     CURSOR_BEFORE = "\n".join([
         "  Implementation complete. Summary written to .agtx/execute.md.",
@@ -332,9 +332,9 @@ class Checks(unittest.TestCase):
         sent it with, so `$agtx-review` comes back as `agtx-review`. Matching the
         sent string alone would read that echo as the agent's output."""
         pane = self.CODEX_PARKED.replace(
-            "  gpt-5.6-sol default · /private/tmp/…",
+            "  gpt-6-luna default · /private/tmp/…",
             "  agtx-review  [Skill] Self-review completed work.\n"
-            "  gpt-5.6-sol default · /private/tmp/…",
+            "  gpt-6-luna default · /private/tmp/…",
         )
         check = smoke.check_command_submitted(
             pane, "$agtx-review", False, self.CODEX_BEFORE

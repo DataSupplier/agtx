@@ -14888,7 +14888,7 @@ const CODEX_SUBMITTED: &str = "\
 • Ran sed -n '1,240p' .codex/skills/agtx-review/SKILL.md
 • Working (6s • esc to interrupt)
 › Use /skills to list available skills
-  gpt-5.6-sol default · /private/tmp/…";
+  gpt-6-luna default · /private/tmp/…";
 
 /// cursor-agent 2026.08.25, parked with its picker open — the state
 /// `submit_message` actually sees, not the tidied one left behind afterwards.

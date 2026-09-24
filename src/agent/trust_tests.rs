@@ -96,7 +96,7 @@ fn codex_trust_is_read_from_a_general_toml_config() {
         h.path(),
         ".codex/config.toml",
         r#"
-model = "gpt-5.6-sol"
+model = "gpt-6-luna"
 
 [mcp_servers.something]
 command = "elsewhere"
