@@ -254,7 +254,7 @@ struct TaskCard {
     integration_status: Option<String>,
     updated_at: String,
     deps_satisfied: bool,
-    /// Dependency ids still short of Review/Done. The board splits Backlog on
+    /// Dependency ids not merged (Done) yet. The board splits Backlog on
     /// `deps_satisfied`; this says what a blocked card is waiting for.
     blocked_by: Vec<String>,
     allowed_actions: Vec<String>,

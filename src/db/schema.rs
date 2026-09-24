@@ -1539,11 +1539,12 @@ impl Database {
     /// Classify a task's referenced_tasks (dependencies) as Ready, Blocked or
     /// Missing.
     ///
-    /// A dependency with an unresolved integration
-    /// ([`Task::has_unresolved_integration`]) blocks even in Review or Done:
-    /// its work has not reached the branch dependents start from.
+    /// A dependency counts only once it is merged into its target
+    /// ([`Task::satisfies_dependents`]: Done, no unresolved integration). A
+    /// task in Review is not merged yet, so dependents started then would
+    /// begin from a branch without its work.
     ///
-    /// An existing dependency short of Review/Done outranks a deleted one: a
+    /// An existing unmerged dependency outranks a deleted one: a
     /// task with both is Blocked, and only once the real blockers clear does
     /// the Missing list surface. Both lists carry every id, not the first.
     pub fn dependency_state(&self, task: &Task) -> DependencyState {
@@ -1556,12 +1557,7 @@ impl Database {
         for ref_id in refs_str.split(',').filter(|s| !s.is_empty()) {
             match self.get_task(ref_id).ok().flatten() {
                 Some(dep) => {
-                    // An unresolved integration (conflicts or another block)
-                    // means the dependency's work is not on the branch
-                    // dependents start from, whatever its status says.
-                    if !matches!(dep.status, TaskStatus::Review | TaskStatus::Done)
-                        || dep.has_unresolved_integration()
-                    {
+                    if !dep.satisfies_dependents() {
                         blocked.push(dep.id);
                     }
                 }
@@ -1577,8 +1573,8 @@ impl Database {
         }
     }
 
-    /// Check whether all referenced_tasks (dependencies) are in Review or Done
-    /// with no unresolved integration.
+    /// Check whether all referenced_tasks (dependencies) are merged into their
+    /// target ([`Task::satisfies_dependents`]).
     /// Returns true if the task has no dependencies or all deps are satisfied.
     /// Deleted dependencies count as satisfied.
     pub fn deps_satisfied(&self, task: &Task) -> bool {

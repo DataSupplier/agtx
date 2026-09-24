@@ -152,7 +152,7 @@ fn visible_column_range(selected: usize, width: u16) -> std::ops::Range<usize> {
 }
 
 /// The prefix a blocked Backlog card wears: the lock glyph plus how many
-/// dependencies are still short of Review/Done. The count is what tells apart
+/// dependencies are not merged (Done) yet. The count is what tells apart
 /// "one more review away" from "waiting on four things".
 fn blocked_badge(blocked_count: usize) -> String {
     format!("\u{2298}{blocked_count} ")
@@ -5998,7 +5998,7 @@ impl App {
                 if let Some(db) = &self.state.db {
                     if !db.deps_satisfied(&task) {
                         self.state.warning_message = Some((
-                            "Dependencies not in Review/Done — cannot start task".to_string(),
+                            "Dependencies not merged (Done) yet — cannot start task".to_string(),
                             Instant::now(),
                         ));
                         return Ok(());
@@ -7270,7 +7270,7 @@ impl App {
             // Block research when dependencies are not satisfied
             if task.status == TaskStatus::Backlog && !db.deps_satisfied(&task) {
                 self.state.warning_message = Some((
-                    "Dependencies not in Review/Done — cannot start task".to_string(),
+                    "Dependencies not merged (Done) yet — cannot start task".to_string(),
                     Instant::now(),
                 ));
                 return Ok(());
@@ -7958,7 +7958,7 @@ impl App {
         if let Some(db) = &self.state.db {
             if !db.deps_satisfied(&task) {
                 self.state.warning_message = Some((
-                    "Dependencies not in Review/Done — cannot start task".to_string(),
+                    "Dependencies not merged (Done) yet — cannot start task".to_string(),
                     Instant::now(),
                 ));
                 return Ok(());
@@ -8500,7 +8500,7 @@ impl App {
             "move_forward" | "move_to_planning" | "move_to_running" | "research"
         );
         if is_forward && task.status == TaskStatus::Backlog && !db.deps_satisfied(&task) {
-            anyhow::bail!("Cannot advance task: dependencies not in Review/Done");
+            anyhow::bail!("Cannot advance task: dependencies not merged (Done) yet");
         }
 
         match req.action.as_str() {

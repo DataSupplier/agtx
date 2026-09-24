@@ -42,7 +42,8 @@ pub const MAX_TASK_TITLE_CHARS: usize = 120;
 /// The actions `task` currently permits, named as the MCP `move_task` verbs.
 ///
 /// `deps_satisfied` comes from [`crate::db::Database::deps_satisfied`]: a task
-/// whose referenced tasks are not yet in Review or Done cannot leave Backlog.
+/// whose referenced tasks are not merged yet (`Task::satisfies_dependents`)
+/// cannot leave Backlog.
 pub fn allowed_actions(task: &Task, deps_satisfied: bool, caller: CallerKind) -> Vec<String> {
     let mut actions: Vec<String> = Vec::new();
 
@@ -155,7 +156,7 @@ pub fn validate_action(
         )
     {
         return Err(ActionRefusal::NotPermitted(format!(
-            "{action} is blocked: this task's dependencies are not all in Review or Done yet"
+            "{action} is blocked: this task's dependencies are not all merged (Done) yet"
         )));
     }
 

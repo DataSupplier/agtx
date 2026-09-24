@@ -204,7 +204,7 @@ export const PRIMARY_ACTION = {
 };
 
 /// The board's six lanes, in board order. `backlog` carries research, and it
-/// splits in two: a backlog task whose dependencies are all in Review/Done
+/// splits in two: a backlog task whose dependencies are all merged (Done)
 /// shows up under Ready, so what can be picked up now is visible without
 /// opening a card. `ready` is a lane, never a status — the server stores
 /// `backlog` for both, and the same actions apply to each.

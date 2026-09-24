@@ -217,7 +217,7 @@ Three types keep the questions apart:
 
 - `TaskStatus` — where a task is in its lifecycle. Unchanged, still five variants.
 - `DependencyState` (`db/models.rs`) — `Ready | Blocked(ids) | Missing(ids)`, computed by
-  `Database::dependency_state`. An existing dependency short of Review/Done outranks a deleted one,
+  `Database::dependency_state`. An existing unmerged dependency outranks a deleted one,
   so a task with both is `Blocked`; `Missing` surfaces only once the real blockers clear.
   `deps_satisfied()` is `dependency_state().is_ready()`, which keeps deleted dependencies
   non-blocking as before.
@@ -1300,7 +1300,7 @@ writes one.
 - In description input, type `!` (at start of line or after space) to search existing tasks
 - Selecting a task inserts `![task-title]` and tracks the reference ID
 - Referenced task IDs stored as comma-separated string in `task.referenced_tasks`
-- References double as **dependencies**: `Database::deps_satisfied` returns true only when every referenced task is in Review or Done **and** has no unresolved workflow integration (`Task::integration_status` unset — see *Workflow Integration* below). Starting research or moving a Backlog task forward is blocked until then (a warning is shown instead). `Database::dependency_state` answers the same question in more detail (`Ready` / `Blocked(ids)` / `Missing(ids)`) and is what the board's Ready lane projects from
+- References double as **dependencies**: `Database::deps_satisfied` returns true only when every referenced task is **merged into its target** — `Task::satisfies_dependents`: Done, with no unresolved workflow integration (`Task::integration_status` unset — see *Workflow Integration* below). Review is not enough: a task under review is not merged, so a dependent started then would begin from a branch without its work. Starting research or moving a Backlog task forward is blocked until then (a warning is shown instead). `Database::dependency_state` answers the same question in more detail (`Ready` / `Blocked(ids)` / `Missing(ids)`) and is what the board's Ready lane projects from
 - `src/tui/dep_graph.rs` builds a topologically-leveled `DepGraph` from `referenced_tasks` — level 0 = no in-graph deps, and a node is `unblocked` when it is in Backlog with satisfied deps. The `D` overlay renders it and can batch-move unblocked tasks. The module is free of ratatui/DB types (the caller passes a `deps_satisfied` closure), so it is unit-testable in isolation
 - MCP `create_tasks_batch` wires the same dependencies via 0-based `depends_on` indices
 - At worktree setup, referenced tasks' artifacts are copied to `.agtx/references/`:
@@ -1312,7 +1312,7 @@ writes one.
 - **Clean** — merge into the configured target checkout (which must be clean and on the target, and may never be `main`), push it, advance to `done`
 - **Conflicts** — `Task::integration_status = "conflicts"`, the paths in `integration_conflicts`, a pull request against the target when the state policy sets `create_or_update_task_pr` (`GitProviderOperations::create_pr`, via `WorkflowRuntime::git_provider_ops`), and an `escalation_note` naming both. The card wears a red `⇆`
 - **Blocked** — any other failure (a dirty target checkout, a failed push or fetch, a task branch that diverged from its remote): `integration_status = "blocked"` with the reason in `escalation_note`
-While `integration_status` is set, `assess` skips the artifact-freshness gate (the first attempt consumed the artifact) and re-fires the step every `INTEGRATION_RETRY_SECONDS`, the task never satisfies a dependency, and the journal gets `integration_unresolved` once per change of reason. A retry first adopts what happened outside the container: a task branch already contained in `origin/<target>` (or a pull request the provider reports merged — squash merges) fast-forwards the target checkout and completes the task; new commits on `origin/<task branch>` (the pull request's conflict editor, a local checkout) are fast-forwarded into the worktree before the merge is re-checked. Success clears the status and journals `integration_resolved`. MCP `list_tasks`/`get_task` report `integration_status`, `integration_conflicts` and `escalation_note`.
+While `integration_status` is set, `assess` skips the artifact-freshness gate (the first attempt consumed the artifact) and re-fires the step every `INTEGRATION_RETRY_SECONDS`, the task stays out of Done (so it cannot satisfy a dependency), and the journal gets `integration_unresolved` once per change of reason. A retry first adopts what happened outside the container: a task branch already contained in `origin/<target>` (or a pull request the provider reports merged — squash merges) fast-forwards the target checkout and completes the task; new commits on `origin/<task branch>` (the pull request's conflict editor, a local checkout) are fast-forwarded into the worktree before the merge is re-checked. Success clears the status and journals `integration_resolved`. MCP `list_tasks`/`get_task` report `integration_status`, `integration_conflicts` and `escalation_note`.
 
 ### Auto Merge-Conflict Resolution
 - During `apply_session_refresh`, Review tasks are checked for merge conflicts with the default branch (main/master)

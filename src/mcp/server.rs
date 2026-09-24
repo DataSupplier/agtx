@@ -333,7 +333,8 @@ struct TaskSummary {
     referenced_tasks: Option<String>,
     base_branch: Option<String>,
     deps_satisfied: bool,
-    /// Dependency ids still short of Review/Done — empty when the task can be
+    /// Dependency ids not merged yet (not Done, or integration unresolved) —
+    /// empty when the task can be
     /// picked up. Names *what* to wait for, next to `deps_satisfied`'s whether.
     blocked_by: Vec<String>,
     /// `"conflicts"` or `"blocked"` while the executor's merge into the
@@ -374,9 +375,10 @@ struct TaskDetail {
     integration_conflicts: Vec<String>,
     created_at: String,
     updated_at: String,
-    /// Whether all referenced_tasks (dependencies) are in Review or Done.
+    /// Whether all referenced_tasks (dependencies) are merged (Done, no
+    /// unresolved integration).
     deps_satisfied: bool,
-    /// Dependencies that are not yet in Review or Done status.
+    /// Dependencies that are not merged yet.
     blocking_tasks: Vec<BlockingTask>,
     /// Referenced ids with no task behind them. A deleted dependency does not
     /// block, so these are reported rather than counted as blockers.
@@ -779,7 +781,7 @@ impl AgtxMcpServer {
                     && task.status == TaskStatus::Backlog
                     && !db.deps_satisfied(&task)
                 {
-                    return "Cannot advance task: dependencies not in Review/Done. Use get_task to see blocking_tasks.".to_string();
+                    return "Cannot advance task: dependencies not merged (Done) yet. Use get_task to see blocking_tasks.".to_string();
                 }
 
                 let mut req = TransitionRequest::new(&params.task_id, &params.action);
