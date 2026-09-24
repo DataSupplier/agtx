@@ -195,7 +195,8 @@ problem**, so agtx implements the model directly:
 
 The dependency graph gives the blackboard its structure. Tasks references they build on,
 forming a graph of partial solutions - agtx holds downstream tasks until their dependencies reach
-Review or Done, then carries the relevant diffs and artifacts into the dependent task's context.
+Review or Done (and, for a workflow task, merge into its target without unresolved conflicts), then
+carries the relevant diffs and artifacts into the dependent task's context.
 
 ```
         ┌───────────────────────────────────────────────────────────┐

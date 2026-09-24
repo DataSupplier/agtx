@@ -72,6 +72,11 @@ pub fn allowed_actions(task: &Task, deps_satisfied: bool, caller: CallerKind) ->
         TaskStatus::Review => {
             actions.push("move_to_done".to_string());
             actions.push("resume".to_string());
+            // Review hosts the workflow's review, validation and integration
+            // states; their agents need the same "stop and ask" exit.
+            if caller == CallerKind::Orchestrator {
+                actions.push("escalate_to_user".to_string());
+            }
             // Safety valve for a pane whose agent lost the current workflow
             // state's prompt: re-deliver the stored prompt to the same agent.
             if caller == CallerKind::Human && task.worktree_path.is_some() {
@@ -174,6 +179,29 @@ mod tests {
         task.status = status;
         task.worktree_path = worktree.then(|| "/wt/t".to_string());
         task
+    }
+
+    /// Review hosts the workflow's review, validation and integration states,
+    /// so their agents can escalate from there too; people never get the
+    /// action, they are already looking at the task.
+    #[test]
+    fn escalate_to_user_reaches_orchestrated_agents_in_review() {
+        for status in [
+            TaskStatus::Planning,
+            TaskStatus::Running,
+            TaskStatus::Review,
+        ] {
+            assert!(
+                allowed_actions(&task(status, true), true, CallerKind::Orchestrator)
+                    .contains(&"escalate_to_user".to_string()),
+                "{status:?}"
+            );
+            assert!(
+                !allowed_actions(&task(status, true), true, CallerKind::Human)
+                    .contains(&"escalate_to_user".to_string()),
+                "{status:?}"
+            );
+        }
     }
 
     /// The prompt-resend safety valve is a person's tool for a task with a

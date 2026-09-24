@@ -313,6 +313,12 @@ impl Database {
         let _ = self
             .conn
             .execute("ALTER TABLE tasks ADD COLUMN base_branch TEXT", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE tasks ADD COLUMN integration_status TEXT", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE tasks ADD COLUMN integration_conflicts TEXT", []);
 
         // Migration: state_attempt is a generation counter for the current
         // entry into whatever state a task occupies. Existing rows predate
@@ -479,8 +485,8 @@ impl Database {
     pub fn create_task(&self, task: &Task) -> Result<()> {
         self.conn.execute(
             r#"
-            INSERT INTO tasks (id, title, description, status, agent, project_id, session_name, worktree_path, branch_name, pr_number, pr_url, plugin, cycle, referenced_tasks, escalation_note, base_branch, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+            INSERT INTO tasks (id, title, description, status, agent, project_id, session_name, worktree_path, branch_name, pr_number, pr_url, plugin, cycle, referenced_tasks, escalation_note, base_branch, integration_status, integration_conflicts, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
             "#,
             params![
                 task.id,
@@ -499,6 +505,8 @@ impl Database {
                 task.referenced_tasks,
                 task.escalation_note,
                 task.base_branch,
+                task.integration_status,
+                task.integration_conflicts,
                 task.created_at.to_rfc3339(),
                 task.updated_at.to_rfc3339(),
             ],
@@ -511,8 +519,8 @@ impl Database {
         for task in tasks {
             tx.execute(
                 r#"
-                INSERT INTO tasks (id, title, description, status, agent, project_id, session_name, worktree_path, branch_name, pr_number, pr_url, plugin, cycle, referenced_tasks, escalation_note, base_branch, created_at, updated_at)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                INSERT INTO tasks (id, title, description, status, agent, project_id, session_name, worktree_path, branch_name, pr_number, pr_url, plugin, cycle, referenced_tasks, escalation_note, base_branch, integration_status, integration_conflicts, created_at, updated_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
                 "#,
                 params![
                     task.id,
@@ -531,6 +539,8 @@ impl Database {
                     task.referenced_tasks,
                     task.escalation_note,
                     task.base_branch,
+                    task.integration_status,
+                    task.integration_conflicts,
                     task.created_at.to_rfc3339(),
                     task.updated_at.to_rfc3339(),
                 ],
@@ -558,7 +568,9 @@ impl Database {
                 referenced_tasks = ?13,
                 escalation_note = ?14,
                 base_branch = ?15,
-                updated_at = ?16
+                integration_status = ?16,
+                integration_conflicts = ?17,
+                updated_at = ?18
             WHERE id = ?1
             "#,
             params![
@@ -577,6 +589,8 @@ impl Database {
                 task.referenced_tasks,
                 task.escalation_note,
                 task.base_branch,
+                task.integration_status,
+                task.integration_conflicts,
                 task.updated_at.to_rfc3339(),
             ],
         )?;
@@ -781,7 +795,7 @@ impl Database {
         let tx = self.conn.transaction()?;
         let now = chrono::Utc::now();
         tx.execute(
-            "UPDATE tasks SET status = 'backlog', session_name = NULL, worktree_path = NULL, branch_name = NULL, base_branch = NULL, pr_number = NULL, pr_url = NULL, escalation_note = NULL, updated_at = ?2 WHERE id = ?1",
+            "UPDATE tasks SET status = 'backlog', session_name = NULL, worktree_path = NULL, branch_name = NULL, base_branch = NULL, pr_number = NULL, pr_url = NULL, escalation_note = NULL, integration_status = NULL, integration_conflicts = NULL, updated_at = ?2 WHERE id = ?1",
             params![task.id, now.to_rfc3339()],
         )?;
         // Inputs reference immutable evidence, so clear inputs first.
@@ -1477,6 +1491,8 @@ impl Database {
             referenced_tasks: row.get("referenced_tasks").ok().flatten(),
             escalation_note: row.get("escalation_note").ok().flatten(),
             base_branch: row.get("base_branch").ok().flatten(),
+            integration_status: row.get("integration_status").ok().flatten(),
+            integration_conflicts: row.get("integration_conflicts").ok().flatten(),
             created_at: chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>("created_at")?)
                 .map(|dt| dt.with_timezone(&chrono::Utc))
                 .unwrap_or_else(|_| chrono::Utc::now()),
@@ -1523,6 +1539,10 @@ impl Database {
     /// Classify a task's referenced_tasks (dependencies) as Ready, Blocked or
     /// Missing.
     ///
+    /// A dependency with an unresolved integration
+    /// ([`Task::has_unresolved_integration`]) blocks even in Review or Done:
+    /// its work has not reached the branch dependents start from.
+    ///
     /// An existing dependency short of Review/Done outranks a deleted one: a
     /// task with both is Blocked, and only once the real blockers clear does
     /// the Missing list surface. Both lists carry every id, not the first.
@@ -1536,7 +1556,12 @@ impl Database {
         for ref_id in refs_str.split(',').filter(|s| !s.is_empty()) {
             match self.get_task(ref_id).ok().flatten() {
                 Some(dep) => {
-                    if !matches!(dep.status, TaskStatus::Review | TaskStatus::Done) {
+                    // An unresolved integration (conflicts or another block)
+                    // means the dependency's work is not on the branch
+                    // dependents start from, whatever its status says.
+                    if !matches!(dep.status, TaskStatus::Review | TaskStatus::Done)
+                        || dep.has_unresolved_integration()
+                    {
                         blocked.push(dep.id);
                     }
                 }
@@ -1552,7 +1577,8 @@ impl Database {
         }
     }
 
-    /// Check whether all referenced_tasks (dependencies) are in Review or Done.
+    /// Check whether all referenced_tasks (dependencies) are in Review or Done
+    /// with no unresolved integration.
     /// Returns true if the task has no dependencies or all deps are satisfied.
     /// Deleted dependencies count as satisfied.
     pub fn deps_satisfied(&self, task: &Task) -> bool {

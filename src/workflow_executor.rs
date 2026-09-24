@@ -18,7 +18,7 @@ use crate::db::{
     Database, ProviderSession, Task, TaskExecutionEvent, TaskStatus, TaskStepReport,
     WorkflowArtifact, WorkflowStepInput, WorkflowTaskState, WorkflowTransitionRecord,
 };
-use crate::git::GitOperations;
+use crate::git::{GitOperations, GitProviderOperations, PullRequestState};
 use crate::tmux::TmuxOperations;
 use crate::tui::app::{
     agtx_task_env, archive_workflow_artifact, build_policy_agent_command,
@@ -772,6 +772,10 @@ pub struct WorkflowRuntime<'a> {
     /// Reads the providers' own session stores to tell whether an agent is
     /// mid-turn and whether a prompt reached the intended agent.
     pub session_probe: &'a dyn crate::agent::native_session::SessionProbe,
+    /// Opens the pull request for a task whose integration conflicts, so the
+    /// conflict can be resolved outside the task's container. `None` skips
+    /// that step; the branch is still pushed.
+    pub git_provider_ops: Option<&'a Arc<dyn GitProviderOperations>>,
 }
 
 /// The outcome of an extracted workflow step.
@@ -2257,10 +2261,50 @@ pub fn submit_final_validation(
     })
 }
 
+/// How long the executor waits between retries of an integration it could not
+/// finish ([`Task::has_unresolved_integration`]). Each retry fetches from the
+/// remote, so it runs on this cadence rather than on every automation tick.
+pub const INTEGRATION_RETRY_SECONDS: i64 = 60;
+
+/// Upper bound for the reason stored in `escalation_note`: git and `gh`
+/// errors can carry whole hook outputs.
+const INTEGRATION_NOTE_LIMIT: usize = 600;
+
+/// Where one integration attempt ended, before it is recorded on the task.
+enum IntegrationAttempt {
+    /// The task branch is in the target: merged by this attempt, or merged on
+    /// the remote (its pull request) and fast-forwarded into the checkout.
+    Integrated { target_branch: String },
+    /// The pushed task branch conflicts with the target.
+    Conflicts {
+        target_branch: String,
+        files: Vec<String>,
+        /// Why no pull request could be opened, when one was due.
+        pull_request_error: Option<String>,
+    },
+}
+
 /// Extracted body of `App::complete_selected_feature_integration`.
 ///
-/// Executes the narrowly-scoped, reviewer-authorized task integration. The
-/// configured target must already be checked out and may never be `main`.
+/// Executes the narrowly-scoped, reviewer-authorized task integration into
+/// the configured target, which may never be `main`. The task branch is
+/// committed and pushed *before* the merge is attempted, so the work always
+/// leaves the task's container, even when the merge cannot happen:
+///
+/// - a clean merge completes the task;
+/// - a conflicting merge records [`INTEGRATION_CONFLICTS`] with the paths,
+///   opens a pull request against the target (when the state policy allows
+///   it) and escalates;
+/// - any other failure records [`INTEGRATION_BLOCKED`] with the reason.
+///
+/// [`assess`] retries both unresolved states every
+/// [`INTEGRATION_RETRY_SECONDS`]. A retry first adopts what happened outside
+/// the container: a resolution pushed to the task branch is fast-forwarded
+/// into the worktree, and a task branch already merged on the remote (its
+/// pull request) completes the task.
+///
+/// [`INTEGRATION_CONFLICTS`]: crate::db::INTEGRATION_CONFLICTS
+/// [`INTEGRATION_BLOCKED`]: crate::db::INTEGRATION_BLOCKED
 pub fn complete_feature_integration(
     workflow: &WorkflowDefinition,
     project_workflow: &WorkflowProjectConfig,
@@ -2295,7 +2339,111 @@ pub fn complete_feature_integration(
             artifact.display()
         );
     }
-    record_step_evidence(db, &task, &current, &task.agent, &artifact, runtime)?;
+    // A retry re-reads the artifact the first attempt already journalled;
+    // recording it again would duplicate that evidence once per retry.
+    if !task.has_unresolved_integration() {
+        record_step_evidence(db, &task, &current, &task.agent, &artifact, runtime)?;
+    }
+
+    let attempt = attempt_feature_integration(
+        workflow,
+        project_workflow,
+        &mut task,
+        &current,
+        Path::new(&worktree),
+        &branch,
+        runtime,
+    );
+    let target_branch = match attempt {
+        Ok(IntegrationAttempt::Integrated { target_branch }) => target_branch,
+        Ok(IntegrationAttempt::Conflicts {
+            target_branch,
+            files,
+            pull_request_error,
+        }) => {
+            let pull_request = match (&task.pr_url, pull_request_error) {
+                (Some(url), _) => format!("Pull request: {url}."),
+                (None, Some(error)) => format!(
+                    "Branch '{branch}' is pushed; no pull request could be opened: {error}."
+                ),
+                (None, None) => format!("Branch '{branch}' is pushed."),
+            };
+            let note = format!(
+                "Has merge conflicts with '{target_branch}': {}. {pull_request} Resolve them on \
+                 the task branch and push, or merge the pull request; AGTX retries on its own.",
+                files.join(", ")
+            );
+            return record_unresolved_integration(
+                db,
+                task,
+                &current,
+                crate::db::INTEGRATION_CONFLICTS,
+                Some(files.join(",")),
+                note,
+            );
+        }
+        Err(error) => {
+            let note = format!(
+                "Integration blocked: {error:#}. AGTX retries on its own once this is resolved."
+            );
+            return record_unresolved_integration(
+                db,
+                task,
+                &current,
+                crate::db::INTEGRATION_BLOCKED,
+                None,
+                note,
+            );
+        }
+    };
+
+    let integration_sha = crate::git::resolve_commit(runtime.project_path, &target_branch)?;
+    let completed = prepare_transition(
+        workflow,
+        project_workflow,
+        &current,
+        "complete_feature_integration",
+        GuardContext {
+            integrated_into_target: true,
+            ..GuardContext::default()
+        },
+    )?;
+    let mut completed_state = completed.state;
+    completed_state.integration_sha = Some(integration_sha);
+    db.advance_workflow_state(&completed_state, &completed.transition)?;
+    if task.has_unresolved_integration() {
+        // The note was the executor's own account of the block; it is settled.
+        task.escalation_note = None;
+        let mut event = TaskExecutionEvent::new(&task.id, "integration_resolved");
+        event.workflow_attempt = Some(current.state_attempt);
+        event.state = Some(current.state.clone());
+        event.outcome = Some("integrated".to_string());
+        event.message = Some(format!("Task integrated into {target_branch}"));
+        db.record_task_execution_event(&event)?;
+    }
+    task.integration_status = None;
+    task.integration_conflicts = None;
+    task.status = TaskStatus::Done;
+    task.updated_at = chrono::Utc::now();
+    db.update_task(&task)?;
+    Ok(WorkflowStepOutcome::Advanced {
+        message: format!("Task integrated into {target_branch}"),
+        task,
+    })
+}
+
+/// The git side of [`complete_feature_integration`]: everything that can
+/// fail for reasons outside the workflow graph. `Err` means "blocked, retry
+/// later"; the caller records it rather than propagating it.
+fn attempt_feature_integration(
+    workflow: &WorkflowDefinition,
+    project_workflow: &WorkflowProjectConfig,
+    task: &mut Task,
+    current: &WorkflowTaskState,
+    worktree: &Path,
+    branch: &str,
+    runtime: &WorkflowRuntime,
+) -> Result<IntegrationAttempt> {
     let policy = project_workflow
         .policy_for_state(workflow, &current.state)?
         .ok_or_else(|| anyhow::anyhow!("Integration state has no role policy"))?;
@@ -2312,60 +2460,185 @@ pub fn complete_feature_integration(
     {
         bail!("Integration state policy does not authorize commit, push, and target merge");
     }
+
+    if task.has_unresolved_integration() {
+        let remote_target = format!("origin/{target_branch}");
+        let remote_branch = format!("origin/{branch}");
+        let target_on_remote = crate::git::fetch_branch(runtime.project_path, &target_branch)?;
+        let branch_on_remote = crate::git::fetch_branch(runtime.project_path, branch)?;
+        let merged_on_remote = branch_on_remote
+            && target_on_remote
+            && (crate::git::is_ancestor(runtime.project_path, &remote_branch, &remote_target)
+                || pull_request_merged(task, runtime));
+        if merged_on_remote {
+            ensure_target_checkout(runtime, &target_branch)?;
+            crate::git::fast_forward(runtime.project_path, &remote_target)?;
+            return Ok(IntegrationAttempt::Integrated { target_branch });
+        }
+        if branch_on_remote && !crate::git::is_ancestor(worktree, &remote_branch, "HEAD") {
+            // A resolution was pushed to the task branch from outside the
+            // container (the pull request's conflict editor, a local checkout).
+            crate::opencode_profile::strip_opencode_permission_profile(worktree);
+            if runtime.git_ops.has_changes(worktree) {
+                bail!(
+                    "'{remote_branch}' has new commits but the task worktree has uncommitted \
+                     changes; commit or discard them so the worktree can take the pushed branch"
+                );
+            }
+            crate::git::fast_forward(worktree, &remote_branch).map_err(|error| {
+                anyhow::anyhow!(
+                    "the task worktree and '{remote_branch}' have diverged; merge them on the \
+                     task branch and push ({error})"
+                )
+            })?;
+        }
+    }
+
+    // agtx's own OpenCode permission profile is launch-time runtime state, not
+    // task work: never let it be committed and merged into the target branch.
+    crate::opencode_profile::strip_opencode_permission_profile(worktree);
+    if runtime.git_ops.has_changes(worktree) {
+        runtime.git_ops.add_all(worktree)?;
+        runtime
+            .git_ops
+            .commit(worktree, &format!("workflow: complete task {}", task.id))?;
+    }
+    runtime.git_ops.push(worktree, branch, true)?;
+
+    // Refs only: the check needs neither checkout, so a target checkout with
+    // uncommitted work still gets its conflicts reported.
+    let (has_conflicts, files) =
+        crate::git::check_merge_conflicts(runtime.project_path, &target_branch, branch)?;
+    if has_conflicts {
+        let pull_request_error = if policy.role_policy.create_or_update_task_pr {
+            ensure_conflict_pull_request(task, &target_branch, branch, &files, worktree, runtime)
+                .err()
+                .map(|error| format!("{error:#}"))
+        } else {
+            None
+        };
+        return Ok(IntegrationAttempt::Conflicts {
+            target_branch,
+            files,
+            pull_request_error,
+        });
+    }
+
+    ensure_target_checkout(runtime, &target_branch)?;
+    crate::git::merge_branch(
+        runtime.project_path,
+        branch,
+        &format!("workflow: integrate task {}", task.id),
+    )?;
+    runtime
+        .git_ops
+        .push(runtime.project_path, &target_branch, false)?;
+    Ok(IntegrationAttempt::Integrated { target_branch })
+}
+
+/// The configured target checkout must be clean and on the target branch
+/// before the executor writes to it.
+fn ensure_target_checkout(runtime: &WorkflowRuntime, target_branch: &str) -> Result<()> {
     if runtime.git_ops.has_changes(runtime.project_path) {
         bail!("configured target checkout has uncommitted changes; integration is refused");
     }
     if crate::git::current_branch(runtime.project_path)? != target_branch {
         bail!("configured target checkout is not on '{target_branch}'; integration is refused");
     }
-    let (has_conflicts, files) =
-        crate::git::check_merge_conflicts(runtime.project_path, &target_branch, &branch)?;
-    if has_conflicts {
-        bail!(
-            "task branch conflicts with '{target_branch}': {}",
-            files.join(", ")
-        );
+    Ok(())
+}
+
+/// Whether the provider reports the task's pull request as merged. Covers a
+/// squash or rebase merge, which leaves the task branch outside the target's
+/// history.
+fn pull_request_merged(task: &Task, runtime: &WorkflowRuntime) -> bool {
+    match (task.pr_number, runtime.git_provider_ops) {
+        (Some(number), Some(provider)) if number > 0 => matches!(
+            provider.get_pr_state(runtime.project_path, number),
+            Ok(PullRequestState::Merged)
+        ),
+        _ => false,
     }
-    // agtx's own OpenCode permission profile is launch-time runtime state, not
-    // task work: never let it be committed and merged into the target branch.
-    crate::opencode_profile::strip_opencode_permission_profile(Path::new(&worktree));
-    if runtime.git_ops.has_changes(Path::new(&worktree)) {
-        runtime.git_ops.add_all(Path::new(&worktree))?;
-        runtime.git_ops.commit(
-            Path::new(&worktree),
-            &format!("workflow: complete task {}", task.id),
-        )?;
+}
+
+/// Open the pull request a person resolves the conflict on, once per task:
+/// later pushes to the branch update it on their own.
+fn ensure_conflict_pull_request(
+    task: &mut Task,
+    target_branch: &str,
+    branch: &str,
+    files: &[String],
+    worktree: &Path,
+    runtime: &WorkflowRuntime,
+) -> Result<()> {
+    if task.pr_url.is_some() {
+        return Ok(());
     }
-    runtime.git_ops.push(Path::new(&worktree), &branch, true)?;
-    crate::git::merge_branch(
-        runtime.project_path,
-        &branch,
-        &format!("workflow: integrate task {}", task.id),
+    let Some(provider) = runtime.git_provider_ops else {
+        return Ok(());
+    };
+    let file_list = files
+        .iter()
+        .map(|file| format!("- `{file}`"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = format!(
+        "AGTX workflow task `{}`.\n\nMerging `{branch}` into `{target_branch}` conflicts in:\n\n\
+         {file_list}\n\nResolve the conflicts on this branch (here, or by merging \
+         `{target_branch}` into it locally) and push. AGTX retries the integration on its own \
+         and completes the task once the branch merges cleanly; merging this pull request \
+         completes it as well.",
+        task.id
+    );
+    let (number, url) = provider.create_pr(
+        worktree,
+        &task.title,
+        &body,
+        branch,
+        Some(target_branch.to_string()),
     )?;
-    runtime
-        .git_ops
-        .push(runtime.project_path, &target_branch, false)?;
-    let integration_sha = crate::git::resolve_commit(runtime.project_path, &target_branch)?;
-    let completed = prepare_transition(
-        workflow,
-        project_workflow,
-        &current,
-        "complete_feature_integration",
-        GuardContext {
-            integrated_into_target: true,
-            ..GuardContext::default()
-        },
-    )?;
-    let mut completed_state = completed.state;
-    completed_state.integration_sha = Some(integration_sha);
-    db.advance_workflow_state(&completed_state, &completed.transition)?;
-    task.status = TaskStatus::Done;
+    task.pr_number = Some(number);
+    task.pr_url = Some(url);
+    Ok(())
+}
+
+/// Persist an integration that could not finish, and escalate it. The journal
+/// gets one event per change of status or reason, not one per retry.
+fn record_unresolved_integration(
+    db: &Database,
+    mut task: Task,
+    current: &WorkflowTaskState,
+    status: &str,
+    conflicts: Option<String>,
+    note: String,
+) -> Result<WorkflowStepOutcome> {
+    let note = bounded_note(&note);
+    let changed = task.integration_status.as_deref() != Some(status)
+        || task.escalation_note.as_deref() != Some(note.as_str());
+    task.integration_status = Some(status.to_string());
+    task.integration_conflicts = conflicts;
+    task.escalation_note = Some(note.clone());
     task.updated_at = chrono::Utc::now();
     db.update_task(&task)?;
-    Ok(WorkflowStepOutcome::Advanced {
-        message: format!("Task integrated into {target_branch}"),
-        task,
-    })
+    if changed {
+        let mut event = TaskExecutionEvent::new(&task.id, "integration_unresolved");
+        event.workflow_attempt = Some(current.state_attempt);
+        event.state = Some(current.state.clone());
+        event.outcome = Some(status.to_string());
+        event.message = Some(note.clone());
+        db.record_task_execution_event(&event)?;
+    }
+    Ok(WorkflowStepOutcome::Blocked { message: note })
+}
+
+fn bounded_note(note: &str) -> String {
+    let note = note.trim();
+    if note.chars().count() <= INTEGRATION_NOTE_LIMIT {
+        return note.to_string();
+    }
+    let mut bounded: String = note.chars().take(INTEGRATION_NOTE_LIMIT - 1).collect();
+    bounded.push('…');
+    bounded
 }
 
 /// What automation should do next for a task, computed from durable
@@ -2726,6 +2999,11 @@ fn assess_final_validation(
 /// The integration reviewer has supplied the final required evidence. The
 /// executor now owns the push, merge into the admitted non-main target, and
 /// durable completion transition.
+///
+/// An integration the executor already started and could not finish is
+/// retried every [`INTEGRATION_RETRY_SECONDS`] instead: its artifact was
+/// consumed by the first attempt, so the freshness gate would otherwise keep
+/// the task waiting forever.
 fn assess_feature_integration(
     worktree: &str,
     plugin: &WorkflowPlugin,
@@ -2739,7 +3017,12 @@ fn assess_feature_integration(
         &task.id,
         ".agent-flow/integration-ready.yaml",
     );
-    if let Some(decision) = artifact_freshness(&artifact, state, task, db) {
+    if task.has_unresolved_integration() {
+        let since_last_attempt = chrono::Utc::now() - task.updated_at;
+        if since_last_attempt < chrono::Duration::seconds(INTEGRATION_RETRY_SECONDS) {
+            return AutomationDecision::Wait;
+        }
+    } else if let Some(decision) = artifact_freshness(&artifact, state, task, db) {
         return decision;
     }
     let verdict = match workflow_artifact_value(&artifact, "verdict") {
@@ -3687,6 +3970,7 @@ mod launch_tests {
             config: &config,
             flags: &flags,
             session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: None,
         };
 
         let outcome = start_workflow_implementation(
@@ -3855,6 +4139,7 @@ mod launch_tests {
             config: &config,
             flags: &flags,
             session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: None,
         };
 
         let outcome = start_workflow_implementation(
@@ -4020,6 +4305,7 @@ mod launch_tests {
             config: &config,
             flags: &flags,
             session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: None,
         };
 
         let outcome =
@@ -4198,6 +4484,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             config: &config,
             flags: &flags,
             session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: None,
         };
 
         let outcome =
@@ -4368,6 +4655,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             config: &config,
             flags: &flags,
             session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: None,
         };
 
         let outcome = start_workflow_planning(
@@ -4516,6 +4804,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             config: &config,
             flags: &flags,
             session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: None,
         };
 
         let error =
@@ -4667,6 +4956,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             config: &config,
             flags: &flags,
             session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: None,
         };
 
         let outcome =
@@ -4844,6 +5134,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             config: &config,
             flags: &flags,
             session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: None,
         };
 
         let outcome = submit_workflow_implementation(
@@ -4992,6 +5283,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             config: &config,
             flags: &flags,
             session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: None,
         };
 
         let outcome =
@@ -5129,6 +5421,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             config: &config,
             flags: &flags,
             session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: None,
         };
 
         let outcome =
@@ -5194,6 +5487,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             config: &config,
             flags: &flags,
             session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: None,
         };
 
         // Artifact-driven path.
@@ -5403,6 +5697,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             config: &config,
             flags: &flags,
             session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: None,
         };
 
         let outcome =
@@ -5502,6 +5797,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             config: &config,
             flags: &flags,
             session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: None,
         };
 
         let error = submit_plan_review(&graph, &project, &plugin, task.clone(), &mut db, &runtime)
@@ -5566,6 +5862,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             config: &config,
             flags: &flags,
             session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: None,
         };
 
         let outcome =
@@ -5628,6 +5925,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             config: &config,
             flags: &flags,
             session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: None,
         };
 
         let outcome = decide_workflow_plan(
@@ -5726,6 +6024,7 @@ mod handoff_tests {
             config: &config,
             flags: &flags,
             session_probe: probe,
+            git_provider_ops: None,
         };
         hand_off_and_deliver(db, task, &handoff(command), &runtime)
     }
@@ -5908,5 +6207,508 @@ mod handoff_tests {
         assert_eq!(sessions[0].provider_session_id, "ses_implementer");
         assert_eq!(sessions[0].state, "implementing");
         assert_eq!(sessions[0].workflow_attempt, 8);
+    }
+}
+
+/// `complete_feature_integration` against real repositories: a bare `origin`,
+/// the configured target checkout, and a task worktree. The git side is not
+/// mocked because the behaviour under test *is* what git does with the refs.
+#[cfg(test)]
+#[cfg(feature = "test-mocks")]
+mod integration_tests {
+    use super::*;
+    use crate::agent::MockAgentRegistry;
+    use crate::config::{GlobalConfig, MergedConfig, ProjectConfig};
+    use crate::db::{INTEGRATION_BLOCKED, INTEGRATION_CONFLICTS};
+    use crate::git::{MockGitProviderOperations, RealGitOps};
+    use crate::tmux::MockTmuxOperations;
+    use crate::workflow::{WorkflowGuard, WorkflowState, WorkflowTransition};
+
+    const TARGET: &str = "feature/poc";
+    const BRANCH: &str = "task/integrate";
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git must be on PATH for this test");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed in {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// Identity for commits, and byte-exact checkouts whatever the machine's
+    /// global `core.autocrlf` says.
+    fn identify(dir: &Path) {
+        git(dir, &["config", "user.email", "test@example.com"]);
+        git(dir, &["config", "user.name", "Test"]);
+        git(dir, &["config", "core.autocrlf", "false"]);
+    }
+
+    /// `origin` (bare), the target checkout on `feature/poc`, and a task
+    /// worktree on its own branch with the task's work left uncommitted, the
+    /// way an agent leaves it for the executor.
+    struct Repos {
+        _root: tempfile::TempDir,
+        origin: PathBuf,
+        project: PathBuf,
+        worktree: PathBuf,
+    }
+
+    impl Repos {
+        fn new(target_edit: Option<&str>) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let origin = root.path().join("origin.git");
+            let project = root.path().join("project");
+            let worktree = root.path().join("worktree");
+            std::fs::create_dir_all(&origin).unwrap();
+            std::fs::create_dir_all(&project).unwrap();
+            git(&origin, &["init", "-q", "--bare"]);
+            git(&project, &["init", "-q"]);
+            identify(&project);
+            git(&project, &["checkout", "-q", "-b", TARGET]);
+            std::fs::write(project.join("shared.txt"), "base\n").unwrap();
+            git(&project, &["add", "."]);
+            git(&project, &["commit", "-q", "-m", "seed"]);
+            git(
+                &project,
+                &["remote", "add", "origin", &origin.to_string_lossy()],
+            );
+            git(&project, &["push", "-q", "-u", "origin", TARGET]);
+            git(
+                &project,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    BRANCH,
+                    &worktree.to_string_lossy(),
+                ],
+            );
+            std::fs::write(worktree.join("shared.txt"), "task\n").unwrap();
+            std::fs::create_dir_all(worktree.join(".agent-flow")).unwrap();
+            std::fs::write(
+                worktree.join(".agent-flow/integration-ready.yaml"),
+                "verdict: ready_for_integration\nfindings: >-\n  ready\n",
+            )
+            .unwrap();
+            if let Some(content) = target_edit {
+                std::fs::write(project.join("shared.txt"), content).unwrap();
+                git(&project, &["commit", "-q", "-am", "target moved"]);
+                git(&project, &["push", "-q", "origin", TARGET]);
+            }
+            Self {
+                _root: root,
+                origin,
+                project,
+                worktree,
+            }
+        }
+
+        /// A second clone standing in for a person outside the container: the
+        /// pull request's conflict editor, or a local checkout.
+        fn outside_clone(&self) -> PathBuf {
+            let clone = self._root.path().join("outside");
+            git(
+                self._root.path(),
+                &[
+                    "clone",
+                    "-q",
+                    "-c",
+                    "core.autocrlf=false",
+                    &self.origin.to_string_lossy(),
+                    &clone.to_string_lossy(),
+                ],
+            );
+            identify(&clone);
+            clone
+        }
+
+        fn remote_ref(&self, branch: &str) -> Option<String> {
+            std::process::Command::new("git")
+                .args(["rev-parse", "--verify", "--quiet", branch])
+                .current_dir(&self.origin)
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        }
+    }
+
+    fn workflow() -> WorkflowDefinition {
+        let graph = WorkflowDefinition {
+            initial_state: "integrate_to_feature".into(),
+            states: vec![
+                WorkflowState {
+                    id: "integrate_to_feature".into(),
+                    label: "Integrate to feature".into(),
+                    role: Some("engineering_reviewer".into()),
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "done".into(),
+                    label: "Done".into(),
+                    role: None,
+                    terminal: true,
+                },
+            ],
+            transitions: vec![WorkflowTransition {
+                action: "complete_feature_integration".into(),
+                from: "integrate_to_feature".into(),
+                to: "done".into(),
+                guards: vec![WorkflowGuard::IntegratedIntoTarget],
+            }],
+        };
+        graph.validate().unwrap();
+        graph
+    }
+
+    fn project_config(open_pull_requests: bool) -> WorkflowProjectConfig {
+        let config: WorkflowProjectConfig = toml::from_str(&format!(
+            r#"
+target_branch = "{TARGET}"
+[role_bindings]
+engineering_reviewer = "codex"
+[role_policies.engineering_reviewer]
+states = ["integrate_to_feature"]
+modify_source_and_tests = true
+[state_policies.integrate_to_feature]
+role = "engineering_reviewer"
+final_task_commit = true
+push_task_branch = true
+create_or_update_task_pr = {open_pull_requests}
+merge_task_into_target = true
+merge_target = "{TARGET}"
+"#
+        ))
+        .unwrap();
+        config.validate().unwrap();
+        config
+    }
+
+    fn plugin() -> WorkflowPlugin {
+        WorkflowPlugin {
+            name: "integration".into(),
+            description: None,
+            init_script: None,
+            state_machine: Some(workflow()),
+            supported_agents: Vec::new(),
+            artifacts: Default::default(),
+            commands: Default::default(),
+            prompts: Default::default(),
+            prompt_triggers: Default::default(),
+            copy_dirs: Vec::new(),
+            copy_files: Vec::new(),
+            cyclic: false,
+            clear_context_on_advance: false,
+            copy_back: Default::default(),
+            auto_dismiss: Vec::new(),
+        }
+    }
+
+    struct Fixture {
+        repos: Repos,
+        db: Database,
+        _db_dir: tempfile::TempDir,
+        task_id: String,
+        dependent_id: String,
+    }
+
+    impl Fixture {
+        fn new(target_edit: Option<&str>) -> Self {
+            let repos = Repos::new(target_edit);
+            let db_dir = tempfile::tempdir().unwrap();
+            let mut db = Database::open_project_at_path(&db_dir.path().join("wf.db")).unwrap();
+            let mut task = Task::new("Integrate thing", "codex", "proj");
+            task.status = TaskStatus::Review;
+            task.worktree_path = Some(repos.worktree.to_string_lossy().to_string());
+            task.branch_name = Some(BRANCH.to_string());
+            db.create_task(&task).unwrap();
+            let state = WorkflowTaskState::new(&task.id, "integrate_to_feature", TARGET);
+            let record =
+                WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "integrate_to_feature");
+            db.record_workflow_admission(&task, &state, &record)
+                .unwrap();
+            let mut dependent = Task::new("Builds on it", "codex", "proj");
+            dependent.referenced_tasks = Some(task.id.clone());
+            db.create_task(&dependent).unwrap();
+            Self {
+                repos,
+                db,
+                _db_dir: db_dir,
+                task_id: task.id,
+                dependent_id: dependent.id,
+            }
+        }
+
+        fn task(&self) -> Task {
+            self.db.get_task(&self.task_id).unwrap().unwrap()
+        }
+
+        fn dependent_ready(&self) -> bool {
+            let dependent = self.db.get_task(&self.dependent_id).unwrap().unwrap();
+            self.db.deps_satisfied(&dependent)
+        }
+
+        fn state(&self) -> String {
+            self.db
+                .get_workflow_task_state(&self.task_id)
+                .unwrap()
+                .unwrap()
+                .state
+        }
+
+        /// Pretend the last attempt was long enough ago for a retry.
+        fn age_last_attempt(&mut self) {
+            let mut task = self.task();
+            task.updated_at =
+                chrono::Utc::now() - chrono::Duration::seconds(INTEGRATION_RETRY_SECONDS + 5);
+            self.db.update_task(&task).unwrap();
+        }
+
+        fn run(
+            &mut self,
+            config: &WorkflowProjectConfig,
+            provider: Option<&Arc<dyn GitProviderOperations>>,
+        ) -> WorkflowStepOutcome {
+            let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(MockTmuxOperations::new());
+            let agent_registry: Arc<dyn AgentRegistry> = Arc::new(MockAgentRegistry::new());
+            let git_ops: Arc<dyn GitOperations> = Arc::new(RealGitOps);
+            let merged = MergedConfig::merge(&GlobalConfig::default(), &ProjectConfig::default());
+            let flags = crate::FeatureFlags::default();
+            let runtime = WorkflowRuntime {
+                tmux_ops: &tmux_ops,
+                agent_registry: &agent_registry,
+                git_ops: &git_ops,
+                tmux_project_name: "proj",
+                project_path: &self.repos.project,
+                config: &merged,
+                flags: &flags,
+                session_probe: crate::agent::native_session::default_probe(),
+                git_provider_ops: provider,
+            };
+            let task = self.task();
+            complete_feature_integration(
+                &workflow(),
+                config,
+                &plugin(),
+                task,
+                &mut self.db,
+                &runtime,
+            )
+            .unwrap()
+        }
+
+        fn assess(&self, config: &WorkflowProjectConfig) -> AutomationDecision {
+            let task = self.task();
+            let state = self
+                .db
+                .get_workflow_task_state(&self.task_id)
+                .unwrap()
+                .unwrap();
+            assess(&workflow(), config, &plugin(), &task, &state, &self.db)
+        }
+    }
+
+    fn provider_opening_pull_request() -> Arc<dyn GitProviderOperations> {
+        let mut provider = MockGitProviderOperations::new();
+        provider
+            .expect_create_pr()
+            .withf(|_, _, body, head, base| {
+                head == BRANCH && base.as_deref() == Some(TARGET) && body.contains("shared.txt")
+            })
+            .times(1)
+            .returning(|_, _, _, _, _| Ok((7, "https://example.test/pull/7".to_string())));
+        provider
+            .expect_get_pr_state()
+            .returning(|_, _| Ok(PullRequestState::Open));
+        Arc::new(provider)
+    }
+
+    #[test]
+    fn a_clean_merge_completes_the_task() {
+        let mut fixture = Fixture::new(None);
+        let outcome = fixture.run(&project_config(true), None);
+
+        assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
+        let task = fixture.task();
+        assert_eq!(task.status, TaskStatus::Done);
+        assert_eq!(task.integration_status, None);
+        assert_eq!(fixture.state(), "done");
+        assert_eq!(
+            std::fs::read_to_string(fixture.repos.project.join("shared.txt")).unwrap(),
+            "task\n"
+        );
+        assert!(fixture.dependent_ready());
+    }
+
+    #[test]
+    fn a_conflict_pushes_the_branch_opens_a_pull_request_and_blocks_dependents() {
+        let mut fixture = Fixture::new(Some("target\n"));
+        let provider = provider_opening_pull_request();
+        let target_before = fixture.repos.remote_ref(TARGET);
+
+        let outcome = fixture.run(&project_config(true), Some(&provider));
+
+        let WorkflowStepOutcome::Blocked { message } = outcome else {
+            panic!("a conflicting merge must not advance the task");
+        };
+        assert!(message.contains("Has merge conflicts"), "{message}");
+        let task = fixture.task();
+        assert_eq!(task.integration_status.as_deref(), Some(INTEGRATION_CONFLICTS));
+        assert_eq!(task.integration_conflicts.as_deref(), Some("shared.txt"));
+        assert_eq!(task.pr_url.as_deref(), Some("https://example.test/pull/7"));
+        assert!(task
+            .escalation_note
+            .as_deref()
+            .is_some_and(|note| note.contains("shared.txt") && note.contains("/pull/7")));
+        assert_eq!(task.status, TaskStatus::Review);
+        assert_eq!(fixture.state(), "integrate_to_feature");
+        assert!(
+            fixture.repos.remote_ref(BRANCH).is_some(),
+            "the task branch must leave the container even though it cannot merge"
+        );
+        assert_eq!(fixture.repos.remote_ref(TARGET), target_before);
+        assert!(
+            !fixture.dependent_ready(),
+            "a dependency in Review with unresolved conflicts must keep dependents blocked"
+        );
+        assert_eq!(
+            fixture.assess(&project_config(true)),
+            AutomationDecision::Wait,
+            "the retry waits out INTEGRATION_RETRY_SECONDS"
+        );
+        fixture.age_last_attempt();
+        assert_eq!(
+            fixture.assess(&project_config(true)),
+            AutomationDecision::Advance("complete_feature_integration".into())
+        );
+    }
+
+    #[test]
+    fn a_resolution_pushed_to_the_task_branch_completes_the_task() {
+        let mut fixture = Fixture::new(Some("target\n"));
+        let provider = provider_opening_pull_request();
+        fixture.run(&project_config(true), Some(&provider));
+
+        let outside = fixture.repos.outside_clone();
+        git(&outside, &["checkout", "-q", BRANCH]);
+        let merge = std::process::Command::new("git")
+            .args(["merge", &format!("origin/{TARGET}")])
+            .current_dir(&outside)
+            .output()
+            .unwrap();
+        assert!(!merge.status.success(), "the fixture must really conflict");
+        std::fs::write(outside.join("shared.txt"), "task and target\n").unwrap();
+        git(&outside, &["commit", "-q", "-am", "resolve conflict"]);
+        git(&outside, &["push", "-q", "origin", BRANCH]);
+
+        fixture.age_last_attempt();
+        let outcome = fixture.run(&project_config(true), Some(&provider));
+
+        assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
+        let task = fixture.task();
+        assert_eq!(task.status, TaskStatus::Done);
+        assert_eq!(task.integration_status, None);
+        assert_eq!(task.integration_conflicts, None);
+        assert_eq!(task.escalation_note, None);
+        assert_eq!(fixture.state(), "done");
+        assert_eq!(
+            std::fs::read_to_string(fixture.repos.project.join("shared.txt")).unwrap(),
+            "task and target\n"
+        );
+        assert!(fixture.dependent_ready());
+        let events = fixture.db.task_execution_events(&fixture.task_id).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "integration_unresolved")
+                .count(),
+            1
+        );
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "integration_resolved"));
+    }
+
+    #[test]
+    fn a_task_branch_merged_on_the_remote_completes_the_task() {
+        let mut fixture = Fixture::new(Some("target\n"));
+        let provider = provider_opening_pull_request();
+        fixture.run(&project_config(true), Some(&provider));
+
+        // Merging the pull request: the task branch lands in the remote target.
+        let outside = fixture.repos.outside_clone();
+        git(&outside, &["checkout", "-q", TARGET]);
+        let merge = std::process::Command::new("git")
+            .args(["merge", &format!("origin/{BRANCH}")])
+            .current_dir(&outside)
+            .output()
+            .unwrap();
+        assert!(!merge.status.success(), "the fixture must really conflict");
+        std::fs::write(outside.join("shared.txt"), "merged on the remote\n").unwrap();
+        git(&outside, &["commit", "-q", "-am", "merge pull request"]);
+        git(&outside, &["push", "-q", "origin", TARGET]);
+
+        fixture.age_last_attempt();
+        let outcome = fixture.run(&project_config(true), Some(&provider));
+
+        assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
+        assert_eq!(fixture.task().status, TaskStatus::Done);
+        assert_eq!(fixture.state(), "done");
+        assert_eq!(
+            std::fs::read_to_string(fixture.repos.project.join("shared.txt")).unwrap(),
+            "merged on the remote\n",
+            "the target checkout is fast-forwarded to the remote merge"
+        );
+    }
+
+    #[test]
+    fn a_dirty_target_checkout_blocks_and_the_retry_completes_once_it_is_clean() {
+        let mut fixture = Fixture::new(None);
+        std::fs::write(fixture.repos.project.join("scratch.txt"), "wip\n").unwrap();
+
+        let outcome = fixture.run(&project_config(true), None);
+
+        assert!(matches!(outcome, WorkflowStepOutcome::Blocked { .. }));
+        let task = fixture.task();
+        assert_eq!(task.integration_status.as_deref(), Some(INTEGRATION_BLOCKED));
+        assert!(task
+            .escalation_note
+            .as_deref()
+            .is_some_and(|note| note.contains("uncommitted changes")));
+        assert!(fixture.repos.remote_ref(BRANCH).is_some());
+        assert!(!fixture.dependent_ready());
+
+        std::fs::remove_file(fixture.repos.project.join("scratch.txt")).unwrap();
+        fixture.age_last_attempt();
+        let outcome = fixture.run(&project_config(true), None);
+
+        assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
+        assert_eq!(fixture.task().status, TaskStatus::Done);
+        assert_eq!(fixture.task().escalation_note, None);
+        assert!(fixture.dependent_ready());
+    }
+
+    #[test]
+    fn conflicts_without_pull_request_authority_still_push_and_escalate() {
+        let mut fixture = Fixture::new(Some("target\n"));
+        let mut provider = MockGitProviderOperations::new();
+        provider.expect_create_pr().never();
+        let provider: Arc<dyn GitProviderOperations> = Arc::new(provider);
+
+        let outcome = fixture.run(&project_config(false), Some(&provider));
+
+        assert!(matches!(outcome, WorkflowStepOutcome::Blocked { .. }));
+        let task = fixture.task();
+        assert_eq!(task.integration_status.as_deref(), Some(INTEGRATION_CONFLICTS));
+        assert_eq!(task.pr_url, None);
+        assert!(fixture.repos.remote_ref(BRANCH).is_some());
     }
 }

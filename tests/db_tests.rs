@@ -1293,6 +1293,61 @@ fn test_dependency_state_ready_once_dep_reaches_review() {
     assert!(db.deps_satisfied(&task));
 }
 
+/// A dependency whose integration into the workflow target is unresolved
+/// keeps its dependents blocked in Review *and* in Done: its work is not on
+/// the branch they start from. Clearing the status releases them.
+#[test]
+fn test_dependency_state_unresolved_integration_blocks_in_review_and_done() {
+    let db = Database::open_in_memory_project().unwrap();
+    let mut dep = stored_dep(&db, "A", TaskStatus::Review);
+    let task = stored_dependent(&db, "B", &[&dep.id]);
+    assert!(db.deps_satisfied(&task));
+
+    for (status, integration) in [
+        (TaskStatus::Review, agtx::db::INTEGRATION_CONFLICTS),
+        (TaskStatus::Done, agtx::db::INTEGRATION_CONFLICTS),
+        (TaskStatus::Review, agtx::db::INTEGRATION_BLOCKED),
+    ] {
+        dep.status = status;
+        dep.integration_status = Some(integration.to_string());
+        db.update_task(&dep).unwrap();
+        assert_eq!(
+            db.dependency_state(&task),
+            DependencyState::Blocked(vec![dep.id.clone()]),
+            "{status:?} with integration {integration}"
+        );
+    }
+
+    dep.integration_status = None;
+    db.update_task(&dep).unwrap();
+    assert!(db.deps_satisfied(&task));
+}
+
+/// The integration columns survive a write and a read, and a workflow reset
+/// to Backlog clears them together with the rest of the delivery state.
+#[test]
+fn test_integration_fields_round_trip_and_reset() {
+    let mut db = Database::open_in_memory_project().unwrap();
+    let mut task = Task::new("Integrate", "codex", "proj");
+    db.create_task(&task).unwrap();
+    task.integration_status = Some(agtx::db::INTEGRATION_CONFLICTS.to_string());
+    task.integration_conflicts = Some("a.rs,b.vue".to_string());
+    db.update_task(&task).unwrap();
+
+    let stored = db.get_task(&task.id).unwrap().unwrap();
+    assert!(stored.has_integration_conflicts());
+    assert_eq!(stored.integration_conflicts.as_deref(), Some("a.rs,b.vue"));
+
+    let state = WorkflowTaskState::new(&task.id, "integrate_to_feature", "feature/poc");
+    let record = WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "integrate_to_feature");
+    db.record_workflow_admission(&stored, &state, &record)
+        .unwrap();
+    db.reset_workflow_to_backlog(&stored, &state).unwrap();
+    let reset = db.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(reset.integration_status, None);
+    assert_eq!(reset.integration_conflicts, None);
+}
+
 #[test]
 fn test_dependency_state_done_dep_is_ready() {
     let db = Database::open_in_memory_project().unwrap();

@@ -553,6 +553,7 @@ mod tests {
             config,
             flags,
             session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: None,
         }
     }
 

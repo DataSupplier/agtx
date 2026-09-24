@@ -3251,8 +3251,19 @@ impl App {
             } else {
                 Span::raw("")
             };
-            let title_spans =
-                Line::from(vec![indicator, warn_span, Span::styled(title, title_style)]);
+            // The pushed branch conflicts with the workflow target; the
+            // escalation note beside it names the files and the pull request.
+            let conflict_span = if task.has_integration_conflicts() {
+                Span::styled("\u{21c6} ", Style::default().fg(Color::Red).bold())
+            } else {
+                Span::raw("")
+            };
+            let title_spans = Line::from(vec![
+                indicator,
+                warn_span,
+                conflict_span,
+                Span::styled(title, title_style),
+            ]);
             let title_line = Paragraph::new(title_spans);
             let title_area = Rect {
                 x: inner.x,
@@ -6104,6 +6115,7 @@ impl App {
             config: &self.state.config,
             flags: &self.state.flags,
             session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: Some(&self.state.git_provider_ops),
         };
         let db = self
             .state
@@ -6132,6 +6144,7 @@ impl App {
             config: &self.state.config,
             flags: &self.state.flags,
             session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: Some(&self.state.git_provider_ops),
         };
         let db = self
             .state
@@ -6181,6 +6194,7 @@ impl App {
             config: &self.state.config,
             flags: &self.state.flags,
             session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: Some(&self.state.git_provider_ops),
         };
         let outcome = reset_workflow_to_backlog(task, db, &runtime)?;
         self.apply_workflow_step_outcome(outcome)
@@ -6255,6 +6269,7 @@ impl App {
             config: &self.state.config,
             flags: &self.state.flags,
             session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: Some(&self.state.git_provider_ops),
         };
         let db = self
             .state
@@ -6292,6 +6307,7 @@ impl App {
             config: &self.state.config,
             flags: &self.state.flags,
             session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: Some(&self.state.git_provider_ops),
         };
         let db = self
             .state
@@ -6330,6 +6346,7 @@ impl App {
             config: &self.state.config,
             flags: &self.state.flags,
             session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: Some(&self.state.git_provider_ops),
         };
         let db = self
             .state
@@ -6370,6 +6387,7 @@ impl App {
             config: &self.state.config,
             flags: &self.state.flags,
             session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: Some(&self.state.git_provider_ops),
         };
         let db = self
             .state
@@ -6417,6 +6435,7 @@ impl App {
             config: &self.state.config,
             flags: &self.state.flags,
             session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: Some(&self.state.git_provider_ops),
         };
         let db = self
             .state
@@ -6463,6 +6482,7 @@ impl App {
             config: &self.state.config,
             flags: &self.state.flags,
             session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: Some(&self.state.git_provider_ops),
         };
         let db = self
             .state
@@ -6509,6 +6529,7 @@ impl App {
             config: &self.state.config,
             flags: &self.state.flags,
             session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: Some(&self.state.git_provider_ops),
         };
         let db = self
             .state
@@ -6549,6 +6570,7 @@ impl App {
             config: &self.state.config,
             flags: &self.state.flags,
             session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: Some(&self.state.git_provider_ops),
         };
         let db = self
             .state
@@ -6589,6 +6611,7 @@ impl App {
             config: &self.state.config,
             flags: &self.state.flags,
             session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: Some(&self.state.git_provider_ops),
         };
         let db = self
             .state
@@ -6665,6 +6688,7 @@ impl App {
             config: &self.state.config,
             flags: &self.state.flags,
             session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: Some(&self.state.git_provider_ops),
         };
         let Some(db) = self.state.db.as_mut() else {
             return;
@@ -8556,9 +8580,12 @@ impl App {
                 self.resend_current_state_prompt(&task)?;
             }
             "escalate_to_user" => {
-                if !matches!(task.status, TaskStatus::Planning | TaskStatus::Running) {
+                if !matches!(
+                    task.status,
+                    TaskStatus::Planning | TaskStatus::Running | TaskStatus::Review
+                ) {
                     anyhow::bail!(
-                        "escalate_to_user is only valid for Planning or Running tasks (current: {})",
+                        "escalate_to_user is only valid for Planning, Running or Review tasks (current: {})",
                         task.status.as_str()
                     );
                 }
@@ -15382,9 +15409,16 @@ fn write_mcp_config(
             );
         }
         agent::McpConfigKind::CodexToml => {
+            // Codex runs with `--ask-for-approval never`, under which an MCP
+            // tool call that needs approval is refused outright ("MCP tool
+            // call requires approval, but approval policy is never") -- so
+            // without this an agent's `move_task` escalation never reaches the
+            // board. Approval is lifted for this one local server only.
+            let esc = |v: &str| v.replace('\\', "\\\\").replace('"', "\\\"");
             let toml = format!(
-                "[mcp_servers.agtx]\ncommand = \"{}\"\nargs = [\"mcp-serve\", \"{}\"]\n",
-                agtx_bin, project_path_str
+                "[mcp_servers.agtx]\ncommand = \"{}\"\nargs = [\"mcp-serve\", \"{}\"]\ndefault_tools_approval_mode = \"approve\"\n",
+                esc(&agtx_bin),
+                esc(&project_path_str)
             );
             let dir = Path::new(worktree_path).join(".codex");
             let _ = std::fs::create_dir_all(&dir);

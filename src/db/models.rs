@@ -63,10 +63,12 @@ impl TaskStatus {
 /// "where is this task in its lifecycle?".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DependencyState {
-    /// No dependencies, or every one of them is in Review or Done.
+    /// No dependencies, or every one of them is in Review or Done with no
+    /// unresolved integration (see [`Task::has_unresolved_integration`]).
     Ready,
-    /// Dependencies that exist but have not reached Review or Done. Carries
-    /// every blocker rather than the first, so a card can name all of them.
+    /// Dependencies that exist but have not reached Review or Done, or whose
+    /// integration into the workflow target is unresolved. Carries every
+    /// blocker rather than the first, so a card can name all of them.
     Blocked(Vec<String>),
     /// Referenced tasks that no longer exist. A deleted dependency reads as
     /// "no longer required", so this state is still safe to pick up.
@@ -117,11 +119,45 @@ pub struct Task {
     pub referenced_tasks: Option<String>,
     pub escalation_note: Option<String>,
     pub base_branch: Option<String>,
+    /// Why the workflow executor's merge into the target branch has not
+    /// completed: [`INTEGRATION_CONFLICTS`] or [`INTEGRATION_BLOCKED`], with
+    /// the details in `escalation_note`. `None` when nothing is outstanding.
+    /// While set, the executor retries on its own and the task never
+    /// satisfies a dependency, whatever its status.
+    #[serde(default)]
+    pub integration_status: Option<String>,
+    /// Comma-separated paths that conflict with the target branch, recorded
+    /// together with [`INTEGRATION_CONFLICTS`].
+    #[serde(default)]
+    pub integration_conflicts: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
+/// `Task::integration_status` value: the task branch is committed and pushed,
+/// but merging it into the workflow target conflicts. Resolving the conflict
+/// on the pushed branch (or merging its pull request) clears it.
+pub const INTEGRATION_CONFLICTS: &str = "conflicts";
+
+/// `Task::integration_status` value: integration stopped for a reason other
+/// than a merge conflict -- a target checkout with uncommitted changes, a
+/// failed push or fetch, a task branch that diverged from its remote. The
+/// reason is in `escalation_note`; the executor retries once it clears.
+pub const INTEGRATION_BLOCKED: &str = "blocked";
+
 impl Task {
+    /// Whether the executor recorded unresolved merge conflicts with the
+    /// workflow target for this task.
+    pub fn has_integration_conflicts(&self) -> bool {
+        self.integration_status.as_deref() == Some(INTEGRATION_CONFLICTS)
+    }
+
+    /// Whether the executor started integrating this task and could not
+    /// finish: conflicts, or any other retryable block.
+    pub fn has_unresolved_integration(&self) -> bool {
+        self.integration_status.is_some()
+    }
+
     pub fn new(
         title: impl Into<String>,
         agent: impl Into<String>,
@@ -158,6 +194,8 @@ impl Task {
             referenced_tasks: None,
             escalation_note: None,
             base_branch: None,
+            integration_status: None,
+            integration_conflicts: None,
             created_at: now,
             updated_at: now,
         }

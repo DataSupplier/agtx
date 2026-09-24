@@ -96,6 +96,60 @@ pub fn resolve_commit(path: &Path, rev: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Fetch one branch from `origin`, refreshing `origin/<branch>`.
+///
+/// `Ok(false)` when the remote has no such branch -- a task branch that was
+/// never pushed is an expected state, not a failure. Any other fetch failure
+/// (network, auth) is an error.
+pub fn fetch_branch(path: &Path, branch: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .current_dir(path)
+        .args([
+            "fetch",
+            "origin",
+            &format!("+refs/heads/{branch}:refs/remotes/origin/{branch}"),
+        ])
+        .output()
+        .context("Failed to run git fetch")?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("couldn't find remote ref") {
+        return Ok(false);
+    }
+    anyhow::bail!("git fetch origin {branch} failed: {}", stderr.trim());
+}
+
+/// Whether every commit of `ancestor` is already contained in `descendant`.
+/// A ref that does not resolve is never an ancestor.
+pub fn is_ancestor(path: &Path, ancestor: &str, descendant: &str) -> bool {
+    Command::new("git")
+        .current_dir(path)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Move the branch checked out at `path` forward to `rev`. Refuses anything
+/// that is not a fast-forward, so local commits are never discarded or merged
+/// implicitly.
+pub fn fast_forward(path: &Path, rev: &str) -> Result<()> {
+    let output = Command::new("git")
+        .current_dir(path)
+        .args(["merge", "--ff-only", rev])
+        .output()
+        .context("Failed to run git merge --ff-only")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "cannot fast-forward to '{rev}': {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// Get the diff between two branches (stat format)
 pub fn diff_stat(path: &Path, base: &str, target: &str) -> Result<String> {
     let output = Command::new("git")
