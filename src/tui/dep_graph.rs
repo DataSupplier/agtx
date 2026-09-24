@@ -20,7 +20,8 @@ pub struct DepNode {
     pub title: String,
     pub status: TaskStatus,
     /// True when the task is in Backlog and all its dependencies are satisfied
-    /// (in Review/Done) — i.e. it is actionable and can be batch-moved.
+    /// (merged: Done, no unresolved integration) — i.e. it is actionable and
+    /// can be batch-moved.
     pub unblocked: bool,
     /// Topological column index (0 = no in-graph dependencies).
     pub level: usize,
@@ -76,7 +77,8 @@ fn parse_refs(refs: &Option<String>) -> Vec<String> {
 /// Build the dependency graph from a project's tasks.
 ///
 /// `deps_satisfied` should return true when every dependency of the given task
-/// is in Review/Done (the same rule `Database::deps_satisfied` applies). It is
+/// is merged (`Task::satisfies_dependents`, the rule `Database::deps_satisfied`
+/// applies). It is
 /// passed as a closure so this function stays database-free and testable.
 ///
 /// References to tasks that are not present in `tasks` (deleted/unknown) are
@@ -238,16 +240,15 @@ mod tests {
     }
 
     /// Mirror of Database::deps_satisfied for tests: deps satisfied when every
-    /// referenced task in `tasks` is Review/Done with no unresolved integration
-    /// (missing => satisfied).
+    /// referenced task in `tasks` is merged (missing => satisfied).
     fn satisfied_fn(tasks: Vec<Task>) -> impl Fn(&Task) -> bool {
         move |t: &Task| {
             let refs = parse_refs(&t.referenced_tasks);
             refs.iter().all(|rid| {
-                tasks.iter().find(|x| &x.id == rid).map_or(true, |dep| {
-                    matches!(dep.status, TaskStatus::Review | TaskStatus::Done)
-                        && !dep.has_unresolved_integration()
-                })
+                tasks
+                    .iter()
+                    .find(|x| &x.id == rid)
+                    .map_or(true, |dep| dep.satisfies_dependents())
             })
         }
     }

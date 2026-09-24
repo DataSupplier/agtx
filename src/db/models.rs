@@ -63,12 +63,12 @@ impl TaskStatus {
 /// "where is this task in its lifecycle?".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DependencyState {
-    /// No dependencies, or every one of them is in Review or Done with no
-    /// unresolved integration (see [`Task::has_unresolved_integration`]).
+    /// No dependencies, or every one of them is merged into its target
+    /// ([`Task::satisfies_dependents`]).
     Ready,
-    /// Dependencies that exist but have not reached Review or Done, or whose
-    /// integration into the workflow target is unresolved. Carries every
-    /// blocker rather than the first, so a card can name all of them.
+    /// Dependencies that exist but are not merged into their target yet.
+    /// Carries every blocker rather than the first, so a card can name all
+    /// of them.
     Blocked(Vec<String>),
     /// Referenced tasks that no longer exist. A deleted dependency reads as
     /// "no longer required", so this state is still safe to pick up.
@@ -123,7 +123,7 @@ pub struct Task {
     /// completed: [`INTEGRATION_CONFLICTS`] or [`INTEGRATION_BLOCKED`], with
     /// the details in `escalation_note`. `None` when nothing is outstanding.
     /// While set, the executor retries on its own and the task never
-    /// satisfies a dependency, whatever its status.
+    /// satisfies a dependency (see [`Task::satisfies_dependents`]).
     #[serde(default)]
     pub integration_status: Option<String>,
     /// Comma-separated paths that conflict with the target branch, recorded
@@ -156,6 +156,14 @@ impl Task {
     /// finish: conflicts, or any other retryable block.
     pub fn has_unresolved_integration(&self) -> bool {
         self.integration_status.is_some()
+    }
+
+    /// Whether this task's work is merged into its target branch, which is
+    /// what a dependent task starts from: Done, with no unresolved
+    /// integration. Review is not enough -- a task under review has not been
+    /// merged, so a dependent started then would begin without its work.
+    pub fn satisfies_dependents(&self) -> bool {
+        self.status == TaskStatus::Done && !self.has_unresolved_integration()
     }
 
     pub fn new(

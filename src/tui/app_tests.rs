@@ -17390,7 +17390,7 @@ fn queued_completion_allows_clean_worktree() {
 /// without anything unlocking it explicitly.
 #[test]
 #[cfg(feature = "test-mocks")]
-fn refresh_moves_a_backlog_card_into_ready_when_its_dependency_reaches_review() {
+fn refresh_moves_a_backlog_card_into_ready_once_its_dependency_is_merged() {
     let mut app = make_test_app();
 
     let mut dep = Task::new("A", "claude", "test-project");
@@ -17419,7 +17419,17 @@ fn refresh_moves_a_backlog_card_into_ready_when_its_dependency_reaches_review() 
     );
     assert!(app.state.board.tasks_in_column(1).is_empty());
 
+    // Review is not merged yet: B stays blocked.
     dep.status = TaskStatus::Review;
+    app.state.db.as_ref().unwrap().update_task(&dep).unwrap();
+    app.refresh_tasks().unwrap();
+    assert_eq!(
+        app.state.board.dep_state(&task.id),
+        &crate::db::DependencyState::Blocked(vec![dep.id.clone()])
+    );
+    assert!(app.state.board.tasks_in_column(1).is_empty());
+
+    dep.status = TaskStatus::Done;
     app.state.db.as_ref().unwrap().update_task(&dep).unwrap();
     app.refresh_tasks().unwrap();
 
@@ -17437,11 +17447,11 @@ fn refresh_moves_a_backlog_card_into_ready_when_its_dependency_reaches_review() 
             .collect::<Vec<_>>(),
         vec!["B"]
     );
-    // A itself moved on to the Review lane, which is what unblocked B.
+    // A itself moved on to the Done lane, which is what unblocked B.
     assert_eq!(
         app.state
             .board
-            .tasks_in_column(4)
+            .tasks_in_column(5)
             .iter()
             .map(|t| t.title.as_str())
             .collect::<Vec<_>>(),
@@ -17510,7 +17520,7 @@ fn a_blocked_backlog_card_still_cannot_move_right() {
         .state
         .warning_message
         .as_ref()
-        .is_some_and(|(msg, _)| msg.contains("Dependencies not in Review/Done")));
+        .is_some_and(|(msg, _)| msg.contains("Dependencies not merged (Done) yet")));
     let saved = app
         .state
         .db

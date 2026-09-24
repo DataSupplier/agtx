@@ -250,8 +250,10 @@ fn test_deps_satisfied_no_refs() {
     assert!(db.deps_satisfied(&task));
 }
 
+/// Dependencies are satisfied only once every one of them is merged (Done);
+/// one still in Review keeps the task blocked.
 #[test]
-fn test_deps_satisfied_all_review_or_done() {
+fn test_deps_satisfied_only_once_all_are_done() {
     let db = Database::open_in_memory_project().unwrap();
 
     let mut dep1 = Task::new("Dep 1", "claude", "proj");
@@ -266,6 +268,10 @@ fn test_deps_satisfied_all_review_or_done() {
     task.referenced_tasks = Some(format!("{},{}", dep1.id, dep2.id));
     db.create_task(&task).unwrap();
 
+    assert!(!db.deps_satisfied(&task));
+
+    dep1.status = TaskStatus::Done;
+    db.update_task(&dep1).unwrap();
     assert!(db.deps_satisfied(&task));
 }
 
@@ -696,9 +702,9 @@ fn test_dep_graph_unblocks_chain_as_deps_complete() {
     unblocked.sort();
     assert_eq!(unblocked, vec![a.id.clone()]);
 
-    // Complete A (move to Review). Now B should become unblocked.
+    // Complete A (merged: Done). Now B should become unblocked.
     let mut a_done = db.get_task(&a.id).unwrap().unwrap();
-    a_done.status = TaskStatus::Review;
+    a_done.status = TaskStatus::Done;
     db.update_task(&a_done).unwrap();
 
     let tasks = db.get_all_tasks().unwrap();
@@ -1279,8 +1285,10 @@ fn test_dependency_state_running_dep_blocks() {
     assert!(!db.deps_satisfied(&task));
 }
 
+/// Review is not merged: a dependent started from the target then would
+/// begin without the dependency's work. Only Done releases it.
 #[test]
-fn test_dependency_state_ready_once_dep_reaches_review() {
+fn test_dependency_state_ready_only_once_dep_is_merged() {
     let db = Database::open_in_memory_project().unwrap();
     let mut dep = stored_dep(&db, "A", TaskStatus::Running);
     let task = stored_dependent(&db, "B", &[&dep.id]);
@@ -1288,18 +1296,24 @@ fn test_dependency_state_ready_once_dep_reaches_review() {
 
     dep.status = TaskStatus::Review;
     db.update_task(&dep).unwrap();
+    assert_eq!(
+        db.dependency_state(&task),
+        DependencyState::Blocked(vec![dep.id.clone()])
+    );
 
+    dep.status = TaskStatus::Done;
+    db.update_task(&dep).unwrap();
     assert_eq!(db.dependency_state(&task), DependencyState::Ready);
     assert!(db.deps_satisfied(&task));
 }
 
 /// A dependency whose integration into the workflow target is unresolved
-/// keeps its dependents blocked in Review *and* in Done: its work is not on
-/// the branch they start from. Clearing the status releases them.
+/// keeps its dependents blocked, even in Done: its work is not on the branch
+/// they start from. Clearing the status releases them.
 #[test]
-fn test_dependency_state_unresolved_integration_blocks_in_review_and_done() {
+fn test_dependency_state_unresolved_integration_blocks_even_when_done() {
     let db = Database::open_in_memory_project().unwrap();
-    let mut dep = stored_dep(&db, "A", TaskStatus::Review);
+    let mut dep = stored_dep(&db, "A", TaskStatus::Done);
     let task = stored_dependent(&db, "B", &[&dep.id]);
     assert!(db.deps_satisfied(&task));
 
@@ -1318,6 +1332,7 @@ fn test_dependency_state_unresolved_integration_blocks_in_review_and_done() {
         );
     }
 
+    dep.status = TaskStatus::Done;
     dep.integration_status = None;
     db.update_task(&dep).unwrap();
     assert!(db.deps_satisfied(&task));
@@ -1405,7 +1420,7 @@ fn test_dependency_state_existing_blocker_outranks_missing() {
 
     // The deleted dependency surfaces only once a real blocker clears, and it
     // leaves the task safe to pick up.
-    a.status = TaskStatus::Review;
+    a.status = TaskStatus::Done;
     db.update_task(&a).unwrap();
 
     assert_eq!(

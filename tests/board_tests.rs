@@ -7,7 +7,7 @@ fn create_test_task(title: &str, status: TaskStatus) -> Task {
     task
 }
 
-/// A Backlog task whose dependency has not reached Review/Done, registered in
+/// A Backlog task whose dependency is not merged (Done) yet, registered in
 /// the dependency cache on the board the way `refresh_tasks` registers it.
 fn add_blocked_task(board: &mut BoardState, title: &str) -> String {
     let mut task = create_test_task(title, TaskStatus::Backlog);
@@ -333,7 +333,7 @@ fn test_column_of_moves_card_when_dependency_clears() {
 
     assert_eq!(board.column_of(&board.tasks[0]), 0);
 
-    // What a refresh does once the dependency reaches Review: recompute the
+    // What a refresh does once the dependency is merged (Done): recompute the
     // dependency state, and the card is in Ready without its status changing.
     board.dep_states.insert(id, DependencyState::Ready);
 
