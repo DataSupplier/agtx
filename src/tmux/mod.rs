@@ -1,6 +1,7 @@
 pub mod control;
 pub mod input;
 mod operations;
+pub mod pane_process;
 
 pub use control::{
     is_window_close, output_pane_id, tmux_quote, ControlClient, Frame, FrameParser, OutputWatch,

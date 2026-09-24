@@ -4006,7 +4006,7 @@ fn test_is_pane_at_shell_returns_false_for_claude() {
     let mut mock = MockTmuxOperations::new();
     mock.expect_pane_current_command()
         .withf(|t| t == "sess:win")
-        .returning(|_| Some("claude".to_string()));
+        .returning(|_| Some("codex".to_string()));
 
     assert!(!is_pane_at_shell(&mock, "sess:win"));
 }
@@ -4206,7 +4206,7 @@ fn test_switch_agent_claude_sends_exit() {
         .returning(|_| Some("bash".to_string()));
     mock.expect_capture_pane().returning(|_| Ok(String::new()));
 
-    let _ = switch_agent_in_tmux(&mock, "sess:win", "claude", "codex");
+    let _ = switch_agent_in_tmux(&mock, "sess:win", "claude", "codex", "codex");
     assert!(
         exit_sent.load(Ordering::SeqCst),
         "/exit should be sent for claude"
@@ -4241,7 +4241,7 @@ fn test_switch_agent_gemini_sends_quit() {
         .returning(|_| Some("zsh".to_string()));
     mock.expect_capture_pane().returning(|_| Ok(String::new()));
 
-    let _ = switch_agent_in_tmux(&mock, "sess:win", "gemini", "claude");
+    let _ = switch_agent_in_tmux(&mock, "sess:win", "gemini", "claude", "claude");
     assert!(
         quit_sent.load(Ordering::SeqCst),
         "/quit should be sent for gemini"
@@ -4269,7 +4269,7 @@ fn test_switch_agent_codex_sends_ctrl_c() {
         .returning(|_| Some("bash".to_string()));
     mock.expect_capture_pane().returning(|_| Ok(String::new()));
 
-    let _ = switch_agent_in_tmux(&mock, "sess:win", "codex", "claude");
+    let _ = switch_agent_in_tmux(&mock, "sess:win", "codex", "claude", "claude");
     assert!(
         ctrl_c_sent.load(Ordering::SeqCst),
         "Ctrl+C should be sent for codex"
@@ -12718,6 +12718,7 @@ fn test_switch_agent_claude_sends_exit_then_new_cmd() {
         &mock_tmux,
         "proj:task",
         "claude",
+        "claude",
         "claude --dangerously-skip-permissions",
     );
 }
@@ -12750,6 +12751,7 @@ fn test_switch_agent_codex_sends_ctrl_c_not_exit() {
     let _ = switch_agent_in_tmux(
         &mock_tmux,
         "proj:task",
+        "codex",
         "codex",
         "codex --sandbox workspace-write",
     );
@@ -12796,7 +12798,7 @@ fn test_switch_agent_retries_with_ctrl_c_when_shell_not_found() {
         .times(1)
         .returning(|_, _| Ok(()));
 
-    let _ = switch_agent_in_tmux(&mock_tmux, "proj:task", "claude", "newagent");
+    let _ = switch_agent_in_tmux(&mock_tmux, "proj:task", "claude", "newagent", "newagent");
 }
 
 #[test]
@@ -12816,7 +12818,9 @@ fn test_switch_agent_sends_ctrl_d_as_last_resort() {
     mock_tmux.expect_send_key().returning(|_, _| Ok(()));
     mock_tmux.expect_paste_text().times(0);
 
-    assert!(switch_agent_in_tmux(&mock_tmux, "proj:task", "claude", "newagent").is_err());
+    assert!(
+        switch_agent_in_tmux(&mock_tmux, "proj:task", "claude", "newagent", "newagent").is_err()
+    );
 }
 
 #[test]
@@ -12854,7 +12858,13 @@ fn test_switch_agent_always_sends_new_agent_cmd() {
         .times(1)
         .returning(|_, _| Ok(()));
 
-    let _ = switch_agent_in_tmux(&mock_tmux, "proj:task", "claude", "my-new-agent");
+    let _ = switch_agent_in_tmux(
+        &mock_tmux,
+        "proj:task",
+        "claude",
+        "my-new-agent",
+        "my-new-agent",
+    );
 }
 /// The bug reproduced live: a hand-off prompt is multi-paragraph reviewer
 /// findings, so the composed command line carries literal `\n`s. Typing that
@@ -12916,7 +12926,7 @@ fn test_switch_agent_multiline_new_agent_cmd_uses_paste_text_not_send_keys() {
         .withf(|_, cmd: &str| !cmd.contains("Review findings"))
         .returning(|_, _| Ok(()));
 
-    let _ = switch_agent_in_tmux(&mock_tmux, "proj:task", "codex", new_agent_cmd);
+    let _ = switch_agent_in_tmux(&mock_tmux, "proj:task", "codex", "claude", new_agent_cmd);
 
     assert_eq!(
         pasted.lock().unwrap().as_deref(),
@@ -12983,7 +12993,7 @@ fn switch_agent_in_tmux_codex_reviewer_findings_round_trip_through_a_real_shell(
         .returning(|_, _| Ok(()));
     mock_tmux.expect_send_keys().returning(|_, _| Ok(()));
 
-    switch_agent_in_tmux(&mock_tmux, "proj:task", "codex", &new_agent_cmd).unwrap();
+    switch_agent_in_tmux(&mock_tmux, "proj:task", "codex", "codex", &new_agent_cmd).unwrap();
 
     let full_cmd = pasted
         .lock()
@@ -13052,6 +13062,7 @@ fn switch_agent_in_tmux_reports_failure_when_previous_agent_never_confirmed_exit
         &mock_tmux,
         "proj:task",
         "codex",
+        "claude",
         "claude --dangerously-skip-permissions",
     );
 
@@ -13424,7 +13435,7 @@ fn test_switch_agent_cursor_sends_ctrl_c_not_exit() {
         .times(1)
         .returning(|_, _| Ok(()));
 
-    let _ = switch_agent_in_tmux(&mock_tmux, "proj:task", "cursor", "agent --yolo");
+    let _ = switch_agent_in_tmux(&mock_tmux, "proj:task", "cursor", "cursor", "agent --yolo");
 }
 
 #[test]
@@ -13448,7 +13459,7 @@ fn test_switch_agent_opencode_sends_exit() {
         .expect_capture_pane()
         .returning(|_| Ok(String::new()));
 
-    let _ = switch_agent_in_tmux(&mock_tmux, "proj:task", "opencode", "opencode");
+    let _ = switch_agent_in_tmux(&mock_tmux, "proj:task", "opencode", "opencode", "opencode");
     assert!(
         exit_sent.load(std::sync::atomic::Ordering::SeqCst),
         "/exit should be sent for opencode"
@@ -17490,4 +17501,119 @@ fn a_blocked_backlog_card_still_cannot_move_right() {
         .unwrap()
         .unwrap();
     assert_eq!(saved.status, TaskStatus::Backlog);
+}
+
+// =============================================================================
+// State-aware recovery: a rebuilt pane resumes the session holding the
+// current workflow state's prompt, or starts fresh and receives it again.
+// =============================================================================
+
+struct RecoveryProbe(crate::agent::native_session::Delivery);
+
+impl crate::agent::native_session::SessionProbe for RecoveryProbe {
+    fn turn_activity(
+        &self,
+        _: &str,
+        _: &Path,
+        _: &str,
+    ) -> Option<crate::agent::native_session::TurnActivity> {
+        None
+    }
+    fn find_delivered_prompt(
+        &self,
+        _: &str,
+        _: &Path,
+        _: &str,
+        _: std::time::SystemTime,
+    ) -> crate::agent::native_session::Delivery {
+        self.0.clone()
+    }
+}
+
+/// A task in `implementing` attempt 8 whose journal holds `prompt`.
+fn task_in_implementing(prompt: &str) -> (Database, Task) {
+    let mut db = Database::open_in_memory_project().unwrap();
+    let task = Task::new("PHASE1 - Setup", "opencode", "proj");
+    db.create_task(&task).unwrap();
+    let mut state = crate::db::WorkflowTaskState::new(&task.id, "implementing", "feature/poc");
+    state.state_attempt = 8;
+    let record =
+        crate::db::WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "implementing");
+    db.record_workflow_admission(&task, &state, &record)
+        .unwrap();
+    let mut report = crate::db::TaskStepReport::new(&task.id, 8, "implementing");
+    report.prompt_text = Some(prompt.to_string());
+    db.upsert_task_step_report(&report).unwrap();
+    (db, task)
+}
+
+fn recovery_events(db: &Database, task: &Task, event_type: &str) -> usize {
+    db.task_execution_events(&task.id)
+        .unwrap()
+        .iter()
+        .filter(|event| event.event_type == event_type)
+        .count()
+}
+
+/// The session that demonstrably holds the implementer prompt is resumed.
+#[test]
+fn recovery_resumes_the_session_holding_the_current_state_prompt() {
+    let (db, task) = task_in_implementing("You are the implementer for task 16581cba.");
+    let probe = RecoveryProbe(crate::agent::native_session::Delivery::Confirmed(
+        "ses_implementer".into(),
+    ));
+
+    let target =
+        resolve_recovery_session(Some(&db), &task.id, "opencode", Path::new("/wt/a"), &probe);
+
+    assert_eq!(target.session.as_deref(), Some("ses_implementer"));
+    assert_eq!(target.redeliver, None);
+    assert_eq!(recovery_events(&db, &task, "agent_session_resumed"), 1);
+}
+
+/// Regression for 16581cba: the only OpenCode session in the worktree is the
+/// planner's. Resuming it made the "implementer" act as planner. Recovery
+/// must start fresh and deliver the implementer prompt instead.
+#[test]
+fn recovery_never_resumes_a_session_from_an_earlier_role() {
+    let prompt = "You are the implementer for task 16581cba.\n\nImplement only the approved plan.";
+    let (db, task) = task_in_implementing(prompt);
+    let probe = RecoveryProbe(crate::agent::native_session::Delivery::Missing);
+
+    let target =
+        resolve_recovery_session(Some(&db), &task.id, "opencode", Path::new("/wt/a"), &probe);
+
+    assert_eq!(target.session, None);
+    assert_eq!(target.redeliver.as_deref(), Some(prompt));
+    assert_eq!(
+        recovery_events(&db, &task, "agent_state_prompt_redelivered"),
+        1
+    );
+}
+
+/// A journal copy cut at the size limit is not the prompt; it is never
+/// re-sent as if it were.
+#[test]
+fn recovery_never_redelivers_a_truncated_journal_prompt() {
+    let (db, task) =
+        task_in_implementing("You are the implementer …\n\n[truncated by AGTX execution journal]");
+    let probe = RecoveryProbe(crate::agent::native_session::Delivery::Missing);
+
+    let target =
+        resolve_recovery_session(Some(&db), &task.id, "opencode", Path::new("/wt/a"), &probe);
+
+    assert_eq!(target.redeliver, None);
+}
+
+/// Claude's `--continue` is already scoped to the working directory; its
+/// recovery is unchanged.
+#[test]
+fn recovery_leaves_recency_scoped_agents_alone() {
+    let (db, task) = task_in_implementing("You are the implementer for task 1.");
+    let probe = RecoveryProbe(crate::agent::native_session::Delivery::Missing);
+
+    let target =
+        resolve_recovery_session(Some(&db), &task.id, "claude", Path::new("/wt/a"), &probe);
+
+    assert_eq!(target, RecoveryTarget::default());
 }
