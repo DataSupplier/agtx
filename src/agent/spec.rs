@@ -31,8 +31,26 @@ pub enum PromptForm {
 pub enum ResumeArgs {
     /// Appended after the launch flags: `claude --dangerously-skip-permissions --continue`.
     Append(&'static [&'static str]),
-    /// Replaces the launch flags entirely: `codex resume --last` takes no `--sandbox`.
+    /// Replaces the launch flags entirely.
     Replace(&'static [&'static str]),
+    /// Resume only by explicit session id, as `<args...> <id>` replacing the
+    /// launch flags: `codex resume <id>`. Used where the agent's "most recent
+    /// session" is not scoped to the task worktree (`codex resume --last` picks
+    /// the newest session in *any* directory). Without a known id the agent is
+    /// started fresh rather than guessing -- see `agent::native_session`.
+    ReplaceWithSession(&'static [&'static str]),
+    /// Resume only by explicit session id, as `<flag> <id>` appended after the
+    /// launch flags: `opencode --session <id>`. Every worktree of a repository
+    /// shares one OpenCode project, so `--continue` is repository-wide. Without
+    /// a known id the agent is started fresh.
+    AppendSession(&'static str),
+}
+
+impl ResumeArgs {
+    /// Whether resuming this agent needs an explicit, task-owned session id.
+    pub fn requires_session_id(self) -> bool {
+        matches!(self, Self::ReplaceWithSession(_) | Self::AppendSession(_))
+    }
 }
 
 /// How skill files are laid out in the agent's native discovery directory, and
@@ -453,7 +471,9 @@ pub const AGENT_SPECS: &[AgentSpec] = &[
         // submitted, and the `$skill` mention resolves and runs.
         launch_prompt_verified: true,
         // `codex resume` is its own subcommand and rejects the launch flags.
-        resume: ResumeArgs::Replace(&["resume", "--last"]),
+        // Never `--last`: in codex-cli 0.156.1 it takes the newest session
+        // across all directories, which resumed another task's conversation.
+        resume: ResumeArgs::ReplaceWithSession(&["resume"]),
         headless_args: &["exec", "--sandbox", "workspace-write"],
         skill_dir: Some((".codex/skills", "")),
         skill_layout: SkillLayout::SkillDir,
@@ -650,7 +670,9 @@ pub const AGENT_SPECS: &[AgentSpec] = &[
         // submit after the interactive UI reports ready.
         prompt_form: PromptForm::Flag("--prompt"),
         launch_prompt_verified: false,
-        resume: ResumeArgs::Append(&["--continue"]),
+        // `--session <id>`, never `--continue`: all worktrees of one repository
+        // share an OpenCode project, so "last session" is not task-scoped.
+        resume: ResumeArgs::AppendSession("--session"),
         headless_args: &[],
         skill_dir: Some((".opencode/command", "")),
         skill_layout: SkillLayout::OpenCodeFlat,

@@ -79,7 +79,7 @@ fn claude_fresh_and_resume_grant_identical_tools_for_the_same_policy() {
 
     let fresh =
         build_policy_agent_command(&agent_ops, "claude", "Implement F3.3", Some(&policy), None);
-    let resumed = build_policy_resume_command(&agent_ops, "claude", Some(&policy), None);
+    let resumed = build_policy_resume_command(&agent_ops, "claude", Some(&policy), None, None);
 
     let expected_tools = "Read,Glob,Grep,Bash(ruff check *),Bash(mypy *),Edit,Write";
     assert_eq!(allowed_tools_value(&fresh), expected_tools);
@@ -104,7 +104,7 @@ fn claude_policy_grants_edit_and_write_for_a_writable_role() {
     };
     let fresh =
         build_policy_agent_command(&agent_ops, "claude", "Implement F3.3", Some(&policy), None);
-    let resumed = build_policy_resume_command(&agent_ops, "claude", Some(&policy), None);
+    let resumed = build_policy_resume_command(&agent_ops, "claude", Some(&policy), None, None);
 
     assert!(fresh.contains("Edit,Write"));
     assert!(resumed.contains("Edit,Write"));
@@ -173,7 +173,7 @@ fn resumed_implementer_with_write_paths_preserves_edit_and_bash_entries() {
     let agent_ops = MockAgentOperations::new();
     let policy = implementer_policy();
 
-    let command = build_policy_resume_command(&agent_ops, "claude", Some(&policy), None);
+    let command = build_policy_resume_command(&agent_ops, "claude", Some(&policy), None, None);
 
     assert!(command.contains("Edit,Write"));
     assert!(command.contains("Bash(ruff check *)"));
@@ -192,9 +192,9 @@ fn resume_without_a_policy_falls_back_to_the_plain_resume_command() {
     let mut agent_ops = MockAgentOperations::new();
     agent_ops
         .expect_build_resume_command()
-        .returning(|| "claude --dangerously-skip-permissions --continue".to_string());
+        .returning(|_| "claude --dangerously-skip-permissions --continue".to_string());
 
-    let command = build_policy_resume_command(&agent_ops, "claude", None, None);
+    let command = build_policy_resume_command(&agent_ops, "claude", None, None, None);
 
     assert_eq!(command, "claude --dangerously-skip-permissions --continue");
 }
@@ -326,11 +326,60 @@ fn codex_resume_reapplies_state_scoped_network_policy() {
         ..Default::default()
     };
 
-    let command = build_policy_resume_command(&agent_ops, "codex", Some(&policy), None);
+    let command = build_policy_resume_command(
+        &agent_ops,
+        "codex",
+        Some(&policy),
+        None,
+        Some("01a0d2cd-3d6c-7001-a881-a219ca0e229d"),
+    );
 
     assert!(command.contains("--config sandbox_workspace_write.network_access=true"));
     assert!(command.contains("--sandbox workspace-write"));
-    assert!(command.ends_with("resume --last"));
+    assert!(command.ends_with("resume 01a0d2cd-3d6c-7001-a881-a219ca0e229d"));
+}
+
+/// Regression for the cross-task resume: a recovered Codex pane with no
+/// session of its own must start fresh under the same policy flags, never
+/// `resume --last`, which picks the newest session of *any* worktree. An id
+/// that is not a plain token is treated as unknown, not spliced into a shell.
+#[test]
+#[cfg(feature = "test-mocks")]
+fn codex_resume_without_own_session_starts_fresh_and_never_uses_last() {
+    let agent_ops = MockAgentOperations::new();
+    let policy = ResolvedWorkflowPolicy {
+        role_policy: crate::workflow::WorkflowRolePolicy {
+            write_paths: vec![".agent-flow/review.yaml".to_string()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    for session in [None, Some("x; rm -rf /")] {
+        let command =
+            build_policy_resume_command(&agent_ops, "codex", Some(&policy), None, session);
+        assert!(!command.contains("--last"), "{command}");
+        assert!(!command.contains("resume"), "{command}");
+        assert!(command.ends_with("--sandbox workspace-write --ask-for-approval never"));
+    }
+}
+
+/// OpenCode is resumed through the agent's own session-scoped command, with
+/// the task worktree's session id passed through unchanged.
+#[test]
+#[cfg(feature = "test-mocks")]
+fn opencode_policy_resume_passes_the_worktree_session_through() {
+    let mut agent_ops = MockAgentOperations::new();
+    agent_ops
+        .expect_build_resume_command()
+        .withf(|session| *session == Some("ses_own"))
+        .returning(|session| format!("opencode --session {}", session.unwrap()));
+    let policy = ResolvedWorkflowPolicy::default();
+
+    let command =
+        build_policy_resume_command(&agent_ops, "opencode", Some(&policy), None, Some("ses_own"));
+
+    assert_eq!(command, "opencode --session ses_own");
 }
 
 /// `resolve_task_workflow_policy` must distinguish "never workflow-managed"

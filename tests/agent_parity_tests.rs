@@ -141,15 +141,15 @@ fn interactive_command_escapes_single_quotes_for_every_agent() {
 fn resume_command_parity() {
     let expected: &[(&str, &str)] = &[
         ("claude", "claude --dangerously-skip-permissions --continue"),
-        // Codex resume *replaces* the launch flags rather than appending to
-        // them: there is no `--sandbox` here.
-        ("codex", "codex resume --last"),
+        // Codex and OpenCode resume only by an explicit session id; with none
+        // they start fresh instead of guessing "the most recent" session.
+        ("codex", "codex --sandbox workspace-write"),
         ("copilot", "copilot --allow-all-tools --continue"),
         (
             "gemini",
             "GEMINI_TRUST_WORKSPACE=true gemini --approval-mode yolo --resume",
         ),
-        ("opencode", "opencode --continue"),
+        ("opencode", "XDG_DATA_HOME=/tmp/agtx-opencode opencode"),
         ("cursor", "agent --yolo --trust --continue"),
         ("grok", "grok --yolo --trust --continue"),
         (
