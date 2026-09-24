@@ -137,7 +137,7 @@ fn test_build_resume_command_all_agents() {
     );
     assert_eq!(
         by_name("codex").build_resume_command(),
-        "codex resume --last"
+        "codex --sandbox workspace-write"
     );
     assert_eq!(
         by_name("copilot").build_resume_command(),
@@ -149,7 +149,7 @@ fn test_build_resume_command_all_agents() {
     );
     assert_eq!(
         by_name("opencode").build_resume_command(),
-        "opencode --continue"
+        "XDG_DATA_HOME=/tmp/agtx-opencode opencode"
     );
     assert_eq!(
         by_name("cursor").build_resume_command(),
@@ -162,6 +162,34 @@ fn test_build_resume_command_all_agents() {
     assert_eq!(
         by_name("antigravity").build_resume_command(),
         "agy --dangerously-skip-permissions --mode accept-edits --continue"
+    );
+}
+
+/// Codex and OpenCode resume only an explicit, task-owned session id: their
+/// "most recent session" spans every worktree, which once resumed another
+/// task's conversation. Without an id they start fresh (see above).
+#[test]
+fn test_build_session_resume_command_scopes_codex_and_opencode_by_id() {
+    let agents = known_agents();
+    let by_name = |n: &str| agents.iter().find(|a| a.name == n).unwrap().clone();
+
+    assert_eq!(
+        by_name("codex").build_session_resume_command(Some("01a0d2cd-3d6c-7001")),
+        "codex resume 01a0d2cd-3d6c-7001"
+    );
+    assert_eq!(
+        by_name("opencode").build_session_resume_command(Some("ses_f2f4ea2c0ffe")),
+        "XDG_DATA_HOME=/tmp/agtx-opencode opencode --session ses_f2f4ea2c0ffe"
+    );
+    // An id that is not a plain token is never spliced into the command.
+    assert_eq!(
+        by_name("codex").build_session_resume_command(Some("x; rm -rf /")),
+        "codex --sandbox workspace-write"
+    );
+    // Recency-based agents are already scoped to the working directory.
+    assert_eq!(
+        by_name("claude").build_session_resume_command(Some("ignored")),
+        "claude --dangerously-skip-permissions --continue"
     );
 }
 

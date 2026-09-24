@@ -92,9 +92,10 @@ fn record_agent_prompt(
 }
 
 /// Attach a provider-native session when the provider exposes one. Hook-based
-/// agents (Codex/Claude) report their current id; OpenCode is discovered from
-/// its local SQLite session store by worktree. Rows are append-only so a
-/// fallback or relaunch remains visible to usage analysis.
+/// agents (Codex/Claude) report their current id; Codex and OpenCode are also
+/// discovered from their local session stores by the exact worktree they were
+/// started in (`agent::native_session`). Rows are append-only so a fallback or
+/// relaunch remains visible to usage analysis.
 fn record_provider_session_if_known(
     db: &Database,
     task: &Task,
@@ -109,34 +110,12 @@ fn record_provider_session_if_known(
         chrono::Utc::now().timestamp(),
     )
     .and_then(|status| status.session_id);
-    let opencode_id = if agent == "opencode" {
-        let data_home = std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/tmp/agtx-opencode"));
-        opencode_session_id_for_worktree(&data_home, worktree)
-    } else {
-        None
-    };
-    let Some(provider_session_id) = hook_id.or(opencode_id) else {
+    let Some(provider_session_id) = hook_id.or_else(|| {
+        crate::agent::native_session::session_id_for_worktree(agent, Path::new(worktree))
+    }) else {
         return;
     };
     record_provider_session(db, task, state, attempt, agent, provider_session_id);
-}
-
-/// Look up the newest OpenCode native session for this worktree without ever
-/// mutating the provider's local database.  A failed/missing local store is
-/// normal for a just-launched session and is deliberately best-effort.
-fn opencode_session_id_for_worktree(data_home: &Path, worktree: &str) -> Option<String> {
-    let database = data_home.join("opencode").join("opencode.db");
-    let conn =
-        rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .ok()?;
-    conn.query_row(
-        "SELECT id FROM session_v2 WHERE directory = ?1 ORDER BY time_updated DESC LIMIT 1",
-        [worktree],
-        |row| row.get(0),
-    )
-    .ok()
 }
 
 fn record_provider_session(
@@ -3251,38 +3230,6 @@ mod launch_tests {
             copy_back: Default::default(),
             auto_dismiss: Vec::new(),
         }
-    }
-
-    #[test]
-    fn discovers_newest_opencode_session_v2_for_worktree() {
-        let data_home = tempfile::tempdir().unwrap();
-        let store = data_home.path().join("opencode");
-        std::fs::create_dir_all(&store).unwrap();
-        let conn = rusqlite::Connection::open(store.join("opencode.db")).unwrap();
-        conn.execute(
-            "CREATE TABLE session_v2 (id TEXT, directory TEXT, time_updated INTEGER)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO session_v2 (id, directory, time_updated) VALUES (?1, ?2, ?3)",
-            rusqlite::params!["older", "C:/work/task", 10_i64],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO session_v2 (id, directory, time_updated) VALUES (?1, ?2, ?3)",
-            rusqlite::params!["newest", "C:/work/task", 20_i64],
-        )
-        .unwrap();
-
-        assert_eq!(
-            opencode_session_id_for_worktree(data_home.path(), "C:/work/task"),
-            Some("newest".to_string())
-        );
-        assert_eq!(
-            opencode_session_id_for_worktree(data_home.path(), "C:/work/other"),
-            None
-        );
     }
 
     #[test]

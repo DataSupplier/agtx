@@ -9936,11 +9936,14 @@ fn recover_task_session(
     // `&task.agent`, not `default_agent`: the resume command must be built
     // for the agent this task's session actually runs, which can differ from
     // the project's current default if that default changed after launch.
+    let native_session =
+        resolve_recovery_session(db, &task.id, &task.agent, Path::new(worktree_path));
     let resume_cmd = build_policy_resume_command(
         agent_ops,
         &task.agent,
         policy.as_ref(),
         Some(Path::new(worktree_path)),
+        native_session.as_deref(),
     );
 
     tmux_ops.create_window(
@@ -12578,10 +12581,16 @@ fn claude_policy_flags(
 /// silently lost the `write_paths`/`allowed_commands` its role required.
 ///
 /// Claude and Codex can both resume under their resolved policy. Codex accepts
-/// `--sandbox`, `--ask-for-approval`, and `--config` before `resume --last`;
+/// `--sandbox`, `--ask-for-approval`, and `--config` before `resume <id>`;
 /// keeping those flags is essential when final validation is recovered after a
 /// container or tmux restart. Every other agent falls back to its native
-/// resume command unchanged.
+/// resume command.
+///
+/// `native_session` is the task worktree's own provider session, found by
+/// `agent::native_session::session_id_for_worktree`. Codex and OpenCode
+/// resume only that id: their "most recent session" is not task-scoped, and
+/// `codex resume --last` once handed a recovered pane another task's
+/// conversation. With no id they start fresh under the same policy flags.
 ///
 /// `agent` must be the task's own bound agent (`task.agent`), not the
 /// project's configured default agent -- those can differ, and using the
@@ -12592,9 +12601,10 @@ fn build_policy_resume_command(
     agent: &str,
     policy: Option<&ResolvedWorkflowPolicy>,
     worktree: Option<&Path>,
+    native_session: Option<&str>,
 ) -> String {
     let Some(policy) = policy else {
-        return agent_ops.build_resume_command();
+        return agent_ops.build_resume_command(native_session);
     };
     if agent == "codex" {
         let model = policy
@@ -12619,15 +12629,16 @@ fn build_policy_resume_command(
         } else {
             ""
         };
+        let resume = native_session
+            .filter(|id| agent::is_plain_session_id(id))
+            .map(|id| format!(" resume {id}"))
+            .unwrap_or_default();
         return format!(
-            "codex{model}{reasoning_effort}{network_config} --sandbox {sandbox} --ask-for-approval never resume --last"
+            "codex{model}{reasoning_effort}{network_config} --sandbox {sandbox} --ask-for-approval never{resume}"
         );
     }
     if agent != "claude" {
-        if agent == "opencode" {
-            return agent_ops.build_resume_command();
-        }
-        return agent_ops.build_resume_command();
+        return agent_ops.build_resume_command(native_session);
     }
     let model = policy
         .role_policy
@@ -13763,11 +13774,15 @@ fn workflow_scoped_resume_command(
         .ancestors()
         .find(|path| path.join(".agtx/workflow.toml").is_file())
     else {
-        return Ok(agent_ops.build_resume_command());
+        let native_session =
+            resolve_recovery_session(None, task_id, agent_name, Path::new(worktree_path));
+        return Ok(agent_ops.build_resume_command(native_session.as_deref()));
     };
     let db = Database::open_project(project_path)?;
+    let native_session =
+        resolve_recovery_session(Some(&db), task_id, agent_name, Path::new(worktree_path));
     let Some(task) = db.get_task(task_id)? else {
-        return Ok(agent_ops.build_resume_command());
+        return Ok(agent_ops.build_resume_command(native_session.as_deref()));
     };
     let policy = resolve_task_workflow_policy(&task, Some(project_path), &task.agent, Some(&db))?;
     Ok(build_policy_resume_command(
@@ -13775,7 +13790,46 @@ fn workflow_scoped_resume_command(
         agent_name,
         policy.as_ref(),
         Some(Path::new(worktree_path)),
+        native_session.as_deref(),
     ))
+}
+
+/// Find the provider-native session a recovered pane must resume: the one
+/// started in this task's own worktree, never the agent's globally most
+/// recent. Journals the decision so a resumed or freshly restarted pane is
+/// traceable to the session it got (or did not get).
+fn resolve_recovery_session(
+    db: Option<&Database>,
+    task_id: &str,
+    agent_name: &str,
+    worktree: &Path,
+) -> Option<String> {
+    let requires_id = agent::spec(agent_name).is_some_and(|s| s.resume.requires_session_id());
+    if !requires_id {
+        return None;
+    }
+    let session = agent::native_session::session_id_for_worktree(agent_name, worktree);
+    if let Some(db) = db {
+        let mut event = crate::db::TaskExecutionEvent::new(
+            task_id,
+            if session.is_some() {
+                "agent_session_resumed"
+            } else {
+                "agent_resume_fresh_fallback"
+            },
+        );
+        event.agent = Some(agent_name.to_string());
+        event.outcome = Some(if session.is_some() { "resumed" } else { "fresh" }.to_string());
+        event.message = Some(match &session {
+            Some(id) => format!("Recovered pane resumes the worktree's own session {id}"),
+            None => format!(
+                "No {agent_name} session was started in {}; recovered pane starts fresh",
+                worktree.display()
+            ),
+        });
+        let _ = db.record_task_execution_event(&event);
+    }
+    session
 }
 
 /// Gracefully switch the agent running in a tmux window.

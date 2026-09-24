@@ -28,9 +28,11 @@ pub trait AgentOperations: Send + Sync {
     /// When prompt is empty, the agent starts with no initial message.
     fn build_interactive_command(&self, prompt: &str) -> String;
 
-    /// Build the shell command to resume the agent's most recent session
-    /// in the current working directory. Used to recover from tmux/server restarts.
-    fn build_resume_command(&self) -> String;
+    /// Build the shell command to resume this task's session after a
+    /// tmux/server restart. `session_id` is the task worktree's own
+    /// provider-native session (see `agent::native_session`); agents that
+    /// resume by id start fresh when it is `None`.
+    fn build_resume_command<'a>(&self, session_id: Option<&'a str>) -> String;
 
     /// Whether this agent takes the opening message at launch; see
     /// [`crate::agent::PromptInjection`].
@@ -83,8 +85,8 @@ impl AgentOperations for CodingAgent {
         self.agent.build_interactive_command(prompt)
     }
 
-    fn build_resume_command(&self) -> String {
-        self.agent.build_resume_command()
+    fn build_resume_command<'a>(&self, session_id: Option<&'a str>) -> String {
+        self.agent.build_session_resume_command(session_id)
     }
 
     fn prompt_injection(&self) -> crate::agent::PromptInjection {

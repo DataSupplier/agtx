@@ -1,4 +1,5 @@
 pub mod hook_status;
+pub mod native_session;
 mod operations;
 pub mod spec;
 pub mod trust;
@@ -89,14 +90,41 @@ impl Agent {
 
     /// Build the shell command to resume the agent's most recent session
     /// in the current working directory. Used to recover from tmux/server restarts.
+    ///
+    /// Agents whose resume needs an explicit session id (see
+    /// [`spec::ResumeArgs::requires_session_id`]) start fresh here; use
+    /// [`Self::build_session_resume_command`] with the task's own session.
     pub fn build_resume_command(&self) -> String {
+        self.build_session_resume_command(None)
+    }
+
+    /// Build the resume command for a known provider-native session.
+    ///
+    /// `session_id` is only used by agents that resume by id; recency-based
+    /// agents (`--continue`, scoped to the working directory) ignore it. An id
+    /// that is missing or not a plain token starts the agent fresh -- it must
+    /// never fall back to a "most recent session" guess that could belong to
+    /// another task.
+    pub fn build_session_resume_command(&self, session_id: Option<&str>) -> String {
         let Some(s) = spec::spec(&self.name) else {
             // Nothing is known about how this agent resumes; start it fresh.
             return self.build_interactive_command("");
         };
-        let args: Vec<&str> = match s.resume {
-            spec::ResumeArgs::Append(extra) => s.base_args.iter().chain(extra).copied().collect(),
-            spec::ResumeArgs::Replace(args) => args.to_vec(),
+        let session_id = session_id.filter(|id| is_plain_session_id(id));
+        let args: Vec<&str> = match (s.resume, session_id) {
+            (spec::ResumeArgs::Append(extra), _) => {
+                s.base_args.iter().chain(extra).copied().collect()
+            }
+            (spec::ResumeArgs::Replace(args), _) => args.to_vec(),
+            (spec::ResumeArgs::ReplaceWithSession(args), Some(id)) => {
+                args.iter().copied().chain([id]).collect()
+            }
+            (spec::ResumeArgs::AppendSession(flag), Some(id)) => {
+                s.base_args.iter().copied().chain([flag, id]).collect()
+            }
+            (spec::ResumeArgs::ReplaceWithSession(_) | spec::ResumeArgs::AppendSession(_), None) => {
+                s.base_args.to_vec()
+            }
         };
         spec::compose_command(s, &args, None)
     }
@@ -114,6 +142,15 @@ impl Agent {
             }
         }
     }
+}
+
+/// Provider session ids are UUIDs (Codex) or `ses_…` tokens (OpenCode). They
+/// are spliced into a shell command unquoted, so anything else is rejected.
+pub fn is_plain_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 /// Get the list of known agents, in preference order.
