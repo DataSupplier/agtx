@@ -12250,6 +12250,27 @@ pub(crate) fn resolve_prompt(
         .replace("{phase}", &cycle.to_string())
 }
 
+/// [`resolve_prompt`] for a workflow hand-off: also fills `{workflow_attempt}`
+/// with the attempt number of the workflow state the prompt is delivered in.
+///
+/// Prompts ask agents to record their session as
+/// `agtx:<task>:<state>:<attempt>`. Before this placeholder existed nothing
+/// supplied the attempt, so agents either skipped the capture or invented an
+/// identifier the delivery-insights parser could not read. The number is
+/// fixed into the prompt text AGTX journals, so a recovery or an operator
+/// re-send delivers the same identifier again.
+pub(crate) fn resolve_workflow_prompt(
+    plugin: &Option<WorkflowPlugin>,
+    phase: &str,
+    task_content: &str,
+    task_id: &str,
+    cycle: i32,
+    workflow_attempt: i64,
+) -> String {
+    resolve_prompt(plugin, phase, task_content, task_id, cycle)
+        .replace("{workflow_attempt}", &workflow_attempt.to_string())
+}
+
 /// Resolve one artifact path without allowing a task ID to escape its worktree.
 pub(crate) fn workflow_artifact_path(
     worktree: &str,
@@ -12417,6 +12438,23 @@ pub(crate) fn archive_workflow_artifact(path: &Path, reason: &str) -> Result<Opt
     Ok(Some(archived))
 }
 
+/// Codex's `--config sandbox_workspace_write.writable_roots=[...]` for the
+/// project's declared writable roots, or nothing when none are declared. The
+/// roots are validated as plain absolute paths when the workflow is loaded
+/// (`validate_writable_root`), so they need no escaping here.
+fn codex_writable_roots_flag(policy: &ResolvedWorkflowPolicy) -> String {
+    let roots = &policy.defaults.writable_roots;
+    if roots.is_empty() {
+        return String::new();
+    }
+    let list = roots
+        .iter()
+        .map(|root| format!("\"{root}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(" --config 'sandbox_workspace_write.writable_roots=[{list}]'")
+}
+
 /// Build the narrowest native agent command available for a resolved workflow
 /// role. Claude's `dontAsk` mode denies anything outside its tool allowlist;
 /// Codex uses its actual filesystem sandbox. Exact write-path auditing remains
@@ -12498,7 +12536,8 @@ pub(crate) fn build_policy_agent_command(
             .as_deref()
             .map(|value| format!(" --config model_reasoning_effort={value}"))
             .unwrap_or_default();
-        return format!("codex{model}{reasoning_effort}{network_config} --sandbox {sandbox} --ask-for-approval never '{quoted_prompt}'");
+        let writable_roots = codex_writable_roots_flag(policy);
+        return format!("codex{model}{reasoning_effort}{network_config}{writable_roots} --sandbox {sandbox} --ask-for-approval never '{quoted_prompt}'");
     }
     if agent == "claude" {
         let flags = claude_policy_flags(&policy.role_policy, policy.network, worktree);
@@ -12511,7 +12550,12 @@ pub(crate) fn build_policy_agent_command(
         // before launch so it's in effect for this invocation. See
         // OPENCODE_PERMISSION_PROFILE.md.
         if let Some(wt) = worktree {
-            write_opencode_permission_profile(wt, &policy.role_policy, policy.network);
+            write_opencode_permission_profile(
+                wt,
+                &policy.role_policy,
+                policy.network,
+                &policy.defaults.writable_roots,
+            );
         }
         // `opencode --model` is not an interactive-CLI flag in OpenCode 2.x;
         // it belongs to `opencode run`, which would replace the terminal
@@ -12541,6 +12585,7 @@ pub(crate) fn build_policy_agent_command(
 fn opencode_permission_rules(
     role_policy: &WorkflowRolePolicy,
     network: bool,
+    writable_roots: &[String],
 ) -> Vec<serde_json::Value> {
     let mut rules = Vec::new();
     if role_policy.permission_mode.as_deref() == Some("autonomous") {
@@ -12574,6 +12619,17 @@ fn opencode_permission_rules(
                 serde_json::json!({ "action": "network", "resource": "*", "effect": "allow" }),
             );
         }
+        // Project-declared writable roots (`[role_policies.defaults]
+        // writable_roots`) are stable absolute directories, identical in every
+        // worktree -- unlike the per-worktree path the note above rules out.
+        for root in writable_roots {
+            let resource = format!("{}/**", root.trim_end_matches('/'));
+            rules.push(serde_json::json!({
+                "action": "external_directory",
+                "resource": resource,
+                "effect": "allow"
+            }));
+        }
     }
     if role_policy.allow_subagents == Some(false) {
         rules.push(serde_json::json!({ "action": "subagent", "resource": "*", "effect": "deny" }));
@@ -12601,8 +12657,9 @@ fn write_opencode_permission_profile(
     worktree: &Path,
     role_policy: &WorkflowRolePolicy,
     network: bool,
+    writable_roots: &[String],
 ) {
-    let rules = opencode_permission_rules(role_policy, network);
+    let rules = opencode_permission_rules(role_policy, network, writable_roots);
     let cfg_path = worktree.join("opencode.json");
     let current_text = std::fs::read_to_string(&cfg_path).ok();
     let mut root = current_text
@@ -12788,8 +12845,9 @@ fn build_policy_resume_command(
             .filter(|id| agent::is_plain_session_id(id))
             .map(|id| format!(" resume {id}"))
             .unwrap_or_default();
+        let writable_roots = codex_writable_roots_flag(policy);
         return format!(
-            "codex{model}{reasoning_effort}{network_config} --sandbox {sandbox} --ask-for-approval never{resume}"
+            "codex{model}{reasoning_effort}{network_config}{writable_roots} --sandbox {sandbox} --ask-for-approval never{resume}"
         );
     }
     if agent != "claude" {

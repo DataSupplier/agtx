@@ -629,9 +629,8 @@ impl AgtxMcpServer {
                                 let dep_state = db.dependency_state(&t);
                                 let deps_satisfied = dep_state.is_ready();
                                 let blocked_by = dep_state.blocked_by().to_vec();
-                                let integration_conflicts = integration_conflict_list(
-                                    t.integration_conflicts.as_deref(),
-                                );
+                                let integration_conflicts =
+                                    integration_conflict_list(t.integration_conflicts.as_deref());
                                 TaskSummary {
                                     id: t.id,
                                     title: t.title,

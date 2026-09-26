@@ -344,6 +344,15 @@ pub struct WorkflowPolicyDefaults {
     pub approve_bypass: bool,
     #[serde(default)]
     pub network: bool,
+    /// Absolute directories *outside* the task worktree that every role's
+    /// agent may write, e.g. a shared outbox. Codex's `workspace-write`
+    /// sandbox otherwise mounts everything outside the worktree (and `/tmp`)
+    /// read-only, so an agent cannot record evidence the project collects
+    /// centrally. Declared here, in the reviewed workflow file, rather than in
+    /// an agent's own settings, so the grant stays reconstructable from this
+    /// one file (see the invariant on `WorkflowRolePolicy`).
+    #[serde(default)]
+    pub writable_roots: Vec<String>,
 }
 
 /// TOML container for `[role_policies.defaults]` and one table per role.
@@ -478,6 +487,9 @@ impl WorkflowProjectConfig {
         }
         if self.role_policies.defaults.approve_bypass {
             bail!("workflow policy may not allow approve_bypass");
+        }
+        for root in &self.role_policies.defaults.writable_roots {
+            validate_writable_root(root)?;
         }
         for (role, policy) in &self.role_policies.roles {
             validate_identifier("role", role)?;
@@ -635,9 +647,49 @@ fn validate_worktree_glob(glob: &str) -> Result<()> {
     Ok(())
 }
 
+/// A writable root is spliced into an agent launch command, so it is held to a
+/// plain absolute path: no glob, no `..`, not the filesystem root, and only
+/// characters that need no shell or TOML quoting.
+fn validate_writable_root(root: &str) -> Result<()> {
+    let plain = root
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'));
+    let segments: Vec<&str> = root.split('/').filter(|s| !s.is_empty()).collect();
+    if !root.starts_with('/')
+        || !plain
+        || segments.is_empty()
+        || segments.iter().any(|s| *s == ".." || *s == ".")
+    {
+        bail!(
+            "writable root '{root}' must be a plain absolute directory \
+             (letters, digits, '/', '.', '_', '-'; no '..', not '/')"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writable_roots_must_be_plain_absolute_directories() {
+        for ok in ["/workspace/.delivery-insights", "/tmp/heaves-heavy-slots"] {
+            assert!(validate_writable_root(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "/",
+            "relative/dir",
+            "/workspace/../etc",
+            "/workspace/**",
+            "/work space",
+            "/x\"; rm -rf /",
+            "/x'y",
+        ] {
+            assert!(validate_writable_root(bad).is_err(), "{bad}");
+        }
+    }
 
     fn workflow() -> WorkflowDefinition {
         WorkflowDefinition {

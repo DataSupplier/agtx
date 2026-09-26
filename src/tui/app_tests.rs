@@ -5865,7 +5865,7 @@ fn test_opencode_permission_rules_none_by_default() {
         allowed_commands: vec!["pytest".into()],
         ..Default::default()
     };
-    let rules = opencode_permission_rules(&policy, true);
+    let rules = opencode_permission_rules(&policy, true, &[]);
     assert!(
         rules.is_empty(),
         "no permission_mode must generate no rules"
@@ -5883,7 +5883,7 @@ fn test_opencode_permission_rules_autonomous_translates_role_policy() {
         allowed_commands: vec!["pytest".into(), "pnpm test".into()],
         ..Default::default()
     };
-    let rules = opencode_permission_rules(&policy, true);
+    let rules = opencode_permission_rules(&policy, true, &[]);
 
     let has = |action: &str, resource: &str, effect: &str| {
         rules
@@ -5917,7 +5917,7 @@ fn test_opencode_permission_rules_subagents_independent_of_autonomous() {
         permission_mode: Some("autonomous".into()),
         ..Default::default()
     };
-    let rules = opencode_permission_rules(&autonomous_no_subagent_opinion, false);
+    let rules = opencode_permission_rules(&autonomous_no_subagent_opinion, false, &[]);
     assert!(
         !rules.iter().any(|r| r["action"] == "subagent"),
         "autonomous mode alone must not deny subagents"
@@ -5927,7 +5927,7 @@ fn test_opencode_permission_rules_subagents_independent_of_autonomous() {
         allow_subagents: Some(false),
         ..Default::default()
     };
-    let rules = opencode_permission_rules(&explicit_deny, false);
+    let rules = opencode_permission_rules(&explicit_deny, false, &[]);
     assert!(rules
         .iter()
         .any(|r| r["action"] == "subagent" && r["effect"] == "deny"));
@@ -5936,7 +5936,7 @@ fn test_opencode_permission_rules_subagents_independent_of_autonomous() {
         allow_subagents: Some(true),
         ..Default::default()
     };
-    let rules = opencode_permission_rules(&explicit_allow, false);
+    let rules = opencode_permission_rules(&explicit_allow, false, &[]);
     assert!(!rules.iter().any(|r| r["action"] == "subagent"));
 }
 
@@ -5967,7 +5967,7 @@ fn test_write_opencode_permission_profile_replaces_generated_slice_without_accum
         write_paths: vec![".agtx/plans/**".into()],
         ..Default::default()
     };
-    write_opencode_permission_profile(wt, &planner, false);
+    write_opencode_permission_profile(wt, &planner, false, &[]);
 
     let after_planner: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(wt.join("opencode.json")).unwrap()).unwrap();
@@ -5988,7 +5988,7 @@ fn test_write_opencode_permission_profile_replaces_generated_slice_without_accum
         write_paths: vec!["api/**".into()],
         ..Default::default()
     };
-    write_opencode_permission_profile(wt, &implementer, false);
+    write_opencode_permission_profile(wt, &implementer, false, &[]);
 
     let after_implementer: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(wt.join("opencode.json")).unwrap()).unwrap();
@@ -6033,7 +6033,7 @@ fn test_write_opencode_permission_profile_preserves_duplicate_project_rule() {
     )
     .unwrap();
 
-    write_opencode_permission_profile(wt, &WorkflowRolePolicy::default(), false);
+    write_opencode_permission_profile(wt, &WorkflowRolePolicy::default(), false, &[]);
 
     let value: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(wt.join("opencode.json")).unwrap()).unwrap();
@@ -6070,7 +6070,7 @@ fn test_strip_opencode_permission_profile_restores_the_original_bytes() {
     let original = "{\n    \"model\": \"deepseek/deepseek-flash\",\n    \"permissions\": [\n        { \"action\": \"external_directory\", \"resource\": \"/workspace/**\", \"effect\": \"allow\" }\n    ]\n}\n";
     std::fs::write(wt.join("opencode.json"), original).unwrap();
 
-    write_opencode_permission_profile(wt, &opencode_implementer_role(), true);
+    write_opencode_permission_profile(wt, &opencode_implementer_role(), true, &[]);
     let during = std::fs::read_to_string(wt.join("opencode.json")).unwrap();
     assert!(during.contains("api/**") && during.contains("glm/glm-5.3-flash"));
 
@@ -6096,9 +6096,9 @@ fn test_strip_after_multiple_role_launches_restores_the_original() {
         write_paths: vec![".agtx/plans/**".into()],
         ..Default::default()
     };
-    write_opencode_permission_profile(wt, &planner, true);
-    write_opencode_permission_profile(wt, &opencode_implementer_role(), true);
-    write_opencode_permission_profile(wt, &planner, false);
+    write_opencode_permission_profile(wt, &planner, true, &[]);
+    write_opencode_permission_profile(wt, &opencode_implementer_role(), true, &[]);
+    write_opencode_permission_profile(wt, &planner, false, &[]);
 
     crate::opencode_profile::strip_opencode_permission_profile(wt);
     assert_eq!(
@@ -6114,15 +6114,15 @@ fn test_strip_after_multiple_role_launches_restores_the_original() {
 fn test_already_present_rules_are_not_appended_again() {
     let dir = tempfile::tempdir().unwrap();
     let wt = dir.path();
-    write_opencode_permission_profile(wt, &opencode_implementer_role(), false);
+    write_opencode_permission_profile(wt, &opencode_implementer_role(), false, &[]);
     crate::opencode_profile::strip_opencode_permission_profile(wt);
     // Simulate the old leak: the generated rules are now part of the file.
-    write_opencode_permission_profile(wt, &opencode_implementer_role(), false);
+    write_opencode_permission_profile(wt, &opencode_implementer_role(), false, &[]);
     let leaked = std::fs::read_to_string(wt.join("opencode.json")).unwrap();
     std::fs::remove_file(opencode_permission_sidecar_path(wt)).unwrap();
 
     for _ in 0..3 {
-        write_opencode_permission_profile(wt, &opencode_implementer_role(), false);
+        write_opencode_permission_profile(wt, &opencode_implementer_role(), false, &[]);
     }
     let value: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(wt.join("opencode.json")).unwrap()).unwrap();
@@ -6150,7 +6150,7 @@ fn test_strip_keeps_changes_the_task_made() {
         "{\"model\": \"deepseek/deepseek-flash\", \"permissions\": []}",
     )
     .unwrap();
-    write_opencode_permission_profile(wt, &opencode_implementer_role(), false);
+    write_opencode_permission_profile(wt, &opencode_implementer_role(), false, &[]);
     let mut value: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(wt.join("opencode.json")).unwrap()).unwrap();
     value["provider"] = serde_json::json!({"extra": {"npm": "x"}});
@@ -17645,4 +17645,96 @@ fn recovery_leaves_recency_scoped_agents_alone() {
         resolve_recovery_session(Some(&db), &task.id, "claude", Path::new("/wt/a"), &probe);
 
     assert_eq!(target, RecoveryTarget::default());
+}
+
+// =============================================================================
+// Project-declared writable roots outside the task worktree
+// =============================================================================
+
+fn policy_with_writable_roots(roots: &[&str]) -> ResolvedWorkflowPolicy {
+    ResolvedWorkflowPolicy {
+        role_policy: crate::workflow::WorkflowRolePolicy {
+            write_paths: vec![".agent-flow/engineering-review.yaml".to_string()],
+            ..Default::default()
+        },
+        defaults: crate::workflow::WorkflowPolicyDefaults {
+            writable_roots: roots.iter().map(|root| root.to_string()).collect(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// Codex's workspace-write sandbox mounts everything outside the worktree
+/// read-only, which made the shared delivery-insights outbox unwritable for
+/// every Codex agent. A declared root must reach both the launch and the
+/// resume command.
+#[test]
+#[cfg(feature = "test-mocks")]
+fn codex_launch_and_resume_grant_the_declared_writable_roots() {
+    let agent_ops = MockAgentOperations::new();
+    let policy = policy_with_writable_roots(&["/workspace/.delivery-insights"]);
+    let flag =
+        r#"--config 'sandbox_workspace_write.writable_roots=["/workspace/.delivery-insights"]'"#;
+
+    let launch = build_policy_agent_command(&agent_ops, "codex", "Review.", Some(&policy), None);
+    let resume =
+        build_policy_resume_command(&agent_ops, "codex", Some(&policy), None, Some("abc-1"));
+
+    for command in [&launch, &resume] {
+        assert!(command.contains(flag), "{command}");
+        assert!(command.contains("--sandbox workspace-write"), "{command}");
+    }
+}
+
+#[test]
+#[cfg(feature = "test-mocks")]
+fn codex_commands_carry_no_writable_roots_flag_when_none_are_declared() {
+    let agent_ops = MockAgentOperations::new();
+    let policy = policy_with_writable_roots(&[]);
+
+    let launch = build_policy_agent_command(&agent_ops, "codex", "Review.", Some(&policy), None);
+    let resume = build_policy_resume_command(&agent_ops, "codex", Some(&policy), None, None);
+
+    for command in [&launch, &resume] {
+        assert!(!command.contains("writable_roots"), "{command}");
+    }
+}
+
+#[test]
+fn opencode_autonomous_profile_allows_the_declared_writable_roots() {
+    let role = crate::workflow::WorkflowRolePolicy {
+        permission_mode: Some("autonomous".to_string()),
+        ..Default::default()
+    };
+
+    let rules =
+        opencode_permission_rules(&role, false, &["/workspace/.delivery-insights".to_string()]);
+
+    assert!(rules.contains(&serde_json::json!({
+        "action": "external_directory",
+        "resource": "/workspace/.delivery-insights/**",
+        "effect": "allow"
+    })));
+    assert!(opencode_permission_rules(&role, false, &[])
+        .iter()
+        .all(|rule| rule["action"] != "external_directory"));
+}
+
+#[test]
+fn workflow_prompts_fill_in_the_workflow_attempt() {
+    let plugin: crate::config::WorkflowPlugin = toml::from_str(
+        "name = \"test\"
+[prompts]
+review = \"Capture --session-id agtx:{task_id}:engineering_review:{workflow_attempt}\"
+",
+    )
+    .unwrap();
+
+    let prompt = resolve_workflow_prompt(&Some(plugin), "review", "task", "T-1", 0, 35);
+
+    assert_eq!(
+        prompt,
+        "Capture --session-id agtx:T-1:engineering_review:35"
+    );
 }

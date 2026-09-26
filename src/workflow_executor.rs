@@ -23,7 +23,7 @@ use crate::tmux::TmuxOperations;
 use crate::tui::app::{
     agtx_task_env, archive_workflow_artifact, build_policy_agent_command,
     ensure_project_tmux_session, ensure_review_addresses_failed_validation, generate_task_slug,
-    planning_artifact_path, resolve_prompt, switch_agent_in_tmux, wait_for_agent_ready,
+    planning_artifact_path, resolve_workflow_prompt, switch_agent_in_tmux, wait_for_agent_ready,
     workflow_artifact_path, workflow_artifact_sha256, workflow_artifact_value,
 };
 use crate::workflow::{GuardContext, WorkflowDefinition, WorkflowProjectConfig};
@@ -1247,7 +1247,7 @@ pub fn start_workflow_planning(
     // saved, and cannot be predicted or copied into the plan artifact.
     let prompt = format!(
         "{}\n\nAGTX owns revision, workflow-attempt, and SHA-256 metadata in its database. Write only the plan content at the required path; do not add, infer, or copy orchestration metadata into the artifact.",
-        resolve_prompt(&Some(plugin.clone()), "planning", &task.content_text(), &task.id, task.cycle),
+        resolve_workflow_prompt(&Some(plugin.clone()), "planning", &task.content_text(), &task.id, task.cycle, planning_attempt),
     );
     let slug = generate_task_slug(&task.id, &task.title);
     let window_name = format!("task-{slug}");
@@ -1772,7 +1772,7 @@ pub fn start_workflow_implementation(
         .ok_or_else(|| anyhow::anyhow!("Implementation state has no bound agent"))?;
     let prompt = format!(
         "{}\n\nAGTX has bound the approved plan internally. Do not write revision, workflow-attempt, or SHA-256 metadata into your result artifact.",
-        resolve_prompt(&Some(plugin.clone()), "running", &task.content_text(), &task.id, task.cycle),
+        resolve_workflow_prompt(&Some(plugin.clone()), "running", &task.content_text(), &task.id, task.cycle, implementation.state.state_attempt),
     );
     let policy = project_workflow.policy_for_state(workflow, &implementation.state.state)?;
     let agent_ops = runtime.agent_registry.get(&implementer);
@@ -1934,7 +1934,7 @@ pub fn submit_workflow_implementation(
         .ok_or_else(|| anyhow::anyhow!("Engineering review state has no bound agent"))?;
     let prompt = format!(
         "{}\n\nAGTX owns workflow-attempt and SHA-256 metadata. Do not write orchestration metadata into your result artifact.",
-        resolve_prompt(&Some(plugin.clone()), "review", &task.content_text(), &task.id, task.cycle),
+        resolve_workflow_prompt(&Some(plugin.clone()), "review", &task.content_text(), &task.id, task.cycle, review.state.state_attempt),
     );
     let target = task
         .session_name
@@ -2064,7 +2064,7 @@ pub fn submit_engineering_review(
         .ok_or_else(|| anyhow::anyhow!("Task session is unavailable"))?;
     let prompt = format!(
         "{}\n\nEngineering-review verdict: {verdict}. Evidence: {}. Follow the declared role policy; do not commit, push, create a PR, merge, or bypass controls.\nAGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artifact.",
-        resolve_prompt(&Some(plugin.clone()), phase, &task.content_text(), &task.id, task.cycle),
+        resolve_workflow_prompt(&Some(plugin.clone()), phase, &task.content_text(), &task.id, task.cycle, transition.state.state_attempt),
         artifact.strip_prefix(&worktree).unwrap_or(&artifact).display(),
     );
     let policy = project_workflow.policy_for_state(workflow, &transition.state.state)?;
@@ -2186,7 +2186,7 @@ pub fn submit_final_validation(
         .ok_or_else(|| anyhow::anyhow!("Task session is unavailable"))?;
     let prompt = format!(
         "{}\n\nFinal-validation verdict: {verdict}. Evidence: {}.{} Follow the declared role policy; do not merge feature/poc into main. AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artifact.",
-        resolve_prompt(&Some(plugin.clone()), phase, &task.content_text(), &task.id, task.cycle),
+        resolve_workflow_prompt(&Some(plugin.clone()), phase, &task.content_text(), &task.id, task.cycle, transition.state.state_attempt),
         artifact.strip_prefix(&worktree).unwrap_or(&artifact).display(),
         if passed {
             String::new()
@@ -4409,6 +4409,8 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
 
         let mut plugin = plugin(graph.clone());
         plugin.artifacts.planning = Some(".agtx/plans/{task_id}.md".into());
+        plugin.prompts.final_validation =
+            Some("Capture as agtx:{task_id}:final_validation:{workflow_attempt}.".into());
 
         let worktree = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
@@ -4501,6 +4503,13 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             sent.contains("AGTX owns workflow-attempt and SHA-256 metadata"),
             "expected metadata-free artifact instruction in the launched prompt, got: {sent}"
         );
+        // The prompt names the attempt of the state it is delivered in, so the
+        // agent can record `agtx:<task>:<state>:<attempt>` without guessing.
+        assert!(
+            sent.contains(&format!("agtx:{}:final_validation:2.", task.id)),
+            "expected the destination attempt in the session id, got: {sent}"
+        );
+        assert!(!sent.contains("{workflow_attempt}"), "{sent}");
     }
 
     /// Opens an independent connection to the same on-disk database `path`
@@ -6561,7 +6570,10 @@ merge_target = "{TARGET}"
         };
         assert!(message.contains("Has merge conflicts"), "{message}");
         let task = fixture.task();
-        assert_eq!(task.integration_status.as_deref(), Some(INTEGRATION_CONFLICTS));
+        assert_eq!(
+            task.integration_status.as_deref(),
+            Some(INTEGRATION_CONFLICTS)
+        );
         assert_eq!(task.integration_conflicts.as_deref(), Some("shared.txt"));
         assert_eq!(task.pr_url.as_deref(), Some("https://example.test/pull/7"));
         assert!(task
@@ -6678,7 +6690,10 @@ merge_target = "{TARGET}"
 
         assert!(matches!(outcome, WorkflowStepOutcome::Blocked { .. }));
         let task = fixture.task();
-        assert_eq!(task.integration_status.as_deref(), Some(INTEGRATION_BLOCKED));
+        assert_eq!(
+            task.integration_status.as_deref(),
+            Some(INTEGRATION_BLOCKED)
+        );
         assert!(task
             .escalation_note
             .as_deref()
@@ -6707,7 +6722,10 @@ merge_target = "{TARGET}"
 
         assert!(matches!(outcome, WorkflowStepOutcome::Blocked { .. }));
         let task = fixture.task();
-        assert_eq!(task.integration_status.as_deref(), Some(INTEGRATION_CONFLICTS));
+        assert_eq!(
+            task.integration_status.as_deref(),
+            Some(INTEGRATION_CONFLICTS)
+        );
         assert_eq!(task.pr_url, None);
         assert!(fixture.repos.remote_ref(BRANCH).is_some());
     }

@@ -316,9 +316,10 @@ impl Database {
         let _ = self
             .conn
             .execute("ALTER TABLE tasks ADD COLUMN integration_status TEXT", []);
-        let _ = self
-            .conn
-            .execute("ALTER TABLE tasks ADD COLUMN integration_conflicts TEXT", []);
+        let _ = self.conn.execute(
+            "ALTER TABLE tasks ADD COLUMN integration_conflicts TEXT",
+            [],
+        );
 
         // Migration: state_attempt is a generation counter for the current
         // entry into whatever state a task occupies. Existing rows predate
