@@ -2192,7 +2192,7 @@ pub fn submit_final_validation(
             String::new()
         } else {
             format!(
-                " A previous validation failure is an active gate: read this exact evidence and write a fresh engineering review. Your review must include validation_failure_sha256: {} and validation_failure_resolution: <what you verified or changed>. Choose the normal engineering-review verdict: corrections_required for unresolved source/test failures, plan_issue for a material plan defect, or approved_for_validation only when a repeat validation is justified.",
+                " A previous validation failure is an active gate: read this exact evidence and write a fresh engineering review. Your review must include validation_failure_sha256: {} and validation_failure_resolution: <what you verified or changed>. Choose a verdict your review instructions allow: corrections_required for unresolved source/test failures, or approved_for_validation only when a repeat validation is justified; handle a plan defect exactly as your review instructions describe.",
                 workflow_artifact_sha256(&artifact)?,
             )
         },
