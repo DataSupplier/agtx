@@ -42,6 +42,24 @@ pub struct ListTasksParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExportRecordsParams {
+    /// Table to export: projects, tasks, workflow_task_states, workflow_transition_history,
+    /// task_execution_events, task_step_reports, provider_sessions, workflow_artifacts,
+    /// workflow_step_inputs.
+    #[schemars(description = "Table to export (fixed allowlist of AGTX workflow tables)")]
+    pub table: String,
+    /// Project ID (required in global mode for every table except `projects`).
+    #[schemars(description = "Project ID. Required in global mode for project tables.")]
+    pub project_id: Option<String>,
+    /// Resume after this cursor value (the `next.since` of the previous page).
+    pub since: Option<String>,
+    /// Resume after this rowid within `since` (the `next.after_rowid` of the previous page).
+    pub after_rowid: Option<i64>,
+    /// Page size, 1-1000 (default 500).
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetTaskParams {
     /// The task ID (UUID)
     #[schemars(description = "The task ID (UUID)")]
@@ -583,6 +601,33 @@ impl AgtxMcpServer {
 
 #[tool_router]
 impl AgtxMcpServer {
+    #[tool(
+        description = "Export whole rows of one AGTX table for a downstream mirror, read-only. Every column is returned as stored. Rows are ordered by the table's change cursor; pass the returned `next` back as `since`/`after_rowid` to continue."
+    )]
+    fn export_records(&self, Parameters(params): Parameters<ExportRecordsParams>) -> String {
+        tracing::info!(tool = "export_records", table = %params.table, project_id = ?params.project_id, "MCP tool called");
+        let db = match crate::db::export_db_for(&params.table) {
+            Some(crate::db::ExportDb::Global) => self.open_global_db(),
+            Some(crate::db::ExportDb::Project) => {
+                self.open_project_db_for(params.project_id.as_deref())
+            }
+            None => return format!("Error: table '{}' is not exportable", params.table),
+        };
+        match db {
+            Ok(db) => match db.export_records(
+                &params.table,
+                params.since.as_deref(),
+                params.after_rowid,
+                params.limit.unwrap_or(500),
+            ) {
+                Ok(page) => serde_json::to_string(&page)
+                    .unwrap_or_else(|e| format!("Error serializing: {}", e)),
+                Err(e) => format!("Error: {}", e),
+            },
+            Err(e) => format!("Error: {}", e),
+        }
+    }
+
     #[tool(description = "List all projects indexed by agtx")]
     fn list_projects(&self, _params: Parameters<ListProjectsParams>) -> String {
         tracing::info!(tool = "list_projects", "MCP tool called");

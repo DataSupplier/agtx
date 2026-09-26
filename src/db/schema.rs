@@ -11,7 +11,7 @@ use super::models::{
 
 /// Database wrapper for SQLite operations
 pub struct Database {
-    conn: Connection,
+    pub(super) conn: Connection,
 }
 
 impl Database {
