@@ -365,52 +365,7 @@ fn hand_off_and_deliver(
     // delivery. Exit whatever is really there, with its own exit command.
     let running = agent_in_pane(runtime, handoff.target);
     let current = running.unwrap_or(handoff.source_agent);
-
-    if let Some(running) = running {
-        let busy =
-            runtime
-                .session_probe
-                .turn_activity(running, Path::new(handoff.worktree), &task.id)
-                == Some(crate::agent::native_session::TurnActivity::Busy);
-        if busy {
-            let deferrals = db
-                .task_execution_events(&task.id)
-                .map(|events| {
-                    events
-                        .iter()
-                        .filter(|event| {
-                            event.event_type == "agent_handoff_deferred"
-                                && event.state.as_deref() == Some(handoff.journal_state)
-                                && event.workflow_attempt == Some(handoff.journal_attempt)
-                        })
-                        .count()
-                })
-                .unwrap_or(0);
-            if deferrals < MAX_IDLE_DEFERRALS {
-                let message = format!(
-                    "'{running}' is still working in tmux pane '{}'; hand-off to '{}' deferred until its turn ends",
-                    handoff.target, handoff.destination_agent
-                );
-                record_handoff_event(
-                    db,
-                    task,
-                    handoff,
-                    "agent_handoff_deferred",
-                    "retryable",
-                    message.clone(),
-                );
-                bail!(message);
-            }
-            record_handoff_event(
-                db,
-                task,
-                handoff,
-                "agent_handoff_idle_timeout",
-                "proceeding",
-                format!("'{running}' still reported a turn in progress after {deferrals} deferrals; handing off anyway"),
-            );
-        }
-    }
+    defer_while_busy(db, task, handoff, running, runtime)?;
 
     let since = std::time::SystemTime::now();
     if let Err(error) = switch_agent_in_tmux(
@@ -431,6 +386,210 @@ fn hand_off_and_deliver(
         return Err(error);
     }
     deliver_to_launched_agent(db, task, handoff, since, runtime)
+}
+
+/// Step 1 of [`hand_off_and_deliver`], shared with [`enforce_handoff_check`]:
+/// refuse (retryably) while the agent in the pane is mid-turn, up to
+/// [`MAX_IDLE_DEFERRALS`] deferrals per state attempt, then proceed anyway.
+fn defer_while_busy(
+    db: &Database,
+    task: &Task,
+    handoff: &Handoff,
+    running: Option<&'static str>,
+    runtime: &WorkflowRuntime,
+) -> Result<()> {
+    let Some(running) = running else {
+        return Ok(());
+    };
+    let busy = runtime
+        .session_probe
+        .turn_activity(running, Path::new(handoff.worktree), &task.id)
+        == Some(crate::agent::native_session::TurnActivity::Busy);
+    if !busy {
+        return Ok(());
+    }
+    let deferrals = db
+        .task_execution_events(&task.id)
+        .map(|events| {
+            events
+                .iter()
+                .filter(|event| {
+                    event.event_type == "agent_handoff_deferred"
+                        && event.state.as_deref() == Some(handoff.journal_state)
+                        && event.workflow_attempt == Some(handoff.journal_attempt)
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    if deferrals < MAX_IDLE_DEFERRALS {
+        let message = format!(
+            "'{running}' is still working in tmux pane '{}'; hand-off to '{}' deferred until its turn ends",
+            handoff.target, handoff.destination_agent
+        );
+        record_handoff_event(
+            db,
+            task,
+            handoff,
+            "agent_handoff_deferred",
+            "retryable",
+            message.clone(),
+        );
+        bail!(message);
+    }
+    record_handoff_event(
+        db,
+        task,
+        handoff,
+        "agent_handoff_idle_timeout",
+        "proceeding",
+        format!("'{running}' still reported a turn in progress after {deferrals} deferrals; handing off anyway"),
+    );
+    Ok(())
+}
+
+/// How often a failing handoff check is returned to the same agent within one
+/// state attempt before the task is escalated to a person instead. Bounded so
+/// a check the agent cannot satisfy never loops forever.
+pub const MAX_HANDOFF_CHECK_RETURNS: usize = 3;
+
+/// Lines of check output handed back to the agent and kept in the journal.
+const HANDOFF_CHECK_OUTPUT_LINES: usize = 80;
+
+/// Run the plugin's handoff check for the state `current` is in, if one is
+/// declared ([`WorkflowPlugin::handoff_checks`]).
+///
+/// `Ok(None)`: no check is declared, or it passed; the caller proceeds with
+/// its hand-off. The command may have fixed files in place (a formatter), which
+/// is intended: only its exit status is judged.
+///
+/// `Ok(Some(outcome))`: the check failed. The artifact is set aside under
+/// `history/` (so [`assess`] waits for a fresh one instead of re-running the
+/// check every tick) and the output is pasted to the *same* agent, which fixes
+/// the findings and writes the artifact again -- no state change, no human.
+/// After [`MAX_HANDOFF_CHECK_RETURNS`] returns in one state attempt the task
+/// is escalated instead. The caller must return `outcome` without advancing.
+fn enforce_handoff_check(
+    db: &Database,
+    task: &mut Task,
+    current: &WorkflowTaskState,
+    plugin: &WorkflowPlugin,
+    artifact: &Path,
+    worktree: &str,
+    runtime: &WorkflowRuntime,
+) -> Result<Option<WorkflowStepOutcome>> {
+    let Some(command) = plugin.handoff_checks.get(&current.state) else {
+        return Ok(None);
+    };
+    let target = task
+        .session_name
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Task session is unavailable"))?;
+    let agent = task.agent.clone();
+    let task_id = task.id.clone();
+    let wait = Handoff {
+        journal_state: &current.state,
+        journal_attempt: current.state_attempt,
+        source_agent: &agent,
+        destination_agent: &agent,
+        target: &target,
+        worktree,
+        command: "",
+        prompt: "",
+        paste_prompt: true,
+    };
+    // An artifact is written mid-turn; judge the work only once the turn ends.
+    defer_while_busy(db, task, &wait, agent_in_pane(runtime, &target), runtime)?;
+
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(worktree)
+        .output()
+        .map_err(|error| anyhow::anyhow!("handoff check `{command}` could not start: {error}"))?;
+    let record = |event_type: &str, outcome: &str, message: String| {
+        let mut event = TaskExecutionEvent::new(&task_id, event_type);
+        event.workflow_attempt = Some(current.state_attempt);
+        event.state = Some(current.state.clone());
+        event.agent = Some(agent.clone());
+        event.outcome = Some(outcome.to_string());
+        event.message = Some(bounded_journal_text(&message));
+        let _ = db.record_task_execution_event(&event);
+    };
+    if output.status.success() {
+        record(
+            "handoff_check_passed",
+            "passed",
+            format!("`{command}` passed"),
+        );
+        return Ok(None);
+    }
+
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    let tail = tail_lines(&text, HANDOFF_CHECK_OUTPUT_LINES);
+    let exit = output
+        .status
+        .code()
+        .map_or_else(|| "a signal".to_string(), |code| format!("exit {code}"));
+    let returns = db
+        .task_execution_events(&task_id)
+        .map(|events| {
+            events
+                .iter()
+                .filter(|event| {
+                    event.event_type == "handoff_check_failed"
+                        && event.state.as_deref() == Some(current.state.as_str())
+                        && event.workflow_attempt == Some(current.state_attempt)
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    let set_aside = archive_workflow_artifact(artifact, "rejected-by-handoff-check")?;
+
+    if returns >= MAX_HANDOFF_CHECK_RETURNS {
+        let message = format!(
+            "Handoff check `{command}` still fails ({exit}) after {returns} returns to '{agent}'; a person needs to look"
+        );
+        record(
+            "handoff_check_escalated",
+            "escalated",
+            format!("{message}\n\n{tail}"),
+        );
+        task.escalation_note = Some(bounded_note(&message));
+        task.updated_at = chrono::Utc::now();
+        db.update_task(task)?;
+        return Ok(Some(WorkflowStepOutcome::Blocked { message }));
+    }
+
+    let prompt = format!(
+        "AGTX handoff check failed before your {state} result could be accepted: `{command}` ({exit}). \
+         Your result artifact {artifact} was set aside, so nothing was handed on. Fix the findings below \
+         within the approved plan, run `{command}` again until it passes, then write the result artifact again.\n\n{tail}",
+        state = current.state,
+        artifact = artifact.strip_prefix(worktree).unwrap_or(artifact).display(),
+    );
+    let deliver = Handoff {
+        prompt: &prompt,
+        ..wait
+    };
+    if let Err(error) =
+        deliver_to_launched_agent(db, task, &deliver, std::time::SystemTime::now(), runtime)
+    {
+        // Undelivered feedback must not strand the task: put the evidence back
+        // so the next tick re-runs the check and tries again.
+        if let Some(path) = &set_aside {
+            let _ = std::fs::rename(path, artifact);
+        }
+        return Err(error);
+    }
+    record(
+        "handoff_check_failed",
+        "returned_to_agent",
+        format!("`{command}` failed ({exit}); returned to '{agent}'\n\n{tail}"),
+    );
+    Ok(Some(WorkflowStepOutcome::Recovered {
+        message: format!("Handoff check failed ({exit}); findings returned to '{agent}'"),
+    }))
 }
 
 /// Steps 3 and 4 of [`hand_off_and_deliver`], shared with fresh-window
@@ -1911,6 +2070,11 @@ pub fn submit_workflow_implementation(
             message: format!("Missing implementation evidence: {}", artifact.display()),
         });
     }
+    if let Some(outcome) = enforce_handoff_check(
+        db, &mut task, &current, plugin, &artifact, &worktree, runtime,
+    )? {
+        return Ok(outcome);
+    }
     let implemented = prepare_transition(
         workflow,
         project_workflow,
@@ -2030,6 +2194,15 @@ pub fn submit_engineering_review(
     );
     let verdict = workflow_artifact_value(&artifact, "verdict")?;
     ensure_review_addresses_failed_validation(&worktree, plugin, &task.id, &artifact, &verdict)?;
+    // Only an approval is held to the handoff check: a rework verdict already
+    // sends the task back, and must never be blocked by the reviewer's lint.
+    if verdict == "approved_for_validation" {
+        if let Some(outcome) = enforce_handoff_check(
+            db, &mut task, &current, plugin, &artifact, &worktree, runtime,
+        )? {
+            return Ok(outcome);
+        }
+    }
     let (action, phase, status) = match verdict.as_str() {
         "corrections_required" => (
             "engineering_corrections_required",
@@ -2162,6 +2335,8 @@ pub fn submit_final_validation(
             artifact.display()
         ),
     };
+    let lint_only = !passed
+        && workflow_artifact_value(&artifact, "failure_class").is_ok_and(|class| class == "lint");
     if passed {
         current.validation_passed_at = Some(chrono::Utc::now());
     }
@@ -2192,8 +2367,13 @@ pub fn submit_final_validation(
             String::new()
         } else {
             format!(
-                " A previous validation failure is an active gate: read this exact evidence and write a fresh engineering review. Your review must include validation_failure_sha256: {} and validation_failure_resolution: <what you verified or changed>. Choose a verdict your review instructions allow: corrections_required for unresolved source/test failures, or approved_for_validation only when a repeat validation is justified; handle a plan defect exactly as your review instructions describe.",
+                " A previous validation failure is an active gate: read this exact evidence and write a fresh engineering review. Your review must include validation_failure_sha256: {} and validation_failure_resolution: <what you verified or changed>. Choose a verdict your review instructions allow: corrections_required for unresolved source/test failures, or approved_for_validation only when a repeat validation is justified; handle a plan defect exactly as your review instructions describe.{}",
                 workflow_artifact_sha256(&artifact)?,
+                if lint_only {
+                    " The failure is classified as lint only (failure_class: lint): fix the reported static-analysis findings yourself within the approved plan, confirm the lint check is clean, and approve for validation; no behaviour change is expected."
+                } else {
+                    ""
+                },
             )
         },
     );
@@ -2961,11 +3141,23 @@ fn assess_engineering_review(
     AutomationDecision::Advance(action.to_string())
 }
 
+/// How often a lint-only final-validation failure is sent back to engineering
+/// review automatically before a human has to look. Bounded so two agents that
+/// disagree about a lint rule cannot loop forever.
+pub const MAX_AUTOMATIC_LINT_RETURNS: usize = 2;
+
 /// Mirrors `submit_final_validation`'s verdict-to-action match, with one
-/// fixed override: a `failed` verdict is always a `HumanGate`, never an
-/// automatic `Advance("validation_failed")`. This is a hard automation-safety
-/// rule, not a project-configurable choice -- a failed validation always
-/// needs a human look before any rework loop restarts.
+/// fixed override: a `failed` verdict is a `HumanGate`, not an automatic
+/// `Advance("validation_failed")` -- a failed validation needs a human look
+/// before any rework loop restarts. This is a hard automation-safety rule, not
+/// a project-configurable choice.
+///
+/// The one exception is a failure the artifact classifies as
+/// `failure_class: lint`: static-analysis findings that need a code change but
+/// are not a behaviour defect. Stopping for a person there adds nothing a
+/// reviewer cannot fix, so it returns to engineering review automatically, up
+/// to [`MAX_AUTOMATIC_LINT_RETURNS`] times per task. Any other or missing class
+/// keeps the gate.
 fn assess_final_validation(
     worktree: &str,
     plugin: &WorkflowPlugin,
@@ -2988,7 +3180,29 @@ fn assess_final_validation(
     };
     match verdict.as_str() {
         "passed" => AutomationDecision::Advance("begin_feature_integration".to_string()),
-        "failed" => AutomationDecision::HumanGate("final validation failed".to_string()),
+        "failed" => {
+            let lint_only = workflow_artifact_value(&artifact, "failure_class")
+                .is_ok_and(|class| class == "lint");
+            if !lint_only {
+                return AutomationDecision::HumanGate("final validation failed".to_string());
+            }
+            let prior_returns = db
+                .workflow_transition_history(&task.id)
+                .map(|history| {
+                    history
+                        .iter()
+                        .filter(|record| record.action == "validation_failed")
+                        .count()
+                })
+                .unwrap_or(usize::MAX);
+            if prior_returns < MAX_AUTOMATIC_LINT_RETURNS {
+                AutomationDecision::Advance("validation_failed".to_string())
+            } else {
+                AutomationDecision::HumanGate(format!(
+                    "final validation failed on lint after {prior_returns} automatic returns to engineering review"
+                ))
+            }
+        }
         other => AutomationDecision::InvalidArtifact(format!(
             "{} has unsupported final-validation verdict '{other}'",
             artifact.display()
@@ -3197,6 +3411,7 @@ mod tests {
             clear_context_on_advance: false,
             copy_back: Default::default(),
             auto_dismiss: Vec::new(),
+            handoff_checks: Default::default(),
         }
     }
 
@@ -3506,6 +3721,70 @@ mod tests {
         );
     }
 
+    fn failed_validation_task(failure_class: &str) -> (tempfile::TempDir, Task, WorkflowTaskState) {
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
+        std::fs::write(
+            worktree.path().join(".agent-flow/final-validation.yaml"),
+            format!("verdict: failed\nfailure_class: {failure_class}\n"),
+        )
+        .unwrap();
+        let task = admitted_task(worktree.path());
+        let state = WorkflowTaskState::new(&task.id, "final_validation", "main");
+        (worktree, task, state)
+    }
+
+    #[test]
+    fn assess_returns_a_lint_only_validation_failure_to_review_automatically() {
+        let graph = assess_workflow();
+        let plugin = plugin_for_tests(graph.clone());
+        let (_worktree, task, state) = failed_validation_task("lint");
+        let db = Database::open_in_memory_project().unwrap();
+
+        let decision = assess(&graph, &project(), &plugin, &task, &state, &db);
+        assert_eq!(
+            decision,
+            AutomationDecision::Advance("validation_failed".to_string())
+        );
+    }
+
+    #[test]
+    fn assess_gates_a_lint_failure_once_the_automatic_returns_are_spent() {
+        let graph = assess_workflow();
+        let plugin = plugin_for_tests(graph.clone());
+        let (_worktree, task, state) = failed_validation_task("lint");
+        let db = Database::open_in_memory_project().unwrap();
+        for _ in 0..MAX_AUTOMATIC_LINT_RETURNS {
+            db.record_workflow_transition(&WorkflowTransitionRecord::new(
+                &task.id,
+                "validation_failed",
+                "final_validation",
+                "engineering_review",
+            ))
+            .unwrap();
+        }
+
+        let decision = assess(&graph, &project(), &plugin, &task, &state, &db);
+        assert!(
+            matches!(&decision, AutomationDecision::HumanGate(reason) if reason.contains("lint")),
+            "{decision:?}"
+        );
+    }
+
+    #[test]
+    fn assess_keeps_the_human_gate_for_a_defect_failure() {
+        let graph = assess_workflow();
+        let plugin = plugin_for_tests(graph.clone());
+        let (_worktree, task, state) = failed_validation_task("defect");
+        let db = Database::open_in_memory_project().unwrap();
+
+        let decision = assess(&graph, &project(), &plugin, &task, &state, &db);
+        assert_eq!(
+            decision,
+            AutomationDecision::HumanGate("final validation failed".to_string())
+        );
+    }
+
     #[test]
     fn assess_advances_a_fresh_ready_integration_artifact() {
         let graph = assess_workflow();
@@ -3800,6 +4079,7 @@ mod launch_tests {
             clear_context_on_advance: false,
             copy_back: Default::default(),
             auto_dismiss: Vec::new(),
+            handoff_checks: Default::default(),
         }
     }
 
@@ -5168,6 +5448,256 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
         assert_eq!(history[2].action, "start_engineering_review");
     }
 
+    /// What one `submit_workflow_implementation` call with a declared handoff
+    /// check left behind.
+    struct HandoffCheckRun {
+        outcome: WorkflowStepOutcome,
+        db: Database,
+        task: Task,
+        worktree: tempfile::TempDir,
+        pasted: Vec<String>,
+        _db_dir: tempfile::TempDir,
+    }
+
+    /// Submit an implementation result with `check` declared as the
+    /// `running` state's handoff check, after `prior_returns` earlier failed
+    /// checks in the same state attempt. The agent in the pane is idle.
+    fn run_implementation_handoff_check(check: &str, prior_returns: usize) -> HandoffCheckRun {
+        let graph = WorkflowDefinition {
+            initial_state: "running".into(),
+            states: vec![
+                WorkflowState {
+                    id: "running".into(),
+                    label: "Running".into(),
+                    role: Some("implementer".into()),
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "implementing_complete".into(),
+                    label: "Implementation complete".into(),
+                    role: None,
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "engineering_review".into(),
+                    label: "Engineering review".into(),
+                    role: Some("reviewer".into()),
+                    terminal: true,
+                },
+            ],
+            transitions: vec![
+                WorkflowTransition {
+                    action: "implementation_complete".into(),
+                    from: "running".into(),
+                    to: "implementing_complete".into(),
+                    guards: vec![],
+                },
+                WorkflowTransition {
+                    action: "start_engineering_review".into(),
+                    from: "implementing_complete".into(),
+                    to: "engineering_review".into(),
+                    guards: vec![],
+                },
+            ],
+        };
+        let mut project = WorkflowProjectConfig {
+            target_branch: "main".into(),
+            ..Default::default()
+        };
+        project
+            .role_bindings
+            .insert("implementer".into(), "claude".into());
+        project
+            .role_bindings
+            .insert("reviewer".into(), "claude".into());
+        project
+            .role_policies
+            .roles
+            .insert("reviewer".into(), WorkflowRolePolicy::default());
+        let mut plugin = plugin(graph.clone());
+        plugin
+            .handoff_checks
+            .insert("running".into(), check.to_string());
+
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
+        std::fs::write(
+            worktree
+                .path()
+                .join(".agent-flow/implementation-result.yaml"),
+            "status: done\n",
+        )
+        .unwrap();
+        let mut task = crate::db::Task::new("Implement thing", "claude", "proj");
+        task.worktree_path = Some(worktree.path().to_string_lossy().to_string());
+        task.session_name = Some("proj:task-impl".into());
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut db = Database::open_project_at_path(&db_dir.path().join("wf.db")).unwrap();
+        db.create_task(&task).unwrap();
+        let current = WorkflowTaskState::new(&task.id, "running", "main");
+        let record = WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "running");
+        db.record_workflow_admission(&task, &current, &record)
+            .unwrap();
+        for _ in 0..prior_returns {
+            let mut event = TaskExecutionEvent::new(&task.id, "handoff_check_failed");
+            event.state = Some("running".into());
+            event.workflow_attempt = Some(current.state_attempt);
+            db.record_task_execution_event(&event).unwrap();
+        }
+
+        let pasted = Arc::new(Mutex::new(Vec::new()));
+        let pasted_for_mock = Arc::clone(&pasted);
+        let mut mock_tmux = MockTmuxOperations::new();
+        mock_tmux.expect_send_keys().returning(|_, _| Ok(()));
+        mock_tmux.expect_send_key().returning(|_, _| Ok(()));
+        mock_tmux.expect_paste_text().returning(move |_, text| {
+            pasted_for_mock.lock().unwrap().push(text.to_string());
+            Ok(())
+        });
+        mock_tmux
+            .expect_capture_pane()
+            .returning(|_| Ok(String::new()));
+        // The implementer is idle in its pane. A passing check then hands off:
+        // the pane briefly shows a shell while the reviewer replaces it.
+        let command_checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let command_checks_for_mock = Arc::clone(&command_checks);
+        mock_tmux.expect_pane_current_command().returning(move |_| {
+            match command_checks_for_mock.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                1 | 2 => Some("bash".to_string()),
+                _ => Some("claude".to_string()),
+            }
+        });
+        let mut mock_registry = MockAgentRegistry::new();
+        mock_registry
+            .expect_get()
+            .returning(|_| Arc::new(MockAgentOperations::new()) as Arc<dyn AgentOperations>);
+        let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(mock_tmux);
+        let agent_registry: Arc<dyn AgentRegistry> = Arc::new(mock_registry);
+        let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
+        let config = merged_config();
+        let flags = feature_flags();
+        let runtime = WorkflowRuntime {
+            tmux_ops: &tmux_ops,
+            agent_registry: &agent_registry,
+            git_ops: &git_ops,
+            tmux_project_name: "proj",
+            project_path: Path::new("C:/work/project"),
+            config: &config,
+            flags: &flags,
+            session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: None,
+        };
+
+        let outcome = submit_workflow_implementation(
+            &graph,
+            &project,
+            &plugin,
+            task.clone(),
+            &mut db,
+            &runtime,
+        )
+        .unwrap();
+        let pasted = pasted.lock().unwrap().clone();
+        let task = db.get_task(&task.id).unwrap().unwrap();
+        HandoffCheckRun {
+            outcome,
+            db,
+            task,
+            worktree,
+            pasted,
+            _db_dir: db_dir,
+        }
+    }
+
+    #[test]
+    fn a_passing_handoff_check_hands_off_as_before() {
+        let run = run_implementation_handoff_check("exit 0", 0);
+
+        assert!(
+            matches!(run.outcome, WorkflowStepOutcome::Advanced { .. }),
+            "{:?}",
+            run.outcome
+        );
+        assert_eq!(
+            run.db
+                .get_workflow_task_state(&run.task.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "engineering_review"
+        );
+        assert!(run
+            .db
+            .task_execution_events(&run.task.id)
+            .unwrap()
+            .iter()
+            .any(|event| event.event_type == "handoff_check_passed"));
+    }
+
+    #[test]
+    fn a_failing_handoff_check_returns_the_findings_to_the_same_agent() {
+        let run = run_implementation_handoff_check("echo 'F401 unused import'; exit 1", 0);
+
+        assert!(
+            matches!(run.outcome, WorkflowStepOutcome::Recovered { .. }),
+            "{:?}",
+            run.outcome
+        );
+        // No state change, no human: the implementer keeps the task.
+        assert_eq!(
+            run.db
+                .get_workflow_task_state(&run.task.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "running"
+        );
+        assert!(run.task.escalation_note.is_none());
+        // The findings reached the agent, and the rejected artifact is set
+        // aside so automation waits for a fresh one.
+        assert_eq!(run.pasted.len(), 1);
+        assert!(
+            run.pasted[0].contains("F401 unused import"),
+            "{}",
+            run.pasted[0]
+        );
+        assert!(!run
+            .worktree
+            .path()
+            .join(".agent-flow/implementation-result.yaml")
+            .exists());
+        assert!(run.worktree.path().join(".agent-flow/history").is_dir());
+        assert!(run
+            .db
+            .task_execution_events(&run.task.id)
+            .unwrap()
+            .iter()
+            .any(|event| event.event_type == "handoff_check_failed"
+                && event.outcome.as_deref() == Some("returned_to_agent")));
+    }
+
+    #[test]
+    fn a_handoff_check_that_keeps_failing_is_escalated_instead_of_looping() {
+        let run = run_implementation_handoff_check("exit 1", MAX_HANDOFF_CHECK_RETURNS);
+
+        assert!(
+            matches!(&run.outcome, WorkflowStepOutcome::Blocked { message } if message.contains("a person needs to look")),
+            "{:?}",
+            run.outcome
+        );
+        assert!(run.pasted.is_empty(), "no further return to the agent");
+        assert!(run.task.escalation_note.is_some());
+        assert_eq!(
+            run.db
+                .get_workflow_task_state(&run.task.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "running"
+        );
+    }
+
     /// A failed next-agent launch must not advance the durable lane: the
     /// resolved verdict transition (here, `approved_for_validation` to the
     /// validator) is committed only after `switch_agent_in_tmux` confirms
@@ -6418,6 +6948,7 @@ merge_target = "{TARGET}"
             clear_context_on_advance: false,
             copy_back: Default::default(),
             auto_dismiss: Vec::new(),
+            handoff_checks: Default::default(),
         }
     }
 

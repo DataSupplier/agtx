@@ -442,6 +442,7 @@ mod tests {
             clear_context_on_advance: false,
             copy_back: Default::default(),
             auto_dismiss: Vec::new(),
+            handoff_checks: Default::default(),
         }
     }
 

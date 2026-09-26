@@ -510,6 +510,7 @@ fn failed_validation_requires_linked_review_resolution() {
         clear_context_on_advance: false,
         copy_back: std::collections::HashMap::new(),
         auto_dismiss: vec![],
+        handoff_checks: Default::default(),
     };
 
     std::fs::write(
@@ -3205,6 +3206,7 @@ fn test_resolve_skill_command_with_plugin() {
         clear_context_on_advance: false,
         copy_back: std::collections::HashMap::new(),
         auto_dismiss: vec![],
+        handoff_checks: Default::default(),
     });
     // Claude/Gemini: canonical form unchanged
     assert_eq!(
@@ -3269,6 +3271,7 @@ fn test_plugin_supports_agent() {
         clear_context_on_advance: false,
         copy_back: std::collections::HashMap::new(),
         auto_dismiss: vec![],
+        handoff_checks: Default::default(),
     };
     assert!(plugin.supports_agent("claude"));
     assert!(plugin.supports_agent("copilot"));
@@ -3296,6 +3299,7 @@ fn test_plugin_supports_agent() {
         clear_context_on_advance: false,
         copy_back: std::collections::HashMap::new(),
         auto_dismiss: vec![],
+        handoff_checks: Default::default(),
     };
     assert!(plugin.supports_agent("claude"));
     assert!(plugin.supports_agent("codex"));
@@ -3372,6 +3376,7 @@ fn test_phase_artifact_exists_with_glob() {
         clear_context_on_advance: false,
         copy_back: std::collections::HashMap::new(),
         auto_dismiss: vec![],
+        handoff_checks: Default::default(),
     });
 
     let worktree = tmp.to_string_lossy().to_string();
@@ -3590,6 +3595,31 @@ fn test_resolve_skill_command_research_phase() {
 }
 
 #[test]
+fn plugin_handoff_checks_parse_per_state_and_default_to_none() {
+    use crate::config::WorkflowPlugin;
+    let with_checks: WorkflowPlugin = toml::from_str(
+        r#"
+        name = "flow"
+        [handoff_checks]
+        implementing = "bash tools/agtx/fix-changed.sh"
+        engineering_review = "timeout 600 bash tools/agtx/fix-changed.sh"
+    "#,
+    )
+    .unwrap();
+    assert_eq!(
+        with_checks
+            .handoff_checks
+            .get("implementing")
+            .map(String::as_str),
+        Some("bash tools/agtx/fix-changed.sh")
+    );
+    assert_eq!(with_checks.handoff_checks.len(), 2);
+
+    let without: WorkflowPlugin = toml::from_str("name = \"flow\"\n").unwrap();
+    assert!(without.handoff_checks.is_empty());
+}
+
+#[test]
 fn test_resolve_skill_command_planning_with_plugin() {
     use crate::config::WorkflowPlugin;
     let plugin_toml = r#"
@@ -3733,6 +3763,7 @@ fn test_resolve_prompt_trigger_with_gsd() {
         clear_context_on_advance: false,
         copy_back: std::collections::HashMap::new(),
         auto_dismiss: vec![],
+        handoff_checks: Default::default(),
     });
     assert_eq!(
         resolve_prompt_trigger(&plugin, "research"),
@@ -3773,6 +3804,7 @@ fn test_resolve_prompt_trigger_empty_string_filtered() {
         clear_context_on_advance: false,
         copy_back: std::collections::HashMap::new(),
         auto_dismiss: vec![],
+        handoff_checks: Default::default(),
     });
     // Empty strings should be filtered out
     assert_eq!(resolve_prompt_trigger(&plugin, "research"), None);

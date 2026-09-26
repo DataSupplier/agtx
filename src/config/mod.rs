@@ -747,6 +747,14 @@ pub struct WorkflowPlugin {
     /// Each rule specifies patterns to detect and keystrokes to send in response.
     #[serde(default)]
     pub auto_dismiss: Vec<AutoDismiss>,
+    /// Shell commands the workflow executor itself runs in the task worktree
+    /// before it accepts a role's handoff artifact, keyed by workflow state id
+    /// (e.g. `implementing = "bash tools/agtx/fix-changed.sh"`). A non-zero exit
+    /// returns the output to the same agent, without a state change or a human,
+    /// so mechanical checks never depend on the agent remembering to run them.
+    /// A command may fix files in place; only its exit status is judged.
+    #[serde(default)]
+    pub handoff_checks: std::collections::HashMap<String, String>,
 }
 
 /// Rule for auto-dismissing interactive prompts in the tmux pane.
