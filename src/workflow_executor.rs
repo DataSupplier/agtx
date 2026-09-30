@@ -1816,6 +1816,16 @@ pub fn decide_workflow_plan(
     }
     db.advance_workflow_state(&decision.state, &decision.transition)?;
     db.update_task(&task)?;
+    // Canonical plan-review verdict signal (`approved | changes_requested`) for
+    // delivery insights. Recorded only after the transition commits, against the
+    // plan_review attempt that was decided, so a blocked decision emits nothing.
+    let mut verdict = TaskExecutionEvent::new(&task.id, "plan_review");
+    verdict.workflow_attempt = Some(current.state_attempt);
+    verdict.state = Some(current.state.clone());
+    verdict.agent = Some(previous_agent.clone());
+    verdict.outcome = Some(if approve { "approved" } else { "changes_requested" }.to_string());
+    verdict.message = Some(action.to_string());
+    let _ = db.record_task_execution_event(&verdict);
     let message = if approve {
         "Plan approved"
     } else {
@@ -6083,6 +6093,17 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
         let final_state_b = db_b.get_workflow_task_state(&task_b.id).unwrap().unwrap();
 
         assert_eq!(final_state_a.state, "plan_approved");
+        for (db, task) in [(&db_a, &task_a), (&db_b, &task_b)] {
+            let verdicts: Vec<_> = db
+                .task_execution_events(&task.id)
+                .unwrap()
+                .into_iter()
+                .filter(|event| event.event_type == "plan_review")
+                .collect();
+            assert_eq!(verdicts.len(), 1);
+            assert_eq!(verdicts[0].outcome.as_deref(), Some("approved"));
+            assert_eq!(verdicts[0].state.as_deref(), Some("plan_review"));
+        }
         assert_eq!(final_state_a.state, final_state_b.state);
         assert_eq!(
             final_state_a.approved_plan_hash,
@@ -6284,6 +6305,15 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             sent.contains("Write only the revised plan content"),
             "revision handoff must prohibit orchestration fields, got: {sent}"
         );
+        let verdicts: Vec<_> = db
+            .task_execution_events(&task.id)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == "plan_review")
+            .collect();
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0].outcome.as_deref(), Some("changes_requested"));
+        assert_eq!(verdicts[0].workflow_attempt, Some(1));
     }
 
     /// A failed return to Planning must leave no review evidence or input
