@@ -1529,10 +1529,23 @@ pub fn start_workflow_planning(
     Ok(WorkflowStepOutcome::Advanced { task, message })
 }
 
+/// Whether `submit_plan` leads to a state no role owns, i.e. the workflow has
+/// no plan-review gate (a brief-sized workflow). Derived from the graph, never
+/// from a state id, so any plugin may drop the gate by routing `submit_plan`
+/// straight to its approved state.
+pub fn plan_submission_skips_review(workflow: &WorkflowDefinition) -> bool {
+    workflow
+        .transition("submit_plan")
+        .and_then(|edge| workflow.state(&edge.to))
+        .is_some_and(|destination| destination.role.is_none())
+}
+
 /// Extracted body of `App::submit_selected_workflow_plan`.
 ///
 /// Hashes the saved planning artifact, records it durably, and hands the
-/// exact revision to the role bound to `plan_reviewer`.
+/// exact revision to the role bound to `plan_reviewer`. When the workflow has
+/// no plan-review gate (see [`plan_submission_skips_review`]) the revision is
+/// approved in place instead.
 pub fn submit_workflow_plan(
     workflow: &WorkflowDefinition,
     project_workflow: &WorkflowProjectConfig,
@@ -1563,6 +1576,31 @@ pub fn submit_workflow_plan(
     let mut evidenced = current.clone();
     evidenced.plan_revision = revision;
     evidenced.plan_hash = Some(format!("{:x}", Sha256::digest(&contents)));
+    if plan_submission_skips_review(workflow) {
+        // The graph routes `submit_plan` to a state no role owns, so there is
+        // no reviewer to launch: the submitted revision is the approved one.
+        // Freeze its hash exactly as `decide_workflow_plan` does on approval.
+        evidenced.approved_plan_revision = Some(revision);
+        evidenced.approved_plan_hash = evidenced.plan_hash.clone();
+        let approval = prepare_transition(
+            workflow,
+            project_workflow,
+            &evidenced,
+            "submit_plan",
+            GuardContext {
+                approved_plan: true,
+                ..GuardContext::default()
+            },
+        )?;
+        record_step_evidence(db, &task, &current, &task.agent, &path, runtime)?;
+        db.advance_workflow_state(&approval.state, &approval.transition)?;
+        task.updated_at = chrono::Utc::now();
+        db.update_task(&task)?;
+        return Ok(WorkflowStepOutcome::Advanced {
+            message: format!("Plan revision {revision} recorded and approved (no plan review)"),
+            task,
+        });
+    }
     let handoff = prepare_transition(
         workflow,
         project_workflow,
@@ -3006,7 +3044,25 @@ pub fn assess(
     };
 
     let decision = match state.state.as_str() {
-        "planning" => assess_planning(worktree, plugin, task, state, db),
+        "planning" => {
+            let decision = assess_planning(worktree, plugin, task, state, db);
+            // Without a plan-review gate, submitting the plan is the approval,
+            // so the sign-off a person asked for (Shift+S popup or the project
+            // `approve_plan` gate) has to hold the submission itself.
+            let approval_gated = project.automation.human_gates.iter().any(|g| g == "approve_plan")
+                || state.human_gate_plan_approval;
+            if plan_submission_skips_review(workflow)
+                && approval_gated
+                && matches!(decision, AutomationDecision::Advance(_))
+            {
+                AutomationDecision::HumanGate(
+                    "Plan ready -- submitting it approves it (no plan review); awaiting your sign-off"
+                        .into(),
+                )
+            } else {
+                decision
+            }
+        }
         "plan_review" => assess_plan_review(worktree, plugin, task, state, db),
         "engineering_review" => assess_engineering_review(worktree, plugin, task, state, db),
         "final_validation" => assess_final_validation(worktree, plugin, task, state, db),
@@ -3289,7 +3345,7 @@ fn assess_implementation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workflow::{WorkflowState, WorkflowTransition};
+    use crate::workflow::{WorkflowGuard, WorkflowState, WorkflowTransition};
 
     fn workflow() -> WorkflowDefinition {
         WorkflowDefinition {
@@ -4052,6 +4108,94 @@ mod tests {
         let decision = assess(&graph, &project(), &plugin, &task, &state, &db);
         assert!(matches!(decision, AutomationDecision::InvalidArtifact(_)));
     }
+
+    /// A brief-sized workflow has no plan-review state: `submit_plan` leads
+    /// straight to a state no role owns.
+    pub(super) fn plan_without_review_graph() -> WorkflowDefinition {
+        WorkflowDefinition {
+            initial_state: "planning".into(),
+            states: vec![
+                WorkflowState {
+                    id: "planning".into(),
+                    label: "Planning".into(),
+                    role: Some("planner".into()),
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "plan_approved".into(),
+                    label: "Plan approved".into(),
+                    role: None,
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "implementing".into(),
+                    label: "Implementing".into(),
+                    role: Some("implementer".into()),
+                    terminal: true,
+                },
+            ],
+            transitions: vec![
+                WorkflowTransition {
+                    action: "submit_plan".into(),
+                    from: "planning".into(),
+                    to: "plan_approved".into(),
+                    guards: vec![],
+                },
+                WorkflowTransition {
+                    action: "start_implementation".into(),
+                    from: "plan_approved".into(),
+                    to: "implementing".into(),
+                    guards: vec![WorkflowGuard::ApprovedPlan],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn plan_submission_skips_review_follows_the_graph_not_a_state_id() {
+        assert!(plan_submission_skips_review(&plan_without_review_graph()));
+
+        let mut with_review = plan_without_review_graph();
+        with_review.states[1].id = "plan_review".into();
+        with_review.states[1].role = Some("plan_reviewer".into());
+        with_review.transitions[0].to = "plan_review".into();
+        assert!(!plan_submission_skips_review(&with_review));
+
+        // No submit_plan edge at all: never claim the review is skipped.
+        with_review.transitions.clear();
+        assert!(!plan_submission_skips_review(&with_review));
+    }
+
+    /// With no review gate, submitting is approving, so a person's requested
+    /// sign-off holds the submission itself instead of the (absent)
+    /// `approve_plan` step.
+    #[test]
+    fn assess_holds_a_review_less_plan_submission_for_the_requested_sign_off() {
+        let graph = plan_without_review_graph();
+        let mut plugin = plugin_for_tests(graph.clone());
+        plugin.artifacts.planning = Some(".agtx/plans/{task_id}.md".into());
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join(".agtx/plans")).unwrap();
+        let task = admitted_task(worktree.path());
+        std::fs::write(
+            worktree
+                .path()
+                .join(format!(".agtx/plans/{}.md", task.id)),
+            "plan\n",
+        )
+        .unwrap();
+        let db = Database::open_in_memory_project().unwrap();
+        let mut state = WorkflowTaskState::new(&task.id, "planning", "main");
+        assert_eq!(
+            assess(&graph, &project(), &plugin, &task, &state, &db),
+            AutomationDecision::Advance("submit_plan".to_string())
+        );
+        state.human_gate_plan_approval = true;
+        assert!(matches!(
+            assess(&graph, &project(), &plugin, &task, &state, &db),
+            AutomationDecision::HumanGate(_)
+        ));
+    }
 }
 
 /// Mock-backed tests for the launch functions extracted from `tui::app`'s
@@ -4063,6 +4207,7 @@ mod tests {
 #[cfg(test)]
 #[cfg(feature = "test-mocks")]
 mod launch_tests {
+    use super::tests::plan_without_review_graph;
     use super::*;
     use crate::agent::{AgentOperations, AgentRegistry, MockAgentOperations, MockAgentRegistry};
     use crate::config::{GlobalConfig, MergedConfig, ProjectConfig, WorkflowPlugin};
@@ -5291,6 +5436,88 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             prompt.contains("Use changes_requested only when at least one BLOCKING finding exists"),
             "reviewer prompt must reserve rejection for blocking findings, got: {prompt}"
         );
+    }
+
+    /// Without a plan-review gate the submitted revision is approved in place:
+    /// no reviewer is launched (the mocks accept no tmux traffic), the plan
+    /// evidence and approved hash are recorded, and `start_implementation`'s
+    /// `approved_plan` guard is satisfied by that approval.
+    #[test]
+    fn submit_workflow_plan_without_a_review_gate_approves_the_revision_in_place() {
+        let graph = plan_without_review_graph();
+        graph.validate().unwrap();
+        let mut project = WorkflowProjectConfig {
+            target_branch: "main".into(),
+            role_bindings: Default::default(),
+            ..Default::default()
+        };
+        project
+            .role_bindings
+            .insert("planner".into(), "claude".into());
+        project
+            .role_bindings
+            .insert("implementer".into(), "claude".into());
+        let mut plugin = plugin(graph.clone());
+        plugin.artifacts.planning = Some(".agent-flow/plan.yaml".into());
+
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
+        std::fs::write(
+            worktree.path().join(".agent-flow/plan.yaml"),
+            "# Brief plan\n\nDo the small thing.\n",
+        )
+        .unwrap();
+        let mut task = crate::db::Task::new("Brief thing", "claude", "proj");
+        task.worktree_path = Some(worktree.path().to_string_lossy().to_string());
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut db = Database::open_project_at_path(&db_dir.path().join("wf.db")).unwrap();
+        db.create_task(&task).unwrap();
+        let current = WorkflowTaskState::new(&task.id, "planning", "main");
+        let record = WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "planning");
+        db.record_workflow_admission(&task, &current, &record)
+            .unwrap();
+
+        let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(MockTmuxOperations::new());
+        let agent_registry: Arc<dyn AgentRegistry> = Arc::new(MockAgentRegistry::new());
+        let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
+        let config = merged_config();
+        let flags = feature_flags();
+        let runtime = WorkflowRuntime {
+            tmux_ops: &tmux_ops,
+            agent_registry: &agent_registry,
+            git_ops: &git_ops,
+            tmux_project_name: "proj",
+            project_path: Path::new("C:/work/project"),
+            config: &config,
+            flags: &flags,
+            session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: None,
+        };
+
+        let outcome =
+            submit_workflow_plan(&graph, &project, &plugin, task.clone(), &mut db, &runtime)
+                .unwrap();
+        assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
+
+        let state = db.get_workflow_task_state(&task.id).unwrap().unwrap();
+        assert_eq!(state.state, "plan_approved");
+        assert_eq!(state.plan_revision, 1);
+        assert!(state.plan_hash.is_some());
+        assert_eq!(state.approved_plan_revision, Some(1));
+        assert_eq!(state.approved_plan_hash, state.plan_hash);
+        let evidence = db.workflow_artifacts_for_task(&task.id).unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].state, "planning");
+        assert!(guard_context_for(&db, &task, &state, &plugin).approved_plan);
+        prepare_transition(
+            &graph,
+            &project,
+            &state,
+            "start_implementation",
+            guard_context_for(&db, &task, &state, &plugin),
+        )
+        .expect("the approval must unlock start_implementation");
     }
 
     /// A failed reviewer launch must not advance the durable lane: both
