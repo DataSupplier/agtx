@@ -80,6 +80,31 @@ pub fn run_automation_tick(
     plugin: &WorkflowPlugin,
     runtime: &WorkflowRuntime,
 ) -> Vec<TaskAutomationResult> {
+    run_automation_tick_for(db, workflow, project, plugin, runtime, |_| true)
+}
+
+/// The plugin whose workflow drives `task`: the task's own `plugin`, else the
+/// project's configured default. A task may therefore override the project's
+/// workflow (a brief running a trimmed graph in a project whose default is the
+/// full one) without any project-level change.
+pub fn task_workflow_plugin_name<'a>(
+    task: &'a Task,
+    project_default: Option<&'a str>,
+) -> Option<&'a str> {
+    task.plugin.as_deref().or(project_default)
+}
+
+/// [`run_automation_tick`] restricted to the tasks `include` accepts, so a caller
+/// with several plugins in one project can sweep each plugin's tasks with that
+/// plugin's own workflow graph, prompts and artifact paths.
+pub fn run_automation_tick_for(
+    db: &mut Database,
+    workflow: &WorkflowDefinition,
+    project: &WorkflowProjectConfig,
+    plugin: &WorkflowPlugin,
+    runtime: &WorkflowRuntime,
+    include: impl Fn(&Task) -> bool,
+) -> Vec<TaskAutomationResult> {
     let tasks = match db.get_all_tasks() {
         Ok(tasks) => tasks,
         Err(_) => return Vec::new(),
@@ -87,7 +112,7 @@ pub fn run_automation_tick(
 
     let mut results = Vec::with_capacity(tasks.len());
     for task in tasks {
-        if task.status == TaskStatus::Done {
+        if task.status == TaskStatus::Done || !include(&task) {
             continue;
         }
 
@@ -1096,6 +1121,160 @@ mod tests {
         assert_eq!(state_after.state, "implementing");
         assert_eq!(state_after.approved_plan_revision, Some(1));
         assert_eq!(state_after.approved_plan_hash.as_deref(), Some("deadbeef"));
+    }
+
+    #[test]
+    fn a_tasks_own_plugin_overrides_the_project_default() {
+        let mut task = Task::new("Brief", "claude", "proj");
+        assert_eq!(
+            task_workflow_plugin_name(&task, Some("full")),
+            Some("full"),
+            "no plugin on the task: the project's configured one"
+        );
+        assert_eq!(task_workflow_plugin_name(&task, None), None);
+        task.plugin = Some("brief".into());
+        assert_eq!(task_workflow_plugin_name(&task, Some("full")), Some("brief"));
+        assert_eq!(task_workflow_plugin_name(&task, None), Some("brief"));
+    }
+
+    /// The same graph as `full_workflow` without the plan-review gate:
+    /// `submit_plan` ends in `plan_approved`, which no role owns.
+    fn brief_workflow() -> WorkflowDefinition {
+        let mut graph = full_workflow();
+        graph.states.retain(|state| state.id != "plan_review");
+        graph.states.push(WorkflowState {
+            id: "plan_approved".into(),
+            label: "Plan approved".into(),
+            role: None,
+            terminal: false,
+        });
+        graph
+            .transitions
+            .retain(|t| t.from != "plan_review" && t.to != "plan_review");
+        graph.transitions.push(WorkflowTransition {
+            action: "submit_plan".into(),
+            from: "planning".into(),
+            to: "plan_approved".into(),
+            guards: vec![],
+        });
+        graph.transitions.push(WorkflowTransition {
+            action: "start_implementation".into(),
+            from: "plan_approved".into(),
+            to: "implementing".into(),
+            guards: vec![WorkflowGuard::ApprovedPlan],
+        });
+        graph
+    }
+
+    /// One project, two plugins: each task is swept with its own plugin's graph.
+    /// The brief plugin approves a submitted plan in place; the full plugin
+    /// hands the same plan to the plan reviewer. A sweep only touches the tasks
+    /// its filter accepts.
+    #[test]
+    fn tick_drives_each_task_with_its_own_plugins_workflow() {
+        let full_graph = full_workflow();
+        let brief_graph = brief_workflow();
+        brief_graph.validate().expect("brief graph is valid");
+        assert!(crate::workflow_executor::plan_submission_skips_review(&brief_graph));
+        assert!(!crate::workflow_executor::plan_submission_skips_review(&full_graph));
+        let mut full_plugin = plugin(full_graph.clone());
+        full_plugin.name = "full".into();
+        full_plugin.artifacts.planning = Some(".agtx/plans/{task_id}.md".into());
+        let mut brief_plugin = plugin(brief_graph.clone());
+        brief_plugin.name = "brief".into();
+        brief_plugin.artifacts.planning = Some(".agtx/plans/{task_id}.md".into());
+        let project = project();
+
+        let mut db = Database::open_in_memory_project().unwrap();
+        let mut worktrees = Vec::new();
+        let mut tasks = Vec::new();
+        for (title, plugin_name) in [("Brief task", "brief"), ("Full task", "full")] {
+            let worktree = tempfile::tempdir().unwrap();
+            let mut task = Task::new(title, "claude", "proj");
+            task.plugin = Some(plugin_name.into());
+            task.worktree_path = Some(worktree.path().to_string_lossy().to_string());
+            task.session_name = Some(format!("proj:task-{plugin_name}"));
+            std::fs::create_dir_all(worktree.path().join(".agtx/plans")).unwrap();
+            std::fs::write(
+                worktree.path().join(format!(".agtx/plans/{}.md", task.id)),
+                "# Plan
+
+Do the thing.
+",
+            )
+            .unwrap();
+            db.create_task(&task).unwrap();
+            let state = WorkflowTaskState::new(&task.id, "planning", "feature/poc");
+            let record =
+                crate::db::WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "planning");
+            db.record_workflow_admission(&task, &state, &record).unwrap();
+            worktrees.push(worktree);
+            tasks.push(task);
+        }
+        let (brief_task, full_task) = (&tasks[0], &tasks[1]);
+
+        let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(permissive_tmux());
+        let agent_registry: Arc<dyn AgentRegistry> = Arc::new(permissive_registry());
+        let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
+        let config = merged_config();
+        let flags = feature_flags();
+        let runtime = runtime_with(
+            &tmux_ops,
+            &agent_registry,
+            &git_ops,
+            worktrees[0].path(),
+            &config,
+            &flags,
+        );
+
+        let results = run_automation_tick_for(
+            &mut db,
+            &brief_graph,
+            &project,
+            &brief_plugin,
+            &runtime,
+            |task| task_workflow_plugin_name(task, Some("full")) == Some("brief"),
+        );
+        assert_eq!(results.len(), 1, "the sweep only visits the brief task");
+        assert_eq!(results[0].task_id, brief_task.id);
+        let brief_state = db.get_workflow_task_state(&brief_task.id).unwrap().unwrap();
+        assert_eq!(brief_state.state, "plan_approved", "no reviewer for the brief");
+        assert_eq!(brief_state.approved_plan_revision, Some(1));
+        assert_eq!(
+            db.get_workflow_task_state(&full_task.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "planning",
+            "the other plugin's task is untouched by this sweep"
+        );
+
+        let results = run_automation_tick_for(
+            &mut db,
+            &full_graph,
+            &project,
+            &full_plugin,
+            &runtime,
+            |task| task_workflow_plugin_name(task, Some("full")) == Some("full"),
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].task_id, full_task.id);
+        assert_eq!(
+            db.get_workflow_task_state(&full_task.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "plan_review",
+            "the full plugin still sends the plan to review"
+        );
+        assert_eq!(
+            db.get_workflow_task_state(&brief_task.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "plan_approved",
+            "the brief task is not swept again by the other plugin"
+        );
     }
 
     /// End-to-end rework cycle: a `plan_review` task with a fresh

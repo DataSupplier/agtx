@@ -342,27 +342,64 @@ struct WorkflowContext {
     plugin: crate::config::WorkflowPlugin,
 }
 
-/// Resolve `WorkflowContext` for a project, the same merge-then-load chain
-/// `defaults_for` (in `web/writes.rs`) already uses to find a project's
-/// configured plugin. `None` covers every reason a project might not have
-/// one: no `workflow_plugin` configured, the plugin has no `state_machine`,
-/// or no `.agtx/workflow.toml` -- all of them mean "this project does not use
-/// the declarative workflow feature," not an error.
-fn workflow_context_for(project_path: &std::path::Path) -> Option<WorkflowContext> {
+/// The workflow contexts a request needs: one per distinct plugin its tasks
+/// run on. A task's own `plugin` wins over the project's configured one, exactly
+/// as in the TUI's automation tick, so a card shows the state and actions of the
+/// workflow that actually drives it.
+struct WorkflowContexts {
+    default_name: Option<String>,
+    by_name: std::collections::HashMap<String, WorkflowContext>,
+}
+
+impl WorkflowContexts {
+    fn for_task(&self, task: &Task) -> Option<&WorkflowContext> {
+        let name = task.plugin.as_deref().or(self.default_name.as_deref())?;
+        self.by_name.get(name)
+    }
+}
+
+/// Resolve the project's default plugin plus every plugin `tasks` name. A plugin
+/// that cannot be loaded, has no `state_machine`, or a project without
+/// `.agtx/workflow.toml`, simply has no context (a legacy board card).
+fn workflow_contexts_for(project_path: &std::path::Path, tasks: &[Task]) -> WorkflowContexts {
     let global = crate::config::GlobalConfig::load().unwrap_or_default();
     let project_cfg = crate::config::ProjectConfig::load(project_path).unwrap_or_default();
     let merged = crate::config::MergedConfig::merge(&global, &project_cfg);
-    let name = merged.workflow_plugin.as_ref()?;
-    let plugin = crate::config::WorkflowPlugin::load(name, Some(project_path)).ok()?;
-    let workflow = plugin.state_machine.clone()?;
+    let default_name = merged.workflow_plugin.clone();
+    let mut by_name = std::collections::HashMap::new();
     let project = crate::workflow::WorkflowProjectConfig::load(project_path)
         .ok()
-        .flatten()?;
-    Some(WorkflowContext {
-        workflow,
-        project,
-        plugin,
-    })
+        .flatten();
+    if let Some(project) = project {
+        let names = default_name
+            .iter()
+            .map(String::as_str)
+            .chain(tasks.iter().filter_map(|task| task.plugin.as_deref()));
+        for name in names {
+            if by_name.contains_key(name) {
+                continue;
+            }
+            let Some(plugin) = crate::config::WorkflowPlugin::load(name, Some(project_path)).ok()
+            else {
+                continue;
+            };
+            let Some(workflow) = plugin.state_machine.clone() else {
+                continue;
+            };
+            by_name.insert(
+                name.to_string(),
+                WorkflowContext {
+                    workflow,
+                    project: project.clone(),
+                    plugin,
+                },
+            );
+        }
+    }
+    WorkflowContexts {
+        default_name,
+        by_name,
+    }
 }
 
 fn card(
@@ -452,7 +489,9 @@ async fn tasks(
 
     // One lookup for the whole board, not one per card: every card here
     // shares the same project's workflow config.
-    let workflow_ctx = project_path.as_deref().and_then(workflow_context_for);
+    let workflow_ctxs = project_path
+        .as_deref()
+        .map(|path| workflow_contexts_for(path, &all));
 
     // Kick off a conflict pass for anything in Review whose answer is missing
     // or stale. It runs *after* this response: the board never waits on git.
@@ -463,7 +502,8 @@ async fn tasks(
             .map(|t| {
                 let rt = runtime.iter().find(|r| r.task_id == t.id);
                 let conflict = state.conflicts.get(&t.id);
-                card(&db, t, rt, conflict, workflow_ctx.as_ref())
+                let ctx = workflow_ctxs.as_ref().and_then(|ctxs| ctxs.for_task(&t));
+                card(&db, t, rt, conflict, ctx)
             })
             .collect(),
     ))
@@ -607,13 +647,14 @@ async fn task_detail(
     let base_branch = t.base_branch.clone();
     let referenced_tasks = t.referenced_tasks.clone();
     let created_at = t.created_at.to_rfc3339();
-    let workflow_ctx = state
+    let workflow_ctxs = state
         .project_path(&pid)
         .ok()
-        .and_then(|p| workflow_context_for(&p));
+        .map(|p| workflow_contexts_for(&p, std::slice::from_ref(&t)));
+    let workflow_ctx = workflow_ctxs.as_ref().and_then(|ctxs| ctxs.for_task(&t));
 
     Ok(Json(TaskDetail {
-        card: card(&db, t, runtime.as_ref(), conflict, workflow_ctx.as_ref()),
+        card: card(&db, t, runtime.as_ref(), conflict, workflow_ctx),
         description,
         worktree_path,
         session_name,

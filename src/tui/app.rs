@@ -32,7 +32,7 @@ use crate::tmux::{
     self, InputConfig, InputError, PaneInput, PaneInputSink, RealTmuxOps, TmuxOperations,
 };
 use crate::workflow::{ResolvedWorkflowPolicy, WorkflowProjectConfig, WorkflowRolePolicy};
-use crate::workflow_automation::run_automation_tick;
+use crate::workflow_automation::{run_automation_tick_for, task_workflow_plugin_name};
 use crate::workflow_executor::{
     admit_task, complete_feature_integration, decide_workflow_plan, reset_workflow_to_backlog,
     restart_workflow_step, revoke_workflow_admission, start_workflow_implementation,
@@ -6653,23 +6653,20 @@ impl App {
     ///
     /// Gated on `.agtx/workflow.toml`'s `[automation] enabled` field, which
     /// defaults to `false`: a project with no `[automation]` table at all
-    /// (the common case today) never reaches `run_automation_tick`, exactly
+    /// (the common case today) never reaches `run_automation_tick_for`, exactly
     /// as if this call were not here. This is the only place in the
-    /// codebase that calls `run_automation_tick` -- `agtx-web` must stay
+    /// codebase that calls `run_automation_tick_for` -- `agtx-web` must stay
     /// read+queue-only, so it never wires this in.
     ///
-    /// Uses the project's single configured plugin (`cached_plugin`), the
-    /// same one `load_plugin_if_configured` resolves at startup, not a
-    /// per-task override: `run_automation_tick` itself sweeps every
-    /// non-terminal task in this project's database in one call.
+    /// Every task is driven by its own plugin's workflow (`task.plugin`), falling
+    /// back to the project's configured plugin (`cached_plugin`, resolved by
+    /// `load_plugin_if_configured`) for a task that names none. So a project
+    /// whose default is the full plan-review workflow can still run a task on
+    /// a trimmed one. Tasks are swept once per distinct plugin, each with that
+    /// plugin's own graph, prompts and artifact paths; a plugin that cannot be
+    /// loaded or has no state machine (the legacy board) is left alone.
     fn run_workflow_automation_tick(&mut self) {
         let Some(project_path) = self.state.project_path.clone() else {
-            return;
-        };
-        let Some(Some(plugin)) = self.state.cached_plugin.clone() else {
-            return;
-        };
-        let Some(workflow) = plugin.state_machine.clone() else {
             return;
         };
         let Some(project_workflow) = WorkflowProjectConfig::load(&project_path).unwrap_or(None)
@@ -6677,6 +6674,38 @@ impl App {
             return;
         };
         if !project_workflow.automation.enabled {
+            return;
+        }
+        let default_name = self.state.config.workflow_plugin.clone();
+        let default_plugin = self.state.cached_plugin.clone().flatten();
+        let mut names: Vec<String> = Vec::new();
+        if let Some(db) = self.state.db.as_ref() {
+            for task in db.get_all_tasks().unwrap_or_default() {
+                if task.status == TaskStatus::Done {
+                    continue;
+                }
+                if let Some(name) = task_workflow_plugin_name(&task, default_name.as_deref()) {
+                    if !names.iter().any(|known| known == name) {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+        }
+        let plugins: Vec<(String, WorkflowPlugin)> = names
+            .into_iter()
+            .filter_map(|name| {
+                let plugin = if default_name.as_deref() == Some(name.as_str()) {
+                    default_plugin.clone()
+                } else {
+                    None
+                }
+                .or_else(|| WorkflowPlugin::load(&name, Some(&project_path)).ok())
+                .or_else(|| skills::load_bundled_plugin(&name))?;
+                plugin.state_machine.as_ref()?;
+                Some((name, plugin))
+            })
+            .collect();
+        if plugins.is_empty() {
             return;
         }
         let runtime = WorkflowRuntime {
@@ -6693,7 +6722,20 @@ impl App {
         let Some(db) = self.state.db.as_mut() else {
             return;
         };
-        let results = run_automation_tick(db, &workflow, &project_workflow, &plugin, &runtime);
+        let mut results = Vec::new();
+        for (name, plugin) in &plugins {
+            let Some(workflow) = plugin.state_machine.as_ref() else {
+                continue;
+            };
+            results.extend(run_automation_tick_for(
+                db,
+                workflow,
+                &project_workflow,
+                plugin,
+                &runtime,
+                |task| task_workflow_plugin_name(task, default_name.as_deref()) == Some(name),
+            ));
+        }
         let advanced = results
             .iter()
             .any(|result| matches!(result.outcome, Some(WorkflowStepOutcome::Advanced { .. })));
