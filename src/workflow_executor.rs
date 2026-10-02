@@ -240,6 +240,19 @@ fn persist_step_evidence(
     evidence: WorkflowArtifact,
     runtime: &WorkflowRuntime,
 ) -> Result<WorkflowArtifact> {
+    let artifact_hash = evidence.sha256.clone();
+    // The automation tick re-derives its decision every pass, so a step that is
+    // retried reaches this point again with the very same artifact. Journalling
+    // it again adds nothing and, unbounded, flooded one task with 42,762 identical
+    // events. The stored row already carries this hash, so return it untouched.
+    if db.step_evidence_already_recorded(
+        &task.id,
+        state.state_attempt,
+        &state.state,
+        &artifact_hash,
+    )? {
+        return db.store_workflow_artifact(&evidence);
+    }
     if let Some(worktree) = task.worktree_path.as_deref() {
         record_provider_session_if_known(
             db,
@@ -251,12 +264,11 @@ fn persist_step_evidence(
         );
     }
     let artifact_text = String::from_utf8_lossy(&evidence.content);
-    let artifact_hash = evidence.sha256.clone();
     let evidence = db.store_workflow_artifact(&evidence)?;
     let mut report = TaskStepReport::new(&task.id, state.state_attempt, &state.state);
     report.agent = Some(agent.to_string());
     report.artifact_path = Some(artifact.display().to_string());
-    report.artifact_sha256 = Some(artifact_hash);
+    report.artifact_sha256 = Some(artifact_hash.clone());
     report.artifact_text = Some(bounded_journal_text(&artifact_text));
     report.final_report = workflow_artifact_value(artifact, "final_report")
         .ok()
@@ -278,6 +290,8 @@ fn persist_step_evidence(
         "Captured durable evidence from {}",
         artifact.display()
     ));
+    // The hash is hex, so it needs no JSON escaping.
+    event.metadata_json = Some(format!(r#"{{"artifact_sha256":"{}"}}"#, artifact_hash));
     db.record_task_execution_event(&event)?;
     Ok(evidence)
 }
@@ -1712,8 +1726,38 @@ pub fn decide_workflow_plan(
     workflow: &WorkflowDefinition,
     project_workflow: &WorkflowProjectConfig,
     plugin: &WorkflowPlugin,
+    task: Task,
+    approve: bool,
+    db: &mut Database,
+    runtime: &WorkflowRuntime,
+) -> Result<WorkflowStepOutcome> {
+    decide_workflow_plan_with_evidence(
+        workflow,
+        project_workflow,
+        plugin,
+        task,
+        approve,
+        None,
+        db,
+        runtime,
+    )
+}
+
+/// [`decide_workflow_plan`] for callers that hold the reviewer's artifact.
+///
+/// `approval_evidence` is the snapshot of that artifact (and where it came
+/// from). It is journalled only once the approval has been validated, just
+/// before the transition commits, so a refused approval leaves no evidence
+/// behind. Journalling it first meant every automation tick that retried a
+/// refused approval recorded the same file again.
+#[allow(clippy::too_many_arguments)]
+fn decide_workflow_plan_with_evidence(
+    workflow: &WorkflowDefinition,
+    project_workflow: &WorkflowProjectConfig,
+    plugin: &WorkflowPlugin,
     mut task: Task,
     approve: bool,
+    approval_evidence: Option<(WorkflowArtifact, &Path)>,
     db: &mut Database,
     runtime: &WorkflowRuntime,
 ) -> Result<WorkflowStepOutcome> {
@@ -1852,6 +1896,19 @@ pub fn decide_workflow_plan(
             confirmed_session.as_deref(),
         )?;
     }
+    if approve {
+        if let Some((evidence, artifact)) = approval_evidence {
+            persist_step_evidence(
+                db,
+                &task,
+                &current,
+                &previous_agent,
+                artifact,
+                evidence,
+                runtime,
+            )?;
+        }
+    }
     db.advance_workflow_state(&decision.state, &decision.transition)?;
     db.update_task(&task)?;
     // Canonical plan-review verdict signal (`approved | changes_requested`) for
@@ -1921,19 +1978,27 @@ pub fn submit_plan_review(
             message: "Plan changes require non-empty findings in plan-review.yaml".into(),
         });
     }
-    // Approval has no external process hand-off, so it can promote the review
-    // immediately. A requested revision does switch agents; its exact snapshot
-    // is deliberately held by `decide_workflow_plan` until that switch is
-    // acknowledged, otherwise a failed launch strands provisional evidence.
-    if approve {
-        record_step_evidence(db, &task, &current, &task.agent, &artifact, runtime)?;
-    }
-    decide_workflow_plan(
+    // Approval has no external process hand-off, but it is still held by
+    // `decide_workflow_plan_with_evidence` until the transition is validated:
+    // journalling the review first recorded it again on every retry of a
+    // refused approval. A requested revision does switch agents; its exact
+    // snapshot is held until that switch is acknowledged, otherwise a failed
+    // launch strands provisional evidence.
+    let approval_evidence = if approve {
+        Some((
+            snapshot_step_evidence(&task, &current, &artifact)?,
+            artifact.as_path(),
+        ))
+    } else {
+        None
+    };
+    decide_workflow_plan_with_evidence(
         workflow,
         project_workflow,
         plugin,
         task,
         approve,
+        approval_evidence,
         db,
         runtime,
     )
@@ -6340,6 +6405,242 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             final_state_a.approved_plan_revision,
             final_state_b.approved_plan_revision
         );
+    }
+
+    /// A plan-review graph whose approval is guarded on an approved plan, plus a
+    /// task sitting in `plan_review` with the reviewer's approved verdict on disk.
+    /// With `plan_hash = None` the guard refuses the approval, which is the
+    /// shape of a task that keeps being retried by the automation tick.
+    fn refused_approval_fixture(
+        plan_hash: Option<&str>,
+    ) -> (
+        WorkflowDefinition,
+        WorkflowProjectConfig,
+        WorkflowPlugin,
+        tempfile::TempDir,
+        crate::db::Task,
+        Database,
+    ) {
+        let graph = WorkflowDefinition {
+            initial_state: "plan_review".into(),
+            states: vec![
+                WorkflowState {
+                    id: "plan_review".into(),
+                    label: "Plan review".into(),
+                    role: Some("plan_reviewer".into()),
+                    terminal: false,
+                },
+                WorkflowState {
+                    id: "plan_approved".into(),
+                    label: "Plan approved".into(),
+                    role: None,
+                    terminal: true,
+                },
+            ],
+            transitions: vec![WorkflowTransition {
+                action: "approve_plan".into(),
+                from: "plan_review".into(),
+                to: "plan_approved".into(),
+                guards: vec![crate::workflow::WorkflowGuard::ApprovedPlan],
+            }],
+        };
+        graph.validate().unwrap();
+        let project = WorkflowProjectConfig {
+            target_branch: "main".into(),
+            role_bindings: Default::default(),
+            ..Default::default()
+        };
+        let plugin = plugin(graph.clone());
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
+        std::fs::write(
+            worktree.path().join(".agent-flow/plan-review.yaml"),
+            "verdict: approved\n",
+        )
+        .unwrap();
+        let mut task = crate::db::Task::new("Review thing", "claude", "proj");
+        task.worktree_path = Some(worktree.path().to_string_lossy().to_string());
+        let mut db = Database::open_in_memory_project().unwrap();
+        db.create_task(&task).unwrap();
+        let mut state = WorkflowTaskState::new(&task.id, "plan_review", "main");
+        state.plan_revision = 1;
+        state.plan_hash = plan_hash.map(str::to_string);
+        let record = WorkflowTransitionRecord::new(&task.id, "seed", "backlog", "plan_review");
+        db.record_workflow_admission(&task, &state, &record)
+            .unwrap();
+        (graph, project, plugin, worktree, task, db)
+    }
+
+    fn evidence_events(db: &Database, task_id: &str) -> usize {
+        db.task_execution_events(task_id)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == "step_evidence_recorded")
+            .count()
+    }
+
+    /// Approval used to record the reviewer's `plan-review.yaml` as step
+    /// evidence and only then ask the workflow for the transition. The
+    /// automation tick re-derives its decision every pass, so when the
+    /// transition was refused it retried the same approval and recorded the
+    /// same evidence again each time: one task logged 42,762 identical events
+    /// in 13 hours without ever leaving `plan_review`. Evidence must exist only
+    /// for an approval that actually took effect.
+    #[test]
+    fn a_refused_plan_approval_records_no_evidence() {
+        let (graph, project, plugin, _worktree, task, mut db) = refused_approval_fixture(None);
+        let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(MockTmuxOperations::new());
+        let agent_registry: Arc<dyn AgentRegistry> = Arc::new(MockAgentRegistry::new());
+        let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
+        let config = merged_config();
+        let flags = feature_flags();
+        let runtime = WorkflowRuntime {
+            tmux_ops: &tmux_ops,
+            agent_registry: &agent_registry,
+            git_ops: &git_ops,
+            tmux_project_name: "proj",
+            project_path: Path::new("C:/work/project"),
+            config: &config,
+            flags: &flags,
+            session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: None,
+        };
+
+        for _ in 0..3 {
+            let outcome =
+                submit_plan_review(&graph, &project, &plugin, task.clone(), &mut db, &runtime);
+            assert!(
+                outcome.is_err() || matches!(outcome, Ok(WorkflowStepOutcome::Blocked { .. })),
+                "the guard must refuse an approval without a plan hash"
+            );
+        }
+
+        assert_eq!(
+            db.get_workflow_task_state(&task.id).unwrap().unwrap().state,
+            "plan_review",
+            "a refused approval must leave the task where it was"
+        );
+        assert_eq!(
+            evidence_events(&db, &task.id),
+            0,
+            "a refused approval must not journal evidence on every retry"
+        );
+    }
+
+    /// A retried step reaches the evidence journal again with the same artifact.
+    /// The second pass must return the stored evidence and add nothing.
+    #[test]
+    fn journalling_the_same_evidence_twice_records_it_once() {
+        let (_graph, _project, _plugin, _worktree, task, mut db) = refused_approval_fixture(None);
+        let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(MockTmuxOperations::new());
+        let agent_registry: Arc<dyn AgentRegistry> = Arc::new(MockAgentRegistry::new());
+        let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
+        let config = merged_config();
+        let flags = feature_flags();
+        let runtime = WorkflowRuntime {
+            tmux_ops: &tmux_ops,
+            agent_registry: &agent_registry,
+            git_ops: &git_ops,
+            tmux_project_name: "proj",
+            project_path: Path::new("C:/work/project"),
+            config: &config,
+            flags: &flags,
+            session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: None,
+        };
+        let current = db.get_workflow_task_state(&task.id).unwrap().unwrap();
+        let artifact =
+            Path::new(task.worktree_path.as_deref().unwrap()).join(".agent-flow/plan-review.yaml");
+
+        let first =
+            record_step_evidence(&db, &task, &current, "claude", &artifact, &runtime).unwrap();
+        let second =
+            record_step_evidence(&db, &task, &current, "claude", &artifact, &runtime).unwrap();
+
+        assert_eq!(
+            first.id, second.id,
+            "the stored evidence is returned, not replaced"
+        );
+        assert_eq!(evidence_events(&db, &task.id), 1);
+        let event = db
+            .task_execution_events(&task.id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == "step_evidence_recorded")
+            .unwrap();
+        assert!(
+            event
+                .metadata_json
+                .as_deref()
+                .is_some_and(|json| json.contains(&first.sha256)),
+            "the journal names the artifact hash so a repeat is identifiable"
+        );
+    }
+
+    /// Changed evidence is new evidence: the guard keys on the artifact hash, so
+    /// a reviewer who rewrites the verdict before it is bound is still recorded.
+    #[test]
+    fn evidence_with_a_different_hash_is_journalled_again() {
+        let (_graph, _project, _plugin, _worktree, task, mut db) = refused_approval_fixture(None);
+        let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(MockTmuxOperations::new());
+        let agent_registry: Arc<dyn AgentRegistry> = Arc::new(MockAgentRegistry::new());
+        let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
+        let config = merged_config();
+        let flags = feature_flags();
+        let runtime = WorkflowRuntime {
+            tmux_ops: &tmux_ops,
+            agent_registry: &agent_registry,
+            git_ops: &git_ops,
+            tmux_project_name: "proj",
+            project_path: Path::new("C:/work/project"),
+            config: &config,
+            flags: &flags,
+            session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: None,
+        };
+        let current = db.get_workflow_task_state(&task.id).unwrap().unwrap();
+        let artifact =
+            Path::new(task.worktree_path.as_deref().unwrap()).join(".agent-flow/plan-review.yaml");
+
+        record_step_evidence(&db, &task, &current, "claude", &artifact, &runtime).unwrap();
+        std::fs::write(&artifact, "verdict: approved\nnote: reworded\n").unwrap();
+        record_step_evidence(&db, &task, &current, "claude", &artifact, &runtime).unwrap();
+
+        assert_eq!(evidence_events(&db, &task.id), 2);
+    }
+
+    /// A normal approval still journals the reviewer's artifact, exactly once,
+    /// and the task advances.
+    #[test]
+    fn an_approved_plan_records_its_evidence_once_and_advances() {
+        let (graph, project, plugin, _worktree, task, mut db) =
+            refused_approval_fixture(Some("deadbeef"));
+        let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(MockTmuxOperations::new());
+        let agent_registry: Arc<dyn AgentRegistry> = Arc::new(MockAgentRegistry::new());
+        let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
+        let config = merged_config();
+        let flags = feature_flags();
+        let runtime = WorkflowRuntime {
+            tmux_ops: &tmux_ops,
+            agent_registry: &agent_registry,
+            git_ops: &git_ops,
+            tmux_project_name: "proj",
+            project_path: Path::new("C:/work/project"),
+            config: &config,
+            flags: &flags,
+            session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: None,
+        };
+
+        let outcome =
+            submit_plan_review(&graph, &project, &plugin, task.clone(), &mut db, &runtime).unwrap();
+
+        assert!(matches!(outcome, WorkflowStepOutcome::Advanced { .. }));
+        assert_eq!(
+            db.get_workflow_task_state(&task.id).unwrap().unwrap().state,
+            "plan_approved"
+        );
+        assert_eq!(evidence_events(&db, &task.id), 1);
     }
 
     /// Graph/project/plugin shared by the `changes_requested` tests below:

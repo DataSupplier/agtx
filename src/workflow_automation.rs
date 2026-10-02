@@ -35,8 +35,11 @@
 //! same mock harness `workflow_executor`'s own tests use, and safe to call
 //! from a background tick with no terminal attached.
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
 use crate::config::WorkflowPlugin;
-use crate::db::{Database, Task, TaskStatus};
+use crate::db::{Database, Task, TaskExecutionEvent, TaskStatus, WorkflowTaskState};
 use crate::workflow::{AdmissionPolicy, WorkflowDefinition, WorkflowProjectConfig};
 use crate::workflow_executor::{
     admit_task, assess, complete_admission, complete_feature_integration,
@@ -63,6 +66,120 @@ pub struct TaskAutomationResult {
     /// here as an ordinary `Blocked` outcome, never a panic or a propagated
     /// error.
     pub outcome: Option<WorkflowStepOutcome>,
+}
+
+/// Consecutive identical failures of one task's step before automation stops
+/// retrying it and asks a person.
+const ESCALATE_AFTER_FAILURES: u32 = 5;
+
+/// Why automation stopped, shown in place of the step's own error once a task
+/// has been escalated.
+const ESCALATED_MESSAGE: &str =
+    "Automation stopped retrying this step after repeated identical failures; a person must act";
+
+/// Consecutive identical failures per task: `(signature, count)`. Process-local
+/// on purpose: it only decides when to stop retrying, and a restart simply
+/// counts again. The durable record is the journal events written below.
+fn advance_failures() -> &'static Mutex<HashMap<String, (String, u32)>> {
+    static FAILURES: OnceLock<Mutex<HashMap<String, (String, u32)>>> = OnceLock::new();
+    FAILURES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn clear_advance_failures(task_id: &str) {
+    if let Ok(mut failures) = advance_failures().lock() {
+        failures.remove(task_id);
+    }
+}
+
+/// Whether this exact step was already escalated: same task, workflow attempt,
+/// state and action. A human reset or any transition changes the attempt or
+/// state, which lifts the stop.
+fn advance_escalated(
+    db: &Database,
+    task_id: &str,
+    state: &WorkflowTaskState,
+    action: &str,
+) -> bool {
+    db.has_task_execution_event(
+        task_id,
+        "workflow_advance_escalated",
+        Some(state.state_attempt),
+        Some(&state.state),
+        Some(action),
+    )
+    .unwrap_or(false)
+}
+
+/// Count one failure of a task's step. The first occurrence is journalled and
+/// logged; repeats stay quiet (the tick re-derives the same decision every pass,
+/// and one task once logged the same failure on every one of them); at the
+/// threshold the task is flagged for a person and automation stops retrying it.
+fn note_advance_failure(
+    db: &Database,
+    task_id: &str,
+    state: &WorkflowTaskState,
+    action: &str,
+    error: &str,
+) {
+    let signature = format!("{}#{}:{action}:{error}", state.state, state.state_attempt);
+    let count = {
+        let Ok(mut failures) = advance_failures().lock() else {
+            return;
+        };
+        let entry = failures
+            .entry(task_id.to_string())
+            .or_insert_with(|| (signature.clone(), 0));
+        if entry.0 != signature {
+            *entry = (signature.clone(), 0);
+        }
+        entry.1 += 1;
+        entry.1
+    };
+    let journal = |event_type: &str, outcome: &str, message: String| {
+        let mut event = TaskExecutionEvent::new(task_id, event_type);
+        event.workflow_attempt = Some(state.state_attempt);
+        event.state = Some(state.state.clone());
+        event.outcome = Some(outcome.to_string());
+        event.message = Some(message);
+        event.metadata_json = Some(
+            serde_json::json!({ "action": action, "error": error, "consecutive_failures": count })
+                .to_string(),
+        );
+        let _ = db.record_task_execution_event(&event);
+    };
+    if count == 1 {
+        tracing::warn!(
+            task_id = %task_id,
+            action = %action,
+            error = %error,
+            "workflow automation advance failed"
+        );
+        journal(
+            "workflow_advance_blocked",
+            "retryable",
+            format!("{action}: {error}"),
+        );
+    } else if count == ESCALATE_AFTER_FAILURES {
+        tracing::warn!(
+            task_id = %task_id,
+            action = %action,
+            failures = count,
+            error = %error,
+            "workflow automation stopped retrying; escalated to a person"
+        );
+        // The message is the bare action so `advance_escalated` can match it.
+        journal(
+            "workflow_advance_escalated",
+            "escalated",
+            action.to_string(),
+        );
+        if let Ok(Some(mut task)) = db.get_task(task_id) {
+            task.escalation_note = Some(format!(
+                "Automation stopped after {count} identical failures of '{action}': {error}"
+            ));
+            let _ = db.update_task(&task);
+        }
+    }
 }
 
 /// Run one automation pass over every task the project database knows
@@ -186,19 +303,26 @@ pub fn run_automation_tick_for(
         if let AutomationDecision::Advance(action) = &decision {
             let action = action.clone();
             let task_id = task.id.clone();
+            if advance_escalated(db, &task_id, &state, &action) {
+                results.push(TaskAutomationResult {
+                    task_id,
+                    decision,
+                    outcome: Some(WorkflowStepOutcome::Blocked {
+                        message: ESCALATED_MESSAGE.to_string(),
+                    }),
+                });
+                continue;
+            }
             let result = dispatch_advance(&action, workflow, project, plugin, task, db, runtime);
             let outcome = match result {
-                Ok(outcome) => outcome,
+                Ok(outcome) => {
+                    clear_advance_failures(&task_id);
+                    outcome
+                }
                 Err(error) => {
-                    tracing::warn!(
-                        task_id = %task_id,
-                        action = %action,
-                        error = %error,
-                        "workflow automation advance failed"
-                    );
-                    WorkflowStepOutcome::Blocked {
-                        message: error.to_string(),
-                    }
+                    let message = error.to_string();
+                    note_advance_failure(db, &task_id, &state, &action, &message);
+                    WorkflowStepOutcome::Blocked { message }
                 }
             };
             results.push(TaskAutomationResult {
@@ -1121,6 +1245,100 @@ mod tests {
         assert_eq!(state_after.state, "implementing");
         assert_eq!(state_after.approved_plan_revision, Some(1));
         assert_eq!(state_after.approved_plan_hash.as_deref(), Some("deadbeef"));
+    }
+
+    /// A step that keeps failing identically used to be retried, and logged,
+    /// on every tick for as long as the task sat there. After a few identical
+    /// failures it is journalled once, the task is flagged for a person, and
+    /// automation stops dispatching it. Here the approval is refused every pass
+    /// because the state carries no plan hash for the approve guard.
+    #[test]
+    fn repeated_identical_failures_escalate_and_stop_retrying() {
+        let graph = full_workflow();
+        let plugin_config = plugin(graph.clone());
+        let project = project();
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
+        std::fs::write(
+            worktree.path().join(".agent-flow/plan-review.yaml"),
+            "verdict: approved\nworkflow_attempt: 1\n",
+        )
+        .unwrap();
+        let mut db = Database::open_in_memory_project().unwrap();
+        let mut task = Task::new("Plan thing", "claude", "proj");
+        task.worktree_path = Some(worktree.path().to_string_lossy().to_string());
+        task.session_name = Some("proj:task-plan".into());
+        db.create_task(&task).unwrap();
+        let mut state = WorkflowTaskState::new(&task.id, "plan_review", "feature/poc");
+        state.plan_revision = 1;
+        state.plan_hash = None;
+        let record =
+            crate::db::WorkflowTransitionRecord::new(&task.id, "seed", "planning", "plan_review");
+        db.record_workflow_admission(&task, &state, &record)
+            .unwrap();
+        let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(permissive_tmux());
+        let agent_registry: Arc<dyn AgentRegistry> = Arc::new(permissive_registry());
+        let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
+        let config = merged_config();
+        let flags = feature_flags();
+        let runtime = runtime_with(
+            &tmux_ops,
+            &agent_registry,
+            &git_ops,
+            worktree.path(),
+            &config,
+            &flags,
+        );
+
+        let count = |db: &Database, event_type: &str| {
+            db_events(db, &task.id)
+                .into_iter()
+                .filter(|event| event.event_type == event_type)
+                .count()
+        };
+        let mut last_message = String::new();
+        for _ in 0..(ESCALATE_AFTER_FAILURES + 3) {
+            let results = run_automation_tick(&mut db, &graph, &project, &plugin_config, &runtime);
+            if let Some(WorkflowStepOutcome::Blocked { message }) = &results[0].outcome {
+                last_message = message.clone();
+            }
+        }
+
+        assert_eq!(
+            db.get_workflow_task_state(&task.id).unwrap().unwrap().state,
+            "plan_review"
+        );
+        assert_eq!(
+            count(&db, "workflow_advance_blocked"),
+            1,
+            "the first failure is journalled once"
+        );
+        assert_eq!(
+            count(&db, "workflow_advance_escalated"),
+            1,
+            "escalated exactly once"
+        );
+        assert_eq!(
+            count(&db, "step_evidence_recorded"),
+            0,
+            "a refused approval journals no evidence"
+        );
+        let flagged = db.get_task(&task.id).unwrap().unwrap();
+        assert!(
+            flagged
+                .escalation_note
+                .as_deref()
+                .is_some_and(|note| note.contains("approve_plan")),
+            "the task is flagged for a person"
+        );
+        assert_eq!(
+            last_message, ESCALATED_MESSAGE,
+            "later ticks no longer dispatch the step"
+        );
+    }
+
+    fn db_events(db: &Database, task_id: &str) -> Vec<crate::db::TaskExecutionEvent> {
+        db.task_execution_events(task_id).unwrap()
     }
 
     #[test]
