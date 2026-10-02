@@ -37,6 +37,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::config::WorkflowPlugin;
 use crate::db::{Database, Task, TaskExecutionEvent, TaskStatus, WorkflowTaskState};
@@ -45,7 +46,7 @@ use crate::workflow_executor::{
     admit_task, assess, complete_admission, complete_feature_integration,
     start_workflow_implementation, submit_engineering_review, submit_final_validation,
     submit_plan_review, submit_workflow_implementation, submit_workflow_plan, AutomationDecision,
-    WorkflowRuntime, WorkflowStepOutcome,
+    RetryableDeferral, WorkflowRuntime, WorkflowStepOutcome,
 };
 
 /// What automation did (or considered, and declined to do) for one task
@@ -69,20 +70,34 @@ pub struct TaskAutomationResult {
 }
 
 /// Consecutive identical failures of one task's step before automation stops
-/// retrying it and asks a person.
+/// retrying it and asks a person. A floor only: the real threshold is
+/// [`ESCALATE_AFTER`], because a tick is about two seconds and a step can
+/// legitimately fail for minutes (a busy agent, a slow tmux pane).
 const ESCALATE_AFTER_FAILURES: u32 = 5;
+
+/// How long one step must keep failing identically before automation gives up.
+/// Time, not ticks, so the tick rate cannot turn a short wait into an escalation.
+const ESCALATE_AFTER: Duration = Duration::from_secs(300);
 
 /// Why automation stopped, shown in place of the step's own error once a task
 /// has been escalated.
 const ESCALATED_MESSAGE: &str =
     "Automation stopped retrying this step after repeated identical failures; a person must act";
 
-/// Consecutive identical failures per task: `(signature, count)`. Process-local
-/// on purpose: it only decides when to stop retrying, and a restart simply
-/// counts again. The durable record is the journal events written below.
-fn advance_failures() -> &'static Mutex<HashMap<String, (String, u32)>> {
-    static FAILURES: OnceLock<Mutex<HashMap<String, (String, u32)>>> = OnceLock::new();
+/// Consecutive identical failures per task: `(signature, count, first seen)`.
+/// Process-local on purpose: it only decides when to stop retrying, and a restart
+/// simply counts again. The durable record is the journal events written below.
+type FailureEntry = (String, u32, Instant);
+
+fn advance_failures() -> &'static Mutex<HashMap<String, FailureEntry>> {
+    static FAILURES: OnceLock<Mutex<HashMap<String, FailureEntry>>> = OnceLock::new();
     FAILURES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Whether a dispatch error is a real failure. A hand-off waiting for a busy
+/// agent is a retryable deferral with its own bounded patience, not a failure.
+fn counts_as_failure(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RetryableDeferral>().is_none()
 }
 
 fn clear_advance_failures(task_id: &str) {
@@ -91,9 +106,18 @@ fn clear_advance_failures(task_id: &str) {
     }
 }
 
-/// Whether this exact step was already escalated: same task, workflow attempt,
-/// state and action. A human reset or any transition changes the attempt or
-/// state, which lifts the stop.
+/// When this process first ran an automation pass. An escalation journalled
+/// earlier belongs to a previous run, possibly an older build that escalated too
+/// eagerly, and must not keep a task stopped forever: a restart starts counting
+/// afresh, exactly like the in-memory failure counter.
+fn process_started_at() -> &'static str {
+    static STARTED: OnceLock<String> = OnceLock::new();
+    STARTED.get_or_init(|| chrono::Utc::now().to_rfc3339())
+}
+
+/// Whether this exact step was already escalated by this process: same task,
+/// workflow attempt, state and action. A human reset or any transition changes
+/// the attempt or state, which lifts the stop.
 fn advance_escalated(
     db: &Database,
     task_id: &str,
@@ -106,6 +130,7 @@ fn advance_escalated(
         Some(state.state_attempt),
         Some(&state.state),
         Some(action),
+        Some(process_started_at()),
     )
     .unwrap_or(false)
 }
@@ -122,19 +147,20 @@ fn note_advance_failure(
     error: &str,
 ) {
     let signature = format!("{}#{}:{action}:{error}", state.state, state.state_attempt);
-    let count = {
+    let (count, first_seen) = {
         let Ok(mut failures) = advance_failures().lock() else {
             return;
         };
         let entry = failures
             .entry(task_id.to_string())
-            .or_insert_with(|| (signature.clone(), 0));
+            .or_insert_with(|| (signature.clone(), 0, Instant::now()));
         if entry.0 != signature {
-            *entry = (signature.clone(), 0);
+            *entry = (signature.clone(), 0, Instant::now());
         }
         entry.1 += 1;
-        entry.1
+        (entry.1, entry.2)
     };
+    let escalate = count >= ESCALATE_AFTER_FAILURES && first_seen.elapsed() >= ESCALATE_AFTER;
     let journal = |event_type: &str, outcome: &str, message: String| {
         let mut event = TaskExecutionEvent::new(task_id, event_type);
         event.workflow_attempt = Some(state.state_attempt);
@@ -159,7 +185,7 @@ fn note_advance_failure(
             "retryable",
             format!("{action}: {error}"),
         );
-    } else if count == ESCALATE_AFTER_FAILURES {
+    } else if escalate {
         tracing::warn!(
             task_id = %task_id,
             action = %action,
@@ -321,7 +347,9 @@ pub fn run_automation_tick_for(
                 }
                 Err(error) => {
                     let message = error.to_string();
-                    note_advance_failure(db, &task_id, &state, &action, &message);
+                    if counts_as_failure(&error) {
+                        note_advance_failure(db, &task_id, &state, &action, &message);
+                    }
                     WorkflowStepOutcome::Blocked { message }
                 }
             };
@@ -1297,11 +1325,26 @@ mod tests {
                 .count()
         };
         let mut last_message = String::new();
-        for _ in 0..(ESCALATE_AFTER_FAILURES + 3) {
-            let results = run_automation_tick(&mut db, &graph, &project, &plugin_config, &runtime);
+        let mut tick = |db: &mut Database| {
+            let results = run_automation_tick(db, &graph, &project, &plugin_config, &runtime);
             if let Some(WorkflowStepOutcome::Blocked { message }) = &results[0].outcome {
                 last_message = message.clone();
             }
+        };
+        // Many identical failures in quick succession are not enough: a step may
+        // legitimately fail for minutes, so nothing is escalated yet.
+        for _ in 0..(ESCALATE_AFTER_FAILURES + 3) {
+            tick(&mut db);
+        }
+        assert_eq!(
+            count(&db, "workflow_advance_escalated"),
+            0,
+            "too soon to give up"
+        );
+        // Once the failures have persisted for the whole window, the step is escalated.
+        backdate_first_failure(&task.id, ESCALATE_AFTER + Duration::from_secs(1));
+        for _ in 0..3 {
+            tick(&mut db);
         }
 
         assert_eq!(
@@ -1339,6 +1382,61 @@ mod tests {
 
     fn db_events(db: &Database, task_id: &str) -> Vec<crate::db::TaskExecutionEvent> {
         db.task_execution_events(task_id).unwrap()
+    }
+
+    /// An escalation from before this process started (an older build that gave
+    /// up too eagerly) must not keep the task stopped; one from this run must.
+    #[test]
+    fn an_escalation_from_an_earlier_run_does_not_stop_the_task() {
+        let db = Database::open_in_memory_project().unwrap();
+        let task = Task::new("Plan thing", "claude", "proj");
+        db.create_task(&task).unwrap();
+        let state = WorkflowTaskState::new(&task.id, "plan_review", "feature/poc");
+        let _ = process_started_at();
+
+        let journal = |created_at: chrono::DateTime<chrono::Utc>| {
+            let mut event = TaskExecutionEvent::new(&task.id, "workflow_advance_escalated");
+            event.workflow_attempt = Some(state.state_attempt);
+            event.state = Some(state.state.clone());
+            event.message = Some("approve_plan".into());
+            event.created_at = created_at;
+            db.record_task_execution_event(&event).unwrap();
+        };
+
+        journal(chrono::Utc::now() - chrono::Duration::hours(1));
+        assert!(
+            !advance_escalated(&db, &task.id, &state, "approve_plan"),
+            "an escalation journalled before this process started no longer stops the step"
+        );
+
+        journal(chrono::Utc::now() + chrono::Duration::seconds(5));
+        assert!(
+            advance_escalated(&db, &task.id, &state, "approve_plan"),
+            "an escalation from this run still does"
+        );
+    }
+
+    /// Make the task's current failure streak look `by` older than it is.
+    fn backdate_first_failure(task_id: &str, by: Duration) {
+        let mut failures = advance_failures().lock().unwrap();
+        let entry = failures.get_mut(task_id).expect("a failure streak exists");
+        entry.2 = Instant::now().checked_sub(by).unwrap_or(entry.2);
+    }
+
+    /// A hand-off waiting for a busy agent has its own bounded patience
+    /// (`MAX_IDLE_DEFERRALS`). Counting it as a failure escalated the task after a
+    /// few ticks, so every agent whose end-of-turn work ran long had to be
+    /// continued by hand.
+    #[test]
+    fn a_hand_off_deferral_is_not_counted_as_a_failure() {
+        let deferral: anyhow::Error = RetryableDeferral {
+            message: "'codex' is still working; hand-off deferred until its turn ends".into(),
+        }
+        .into();
+        assert!(!counts_as_failure(&deferral));
+        assert!(counts_as_failure(&anyhow::anyhow!(
+            "workflow artifact conflict"
+        )));
     }
 
     #[test]

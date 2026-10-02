@@ -302,6 +302,25 @@ fn persist_step_evidence(
 /// an agent that does not leave, so giving up the wait cannot mis-deliver.
 const MAX_IDLE_DEFERRALS: usize = 25;
 
+/// A step that cannot proceed yet but is expected to on a later tick: the agent
+/// in the pane is still mid-turn. It has its own bounded patience
+/// ([`MAX_IDLE_DEFERRALS`], journalled as `agent_handoff_deferred`), so callers
+/// that count failures, such as the automation tick's escalation, must not
+/// treat it as one. A distinct type, not message matching, so rewording the
+/// text can never silently turn a wait into a failure.
+#[derive(Debug)]
+pub struct RetryableDeferral {
+    pub message: String,
+}
+
+impl std::fmt::Display for RetryableDeferral {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RetryableDeferral {}
+
 /// One workflow hand-off: the pane `target` passes from whichever agent is
 /// running in it to `destination_agent`, which must end up holding `prompt`.
 struct Handoff<'a> {
@@ -448,7 +467,7 @@ fn defer_while_busy(
             "retryable",
             message.clone(),
         );
-        bail!(message);
+        return Err(RetryableDeferral { message }.into());
     }
     record_handoff_event(
         db,
@@ -7168,6 +7187,10 @@ mod handoff_tests {
         let error = run(mock, &probe, &db, &task, "opencode").unwrap_err();
 
         assert!(error.to_string().contains("deferred"), "{error}");
+        assert!(
+            error.downcast_ref::<RetryableDeferral>().is_some(),
+            "a wait must be a typed deferral so the tick never counts it as a failure"
+        );
         assert_eq!(events(&db, &task, "agent_handoff_deferred"), 1);
     }
 

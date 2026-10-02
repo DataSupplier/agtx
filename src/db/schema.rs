@@ -1097,8 +1097,9 @@ impl Database {
     }
 
     /// Whether the journal holds an event of this type for the task, optionally
-    /// narrowed to one attempt, state and message. A targeted existence check,
-    /// so callers on the automation tick never load a task's whole journal.
+    /// narrowed to one attempt, state, message and a lower time bound (an RFC 3339
+    /// timestamp). A targeted existence check, so callers on the automation tick
+    /// never load a task's whole journal.
     pub fn has_task_execution_event(
         &self,
         task_id: &str,
@@ -1106,14 +1107,16 @@ impl Database {
         workflow_attempt: Option<i64>,
         state: Option<&str>,
         message: Option<&str>,
+        since: Option<&str>,
     ) -> Result<bool> {
         Ok(self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM task_execution_events
               WHERE task_id = ?1 AND event_type = ?2
                 AND (?3 IS NULL OR workflow_attempt = ?3)
                 AND (?4 IS NULL OR state = ?4)
-                AND (?5 IS NULL OR message = ?5))",
-            params![task_id, event_type, workflow_attempt, state, message],
+                AND (?5 IS NULL OR message = ?5)
+                AND (?6 IS NULL OR created_at >= ?6))",
+            params![task_id, event_type, workflow_attempt, state, message, since],
             |row| row.get(0),
         )?)
     }
