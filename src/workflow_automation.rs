@@ -322,9 +322,8 @@ pub fn run_automation_tick_for(
 
         // Lane 2: everything from `planning` onward is decided by `assess`,
         // which already encodes every automation-safety rule (artifact
-        // freshness via `state_attempt`, the fixed `HumanGate` for a failed
-        // final validation) that this driver must never second-guess or
-        // bypass.
+        // freshness via `state_attempt`, the bounded return of a failed final
+        // validation) that this driver must never second-guess or bypass.
         let decision = assess(workflow, project, plugin, &task, &state, db);
         if let AutomationDecision::Advance(action) = &decision {
             let action = action.clone();
@@ -1040,11 +1039,11 @@ mod tests {
         ));
     }
 
-    /// Human-gate boundary: a `final_validation` task whose artifact says
-    /// `verdict: failed` is never auto-advanced by any number of ticks. Only
-    /// a human calling `submit_final_validation` directly may move it.
+    /// AGTX is unattended: a `final_validation` task whose artifact says
+    /// `verdict: failed` is never held at a human gate. The first tick returns
+    /// it to engineering review (bounded, see `MAX_AUTOMATIC_VALIDATION_RETURNS`).
     #[test]
-    fn final_validation_failed_is_never_auto_advanced() {
+    fn final_validation_failed_is_returned_automatically_never_gated() {
         let graph = full_workflow();
         let plugin_config = plugin(graph.clone());
         let project = project();
@@ -1085,17 +1084,19 @@ mod tests {
             &flags,
         );
 
-        for _ in 0..50 {
-            let results = run_automation_tick(&mut db, &graph, &project, &plugin_config, &runtime);
-            assert_eq!(results.len(), 1);
-            assert_eq!(
-                results[0].decision,
-                AutomationDecision::HumanGate("final validation failed".to_string())
-            );
-            assert!(results[0].outcome.is_none());
-        }
-        let unchanged = db.get_workflow_task_state(&task.id).unwrap().unwrap();
-        assert_eq!(unchanged.state, "final_validation");
+        let results = run_automation_tick(&mut db, &graph, &project, &plugin_config, &runtime);
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].decision,
+            AutomationDecision::Advance("validation_failed".to_string())
+        );
+        // The return is attempted, not held at a gate (a held decision has no outcome). This
+        // fixture's task has no tmux session, so the launch itself stops there; the transitions
+        // are covered by the `submit_final_validation` launch tests in `workflow_executor`.
+        assert!(
+            results[0].outcome.is_some(),
+            "the return is attempted, not held"
+        );
     }
 
     /// Idempotency: once a tick fires a transition, the artifact that

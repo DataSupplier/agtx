@@ -481,8 +481,9 @@ fn defer_while_busy(
 }
 
 /// How often a failing handoff check is returned to the same agent within one
-/// state attempt before the task is escalated to a person instead. Bounded so
-/// a check the agent cannot satisfy never loops forever.
+/// state attempt before the handoff is accepted with its findings recorded.
+/// Bounded so a check the agent cannot satisfy never loops forever; AGTX is
+/// unattended, so the bound ends in an automatic outcome, never a person.
 pub const MAX_HANDOFF_CHECK_RETURNS: usize = 3;
 
 /// Lines of check output handed back to the agent and kept in the journal.
@@ -499,8 +500,9 @@ const HANDOFF_CHECK_OUTPUT_LINES: usize = 80;
 /// `history/` (so [`assess`] waits for a fresh one instead of re-running the
 /// check every tick) and the output is pasted to the *same* agent, which fixes
 /// the findings and writes the artifact again -- no state change, no human.
-/// After [`MAX_HANDOFF_CHECK_RETURNS`] returns in one state attempt the task
-/// is escalated instead. The caller must return `outcome` without advancing.
+/// After [`MAX_HANDOFF_CHECK_RETURNS`] returns in one state attempt the
+/// handoff is accepted (`Ok(None)`) and a `handoff_check_exhausted` event
+/// records the findings for rework.
 fn enforce_handoff_check(
     db: &Database,
     task: &mut Task,
@@ -577,22 +579,17 @@ fn enforce_handoff_check(
                 .count()
         })
         .unwrap_or(0);
-    let set_aside = archive_workflow_artifact(artifact, "rejected-by-handoff-check")?;
-
     if returns >= MAX_HANDOFF_CHECK_RETURNS {
-        let message = format!(
-            "Handoff check `{command}` still fails ({exit}) after {returns} returns to '{agent}'; a person needs to look"
-        );
         record(
-            "handoff_check_escalated",
-            "escalated",
-            format!("{message}\n\n{tail}"),
+            "handoff_check_exhausted",
+            "accepted_with_findings",
+            format!(
+                "`{command}` still fails ({exit}) after {returns} returns to '{agent}'; the handoff is accepted and the findings are left for rework\n\n{tail}"
+            ),
         );
-        task.escalation_note = Some(bounded_note(&message));
-        task.updated_at = chrono::Utc::now();
-        db.update_task(task)?;
-        return Ok(Some(WorkflowStepOutcome::Blocked { message }));
+        return Ok(None);
     }
+    let set_aside = archive_workflow_artifact(artifact, "rejected-by-handoff-check")?;
 
     let prompt = format!(
         "AGTX handoff check failed before your {state} result could be accepted: `{command}` ({exit}). \
@@ -2335,7 +2332,14 @@ pub fn submit_engineering_review(
             return Ok(outcome);
         }
     }
+    let corrections_capped =
+        verdict == "corrections_required" && corrections_exhausted(db, &task.id);
     let (action, phase, status) = match verdict.as_str() {
+        "corrections_required" if corrections_capped => (
+            "start_final_validation",
+            "final_validation",
+            TaskStatus::Review,
+        ),
         "corrections_required" => (
             "engineering_corrections_required",
             "running",
@@ -2372,6 +2376,13 @@ pub fn submit_engineering_review(
         resolve_workflow_prompt(&Some(plugin.clone()), phase, &task.content_text(), &task.id, task.cycle, transition.state.state_attempt),
         artifact.strip_prefix(&worktree).unwrap_or(&artifact).display(),
     );
+    let prompt = if corrections_capped {
+        format!(
+            "{prompt}\n\nThe engineering-review correction limit ({MAX_ENGINEERING_CORRECTIONS}) was reached: the findings in the review are accepted as they stand and left for rework. Validate the work as it is."
+        )
+    } else {
+        prompt
+    };
     let policy = project_workflow.policy_for_state(workflow, &transition.state.state)?;
     let command = build_policy_agent_command(
         runtime.agent_registry.get(&next_agent).as_ref(),
@@ -2408,6 +2419,18 @@ pub fn submit_engineering_review(
         runtime,
     )?;
     db.advance_workflow_state(&transition.state, &transition.transition)?;
+    if corrections_capped {
+        record_loop_exhausted(
+            db,
+            &task,
+            &current,
+            "engineering_corrections_exhausted",
+            format!(
+                "Engineering review asked for corrections after {MAX_ENGINEERING_CORRECTIONS} corrections already went back to the implementer; the task moves on to final validation and the open findings are left for rework. Evidence: {}",
+                artifact.strip_prefix(&worktree).unwrap_or(&artifact).display()
+            ),
+        );
+    }
     record_agent_prompt(
         db,
         &task,
@@ -2459,16 +2482,18 @@ pub fn submit_final_validation(
         ".agent-flow/final-validation.yaml",
     );
     let verdict = workflow_artifact_value(&artifact, "verdict")?;
+    // A failure that has already returned to review the allowed number of times is
+    // accepted: the task integrates and the findings are left for rework.
+    let returns_exhausted = verdict == "failed" && validation_returns_exhausted(db, &task.id);
     let (action, phase, passed) = match verdict.as_str() {
         "passed" => ("begin_feature_integration", "integration", true),
+        "failed" if returns_exhausted => ("begin_feature_integration", "integration", true),
         "failed" => ("validation_failed", "review", false),
         _ => bail!(
             "{} has unsupported final-validation verdict '{verdict}'",
             artifact.display()
         ),
     };
-    let lint_only = !passed
-        && workflow_artifact_value(&artifact, "failure_class").is_ok_and(|class| class == "lint");
     if passed {
         current.validation_passed_at = Some(chrono::Utc::now());
     }
@@ -2495,17 +2520,17 @@ pub fn submit_final_validation(
         "{}\n\nFinal-validation verdict: {verdict}. Evidence: {}.{} Follow the declared role policy; do not merge feature/poc into main. AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artifact.",
         resolve_workflow_prompt(&Some(plugin.clone()), phase, &task.content_text(), &task.id, task.cycle, transition.state.state_attempt),
         artifact.strip_prefix(&worktree).unwrap_or(&artifact).display(),
-        if passed {
+        if returns_exhausted {
+            format!(
+                " Validation failed after {MAX_AUTOMATIC_VALIDATION_RETURNS} automatic returns to engineering review: its findings are accepted as they stand and left for rework. Review the integration readiness of the work as it is."
+            )
+        } else if passed {
             String::new()
         } else {
             format!(
                 " A previous validation failure is an active gate: read this exact evidence and write a fresh engineering review. Your review must include validation_failure_sha256: {} and validation_failure_resolution: <what you verified or changed>. Choose a verdict your review instructions allow: corrections_required for unresolved source/test failures, or approved_for_validation only when a repeat validation is justified; handle a plan defect exactly as your review instructions describe.{}",
                 workflow_artifact_sha256(&artifact)?,
-                if lint_only {
-                    " The failure is classified as lint only (failure_class: lint): fix the reported static-analysis findings yourself within the approved plan, confirm the lint check is clean, and approve for validation; no behaviour change is expected."
-                } else {
-                    ""
-                },
+                " The validation reported critical findings (the FINDING: critical lines in its evidence): fix them within the approved plan and approve for validation; a finding that cannot be fixed within the approved plan is a requirements gap, so record it as your review instructions describe and approve.",
             )
         },
     );
@@ -2554,6 +2579,18 @@ pub fn submit_final_validation(
         runtime,
     )?;
     db.advance_workflow_state(&transition.state, &transition.transition)?;
+    if returns_exhausted {
+        record_loop_exhausted(
+            db,
+            &task,
+            &current,
+            "validation_returns_exhausted",
+            format!(
+                "Final validation failed again after {MAX_AUTOMATIC_VALIDATION_RETURNS} automatic returns to engineering review; the task integrates and the open findings are left for rework. Evidence: {}",
+                artifact.strip_prefix(&worktree).unwrap_or(&artifact).display()
+            ),
+        );
+    }
     record_agent_prompt(
         db,
         &task,
@@ -3256,6 +3293,56 @@ fn assess_plan_review(
     }
 }
 
+/// How many `engineering_corrections_required` sends back to the implementer one
+/// task gets. The next `corrections_required` verdict moves the task on to final
+/// validation instead (no human, no further loop) and records
+/// `engineering_corrections_exhausted`, so the open findings become rework.
+pub const MAX_ENGINEERING_CORRECTIONS: usize = 3;
+
+/// How many times a failed final validation returns to engineering review
+/// automatically. After that the failure is accepted, the task integrates and
+/// `validation_returns_exhausted` records the findings for rework.
+pub const MAX_AUTOMATIC_VALIDATION_RETURNS: usize = 2;
+
+/// How often `action` already fired for this task. A history that cannot be read
+/// counts as zero: the safe reading is "not exhausted yet".
+fn transition_count(db: &Database, task_id: &str, action: &str) -> usize {
+    db.workflow_transition_history(task_id)
+        .map(|history| {
+            history
+                .iter()
+                .filter(|record| record.action == action)
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn corrections_exhausted(db: &Database, task_id: &str) -> bool {
+    transition_count(db, task_id, "engineering_corrections_required") >= MAX_ENGINEERING_CORRECTIONS
+}
+
+fn validation_returns_exhausted(db: &Database, task_id: &str) -> bool {
+    transition_count(db, task_id, "validation_failed") >= MAX_AUTOMATIC_VALIDATION_RETURNS
+}
+
+/// Journal why a bounded loop ended in an automatic outcome. Best effort, like
+/// the other journal writes: a lost event must not stop the task.
+fn record_loop_exhausted(
+    db: &Database,
+    task: &Task,
+    state: &WorkflowTaskState,
+    event_type: &str,
+    message: String,
+) {
+    let mut event = TaskExecutionEvent::new(&task.id, event_type);
+    event.workflow_attempt = Some(state.state_attempt);
+    event.state = Some(state.state.clone());
+    event.agent = Some(task.agent.clone());
+    event.outcome = Some("accepted_with_findings".to_string());
+    event.message = Some(bounded_journal_text(&message));
+    let _ = db.record_task_execution_event(&event);
+}
+
 /// Mirrors `submit_engineering_review`'s verdict-to-action match exactly.
 fn assess_engineering_review(
     worktree: &str,
@@ -3278,6 +3365,7 @@ fn assess_engineering_review(
         Err(error) => return AutomationDecision::InvalidArtifact(error.to_string()),
     };
     let action = match verdict.as_str() {
+        "corrections_required" if corrections_exhausted(db, &task.id) => "start_final_validation",
         "corrections_required" => "engineering_corrections_required",
         "plan_issue" => "engineering_plan_issue",
         "approved_for_validation" => "start_final_validation",
@@ -3291,23 +3379,12 @@ fn assess_engineering_review(
     AutomationDecision::Advance(action.to_string())
 }
 
-/// How often a lint-only final-validation failure is sent back to engineering
-/// review automatically before a human has to look. Bounded so two agents that
-/// disagree about a lint rule cannot loop forever.
-pub const MAX_AUTOMATIC_LINT_RETURNS: usize = 2;
-
 /// Mirrors `submit_final_validation`'s verdict-to-action match, with one
-/// fixed override: a `failed` verdict is a `HumanGate`, not an automatic
-/// `Advance("validation_failed")` -- a failed validation needs a human look
-/// before any rework loop restarts. This is a hard automation-safety rule, not
-/// a project-configurable choice.
-///
-/// The one exception is a failure the artifact classifies as
-/// `failure_class: lint`: static-analysis findings that need a code change but
-/// are not a behaviour defect. Stopping for a person there adds nothing a
-/// reviewer cannot fix, so it returns to engineering review automatically, up
-/// to [`MAX_AUTOMATIC_LINT_RETURNS`] times per task. Any other or missing class
-/// keeps the gate.
+/// bound: a `failed` verdict returns to engineering review automatically, up to
+/// [`MAX_AUTOMATIC_VALIDATION_RETURNS`] times per task. After that the failure is
+/// accepted (`begin_feature_integration`, the same dispatch entry): AGTX is
+/// unattended, so a bound ends in an automatic outcome, never a human gate. The
+/// open findings stay in the evidence and in the journal for rework.
 fn assess_final_validation(
     worktree: &str,
     plugin: &WorkflowPlugin,
@@ -3330,29 +3407,10 @@ fn assess_final_validation(
     };
     match verdict.as_str() {
         "passed" => AutomationDecision::Advance("begin_feature_integration".to_string()),
-        "failed" => {
-            let lint_only = workflow_artifact_value(&artifact, "failure_class")
-                .is_ok_and(|class| class == "lint");
-            if !lint_only {
-                return AutomationDecision::HumanGate("final validation failed".to_string());
-            }
-            let prior_returns = db
-                .workflow_transition_history(&task.id)
-                .map(|history| {
-                    history
-                        .iter()
-                        .filter(|record| record.action == "validation_failed")
-                        .count()
-                })
-                .unwrap_or(usize::MAX);
-            if prior_returns < MAX_AUTOMATIC_LINT_RETURNS {
-                AutomationDecision::Advance("validation_failed".to_string())
-            } else {
-                AutomationDecision::HumanGate(format!(
-                    "final validation failed on lint after {prior_returns} automatic returns to engineering review"
-                ))
-            }
+        "failed" if validation_returns_exhausted(db, &task.id) => {
+            AutomationDecision::Advance("begin_feature_integration".to_string())
         }
+        "failed" => AutomationDecision::Advance("validation_failed".to_string()),
         other => AutomationDecision::InvalidArtifact(format!(
             "{} has unsupported final-validation verdict '{other}'",
             artifact.display()
@@ -3849,28 +3907,6 @@ mod tests {
         assert!(matches!(decision, AutomationDecision::InvalidArtifact(_)));
     }
 
-    #[test]
-    fn assess_gates_a_failed_final_validation_to_a_human_instead_of_advancing() {
-        let graph = assess_workflow();
-        let plugin = plugin_for_tests(graph.clone());
-        let worktree = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
-        std::fs::write(
-            worktree.path().join(".agent-flow/final-validation.yaml"),
-            "verdict: failed\n",
-        )
-        .unwrap();
-        let task = admitted_task(worktree.path());
-        let state = WorkflowTaskState::new(&task.id, "final_validation", "main");
-        let db = Database::open_in_memory_project().unwrap();
-
-        let decision = assess(&graph, &project(), &plugin, &task, &state, &db);
-        assert_eq!(
-            decision,
-            AutomationDecision::HumanGate("final validation failed".to_string())
-        );
-    }
-
     fn failed_validation_task(failure_class: &str) -> (tempfile::TempDir, Task, WorkflowTaskState) {
         let worktree = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
@@ -3884,12 +3920,54 @@ mod tests {
         (worktree, task, state)
     }
 
+    fn record_returns(
+        db: &Database,
+        task: &Task,
+        action: &str,
+        from: &str,
+        to: &str,
+        count: usize,
+    ) {
+        for _ in 0..count {
+            db.record_workflow_transition(&WorkflowTransitionRecord::new(
+                &task.id, action, from, to,
+            ))
+            .unwrap();
+        }
+    }
+
     #[test]
-    fn assess_returns_a_lint_only_validation_failure_to_review_automatically() {
+    fn assess_returns_any_failed_validation_to_review_automatically() {
+        // The class no longer decides anything: a failed verdict never reaches a human gate.
+        for class in ["lint", "defect", "none"] {
+            let graph = assess_workflow();
+            let plugin = plugin_for_tests(graph.clone());
+            let (_worktree, task, state) = failed_validation_task(class);
+            let db = Database::open_in_memory_project().unwrap();
+
+            let decision = assess(&graph, &project(), &plugin, &task, &state, &db);
+            assert_eq!(
+                decision,
+                AutomationDecision::Advance("validation_failed".to_string()),
+                "failure_class {class}"
+            );
+        }
+    }
+
+    #[test]
+    fn assess_still_returns_a_failed_validation_while_returns_remain() {
         let graph = assess_workflow();
         let plugin = plugin_for_tests(graph.clone());
         let (_worktree, task, state) = failed_validation_task("lint");
         let db = Database::open_in_memory_project().unwrap();
+        record_returns(
+            &db,
+            &task,
+            "validation_failed",
+            "final_validation",
+            "engineering_review",
+            MAX_AUTOMATIC_VALIDATION_RETURNS - 1,
+        );
 
         let decision = assess(&graph, &project(), &plugin, &task, &state, &db);
         assert_eq!(
@@ -3899,39 +3977,67 @@ mod tests {
     }
 
     #[test]
-    fn assess_gates_a_lint_failure_once_the_automatic_returns_are_spent() {
+    fn assess_accepts_a_failed_validation_once_the_automatic_returns_are_spent() {
         let graph = assess_workflow();
         let plugin = plugin_for_tests(graph.clone());
         let (_worktree, task, state) = failed_validation_task("lint");
         let db = Database::open_in_memory_project().unwrap();
-        for _ in 0..MAX_AUTOMATIC_LINT_RETURNS {
-            db.record_workflow_transition(&WorkflowTransitionRecord::new(
-                &task.id,
-                "validation_failed",
-                "final_validation",
-                "engineering_review",
-            ))
-            .unwrap();
-        }
+        record_returns(
+            &db,
+            &task,
+            "validation_failed",
+            "final_validation",
+            "engineering_review",
+            MAX_AUTOMATIC_VALIDATION_RETURNS,
+        );
 
+        // Same dispatch entry as a pass: the task integrates, no person is asked.
         let decision = assess(&graph, &project(), &plugin, &task, &state, &db);
-        assert!(
-            matches!(&decision, AutomationDecision::HumanGate(reason) if reason.contains("lint")),
-            "{decision:?}"
+        assert_eq!(
+            decision,
+            AutomationDecision::Advance("begin_feature_integration".to_string())
         );
     }
 
     #[test]
-    fn assess_keeps_the_human_gate_for_a_defect_failure() {
+    fn assess_returns_review_corrections_until_the_cap_then_moves_on() {
         let graph = assess_workflow();
         let plugin = plugin_for_tests(graph.clone());
-        let (_worktree, task, state) = failed_validation_task("defect");
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
+        std::fs::write(
+            worktree.path().join(".agent-flow/engineering-review.yaml"),
+            "verdict: corrections_required\n",
+        )
+        .unwrap();
+        let task = admitted_task(worktree.path());
+        let state = WorkflowTaskState::new(&task.id, "engineering_review", "main");
         let db = Database::open_in_memory_project().unwrap();
-
-        let decision = assess(&graph, &project(), &plugin, &task, &state, &db);
+        record_returns(
+            &db,
+            &task,
+            "engineering_corrections_required",
+            "engineering_review",
+            "implementing",
+            MAX_ENGINEERING_CORRECTIONS - 1,
+        );
         assert_eq!(
-            decision,
-            AutomationDecision::HumanGate("final validation failed".to_string())
+            assess(&graph, &project(), &plugin, &task, &state, &db),
+            AutomationDecision::Advance("engineering_corrections_required".to_string())
+        );
+
+        record_returns(
+            &db,
+            &task,
+            "engineering_corrections_required",
+            "engineering_review",
+            "implementing",
+            1,
+        );
+        // The fourth correction does not happen: the task moves on to validation.
+        assert_eq!(
+            assess(&graph, &project(), &plugin, &task, &state, &db),
+            AutomationDecision::Advance("start_final_validation".to_string())
         );
     }
 
@@ -5999,24 +6105,40 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
     }
 
     #[test]
-    fn a_handoff_check_that_keeps_failing_is_escalated_instead_of_looping() {
+    fn a_handoff_check_that_keeps_failing_is_accepted_instead_of_looping_or_escalating() {
         let run = run_implementation_handoff_check("exit 1", MAX_HANDOFF_CHECK_RETURNS);
 
+        // AGTX is unattended: no person is called. The handoff goes through and the
+        // findings are journaled for rework.
         assert!(
-            matches!(&run.outcome, WorkflowStepOutcome::Blocked { message } if message.contains("a person needs to look")),
+            matches!(run.outcome, WorkflowStepOutcome::Advanced { .. }),
             "{:?}",
             run.outcome
         );
-        assert!(run.pasted.is_empty(), "no further return to the agent");
-        assert!(run.task.escalation_note.is_some());
+        assert!(
+            !run.pasted
+                .iter()
+                .any(|text| text.contains("handoff check failed")),
+            "no further return to the agent"
+        );
+        assert!(run.task.escalation_note.is_none());
         assert_eq!(
             run.db
                 .get_workflow_task_state(&run.task.id)
                 .unwrap()
                 .unwrap()
                 .state,
-            "running"
+            "engineering_review"
         );
+        assert!(run
+            .db
+            .task_execution_events(&run.task.id)
+            .unwrap()
+            .iter()
+            .any(|event| event.event_type == "handoff_check_exhausted"
+                && event.outcome.as_deref() == Some("accepted_with_findings")));
+        // The artifact was handed on, not set aside.
+        assert!(!run.worktree.path().join(".agent-flow/history").exists());
     }
 
     /// A failed next-agent launch must not advance the durable lane: the
@@ -6292,6 +6414,268 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
             db.get_workflow_task_state(&task.id).unwrap().unwrap().state,
             "integrate_to_feature"
         );
+    }
+
+    type SubmitFn = fn(
+        &WorkflowDefinition,
+        &WorkflowProjectConfig,
+        &WorkflowPlugin,
+        Task,
+        &mut Database,
+        &WorkflowRuntime,
+    ) -> Result<WorkflowStepOutcome>;
+
+    /// What one `submit_*` call left behind, for the bounded-loop tests.
+    struct LoopRun {
+        outcome: WorkflowStepOutcome,
+        db: Database,
+        task: Task,
+        _db_dir: tempfile::TempDir,
+        _worktree: tempfile::TempDir,
+    }
+
+    /// Run `submit` for a task in `state` whose artifact `file` holds `body`, after the given
+    /// earlier transitions `(action, from, to, times)`. The graph holds both outgoing routes of
+    /// the state so the test sees which one the engine takes.
+    fn run_bounded_loop(
+        state: &str,
+        routes: &[(&str, &str)],
+        file: &str,
+        body: &str,
+        earlier: &[(&str, &str, &str, usize)],
+        submit: SubmitFn,
+    ) -> LoopRun {
+        let mut states = vec![WorkflowState {
+            id: state.into(),
+            label: state.into(),
+            role: Some("validator".into()),
+            terminal: false,
+        }];
+        let mut transitions = Vec::new();
+        for (action, to) in routes {
+            if !states.iter().any(|existing| existing.id == *to) {
+                states.push(WorkflowState {
+                    id: (*to).into(),
+                    label: (*to).into(),
+                    role: Some("implementer".into()),
+                    terminal: true,
+                });
+            }
+            let guards = if *action == "begin_feature_integration" {
+                vec![crate::workflow::WorkflowGuard::FinalValidationPassed]
+            } else {
+                vec![]
+            };
+            transitions.push(WorkflowTransition {
+                action: (*action).into(),
+                from: state.into(),
+                to: (*to).into(),
+                guards,
+            });
+        }
+        let graph = WorkflowDefinition {
+            initial_state: state.into(),
+            states,
+            transitions,
+        };
+        graph.validate().unwrap();
+        let mut project = WorkflowProjectConfig {
+            target_branch: "main".into(),
+            ..Default::default()
+        };
+        for role in ["validator", "implementer"] {
+            project.role_bindings.insert(role.into(), "claude".into());
+            project
+                .role_policies
+                .roles
+                .insert(role.into(), WorkflowRolePolicy::default());
+        }
+        let plugin = plugin(graph.clone());
+
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join(".agent-flow")).unwrap();
+        std::fs::write(worktree.path().join(".agent-flow").join(file), body).unwrap();
+        let mut task = crate::db::Task::new("Bounded loop", "claude", "proj");
+        task.worktree_path = Some(worktree.path().to_string_lossy().to_string());
+        task.session_name = Some("proj:task-loop".into());
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut db = Database::open_project_at_path(&db_dir.path().join("wf.db")).unwrap();
+        db.create_task(&task).unwrap();
+        let current = WorkflowTaskState::new(&task.id, state, "main");
+        let record = WorkflowTransitionRecord::new(&task.id, "seed", "backlog", state);
+        db.record_workflow_admission(&task, &current, &record)
+            .unwrap();
+        for (action, from, to, times) in earlier {
+            for _ in 0..*times {
+                db.record_workflow_transition(&WorkflowTransitionRecord::new(
+                    &task.id, *action, *from, *to,
+                ))
+                .unwrap();
+            }
+        }
+
+        let mut mock_tmux = MockTmuxOperations::new();
+        mock_tmux.expect_send_keys().returning(|_, _| Ok(()));
+        mock_tmux.expect_send_key().returning(|_, _| Ok(()));
+        let command_checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let command_checks_for_mock = Arc::clone(&command_checks);
+        mock_tmux.expect_pane_current_command().returning(move |_| {
+            if command_checks_for_mock.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                Some("bash".to_string())
+            } else {
+                Some("claude".to_string())
+            }
+        });
+        mock_tmux
+            .expect_capture_pane()
+            .returning(|_| Ok(String::new()));
+        mock_tmux.expect_paste_text().returning(|_, _| Ok(()));
+        let mut mock_registry = MockAgentRegistry::new();
+        mock_registry
+            .expect_get()
+            .returning(|_| Arc::new(MockAgentOperations::new()) as Arc<dyn AgentOperations>);
+        let tmux_ops: Arc<dyn TmuxOperations> = Arc::new(mock_tmux);
+        let agent_registry: Arc<dyn AgentRegistry> = Arc::new(mock_registry);
+        let git_ops: Arc<dyn GitOperations> = Arc::new(MockGitOperations::new());
+        let config = merged_config();
+        let flags = feature_flags();
+        let runtime = WorkflowRuntime {
+            tmux_ops: &tmux_ops,
+            agent_registry: &agent_registry,
+            git_ops: &git_ops,
+            tmux_project_name: "proj",
+            project_path: Path::new("C:/work/project"),
+            config: &config,
+            flags: &flags,
+            session_probe: crate::agent::native_session::default_probe(),
+            git_provider_ops: None,
+        };
+        let outcome = submit(&graph, &project, &plugin, task.clone(), &mut db, &runtime).unwrap();
+        LoopRun {
+            outcome,
+            db,
+            task,
+            _db_dir: db_dir,
+            _worktree: worktree,
+        }
+    }
+
+    fn loop_state(run: &LoopRun) -> String {
+        run.db
+            .get_workflow_task_state(&run.task.id)
+            .unwrap()
+            .unwrap()
+            .state
+    }
+
+    fn has_event(run: &LoopRun, event_type: &str) -> bool {
+        run.db
+            .task_execution_events(&run.task.id)
+            .unwrap()
+            .iter()
+            .any(|event| {
+                event.event_type == event_type
+                    && event.outcome.as_deref() == Some("accepted_with_findings")
+            })
+    }
+
+    const VALIDATION_ROUTES: [(&str, &str); 2] = [
+        ("validation_failed", "engineering_review"),
+        ("begin_feature_integration", "integrate_to_feature"),
+    ];
+    const REVIEW_ROUTES: [(&str, &str); 2] = [
+        ("engineering_corrections_required", "implementing"),
+        ("start_final_validation", "final_validation"),
+    ];
+
+    #[test]
+    fn a_failed_validation_returns_to_review_while_returns_remain() {
+        let run = run_bounded_loop(
+            "final_validation",
+            &VALIDATION_ROUTES,
+            "final-validation.yaml",
+            "verdict: failed\nfailure_class: lint\n",
+            &[(
+                "validation_failed",
+                "final_validation",
+                "engineering_review",
+                MAX_AUTOMATIC_VALIDATION_RETURNS - 1,
+            )],
+            submit_final_validation,
+        );
+        assert!(matches!(run.outcome, WorkflowStepOutcome::Advanced { .. }));
+        assert_eq!(loop_state(&run), "engineering_review");
+        assert!(!has_event(&run, "validation_returns_exhausted"));
+    }
+
+    #[test]
+    fn a_failed_validation_integrates_once_its_returns_are_spent() {
+        let run = run_bounded_loop(
+            "final_validation",
+            &VALIDATION_ROUTES,
+            "final-validation.yaml",
+            "verdict: failed\nfailure_class: defect\n",
+            &[(
+                "validation_failed",
+                "final_validation",
+                "engineering_review",
+                MAX_AUTOMATIC_VALIDATION_RETURNS,
+            )],
+            submit_final_validation,
+        );
+        // No human gate: the failure is accepted, the task integrates, and the findings are
+        // journaled so they become rework.
+        assert!(matches!(run.outcome, WorkflowStepOutcome::Advanced { .. }));
+        assert_eq!(loop_state(&run), "integrate_to_feature");
+        assert!(has_event(&run, "validation_returns_exhausted"));
+        assert!(run
+            .db
+            .get_workflow_task_state(&run.task.id)
+            .unwrap()
+            .unwrap()
+            .validation_passed_at
+            .is_some());
+    }
+
+    #[test]
+    fn review_corrections_go_back_to_the_implementer_until_the_cap() {
+        let run = run_bounded_loop(
+            "engineering_review",
+            &REVIEW_ROUTES,
+            "engineering-review.yaml",
+            "verdict: corrections_required\nfindings: >-\n  a defect\n",
+            &[(
+                "engineering_corrections_required",
+                "engineering_review",
+                "implementing",
+                MAX_ENGINEERING_CORRECTIONS - 1,
+            )],
+            submit_engineering_review,
+        );
+        assert!(matches!(run.outcome, WorkflowStepOutcome::Advanced { .. }));
+        assert_eq!(loop_state(&run), "implementing");
+        assert!(!has_event(&run, "engineering_corrections_exhausted"));
+    }
+
+    #[test]
+    fn a_review_that_still_wants_corrections_after_the_cap_moves_on_to_validation() {
+        let run = run_bounded_loop(
+            "engineering_review",
+            &REVIEW_ROUTES,
+            "engineering-review.yaml",
+            "verdict: corrections_required\nfindings: >-\n  a defect\n",
+            &[(
+                "engineering_corrections_required",
+                "engineering_review",
+                "implementing",
+                MAX_ENGINEERING_CORRECTIONS,
+            )],
+            submit_engineering_review,
+        );
+        // The fourth correction does not happen, and nobody is asked.
+        assert!(matches!(run.outcome, WorkflowStepOutcome::Advanced { .. }));
+        assert_eq!(loop_state(&run), "final_validation");
+        assert!(has_event(&run, "engineering_corrections_exhausted"));
     }
 
     /// `submit_plan_review` on an `approved` artifact must drive the exact
