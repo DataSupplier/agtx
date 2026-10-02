@@ -69,24 +69,30 @@ pub struct TaskAutomationResult {
     pub outcome: Option<WorkflowStepOutcome>,
 }
 
-/// Consecutive identical failures of one task's step before automation stops
-/// retrying it and asks a person. A floor only: the real threshold is
-/// [`ESCALATE_AFTER`], because a tick is about two seconds and a step can
-/// legitimately fail for minutes (a busy agent, a slow tmux pane).
-const ESCALATE_AFTER_FAILURES: u32 = 5;
+/// Consecutive identical failures of one task's step before automation slows
+/// down its retries. A floor only: the real threshold is [`STALL_AFTER`],
+/// because a tick is about two seconds and a step can legitimately fail for
+/// minutes (a busy agent, a slow tmux pane).
+const STALL_AFTER_FAILURES: u32 = 5;
 
-/// How long one step must keep failing identically before automation gives up.
-/// Time, not ticks, so the tick rate cannot turn a short wait into an escalation.
-const ESCALATE_AFTER: Duration = Duration::from_secs(300);
+/// How long one step must keep failing identically before it counts as stalled.
+/// Time, not ticks, so the tick rate cannot turn a short wait into a stall.
+const STALL_AFTER: Duration = Duration::from_secs(300);
 
-/// Why automation stopped, shown in place of the step's own error once a task
-/// has been escalated.
-const ESCALATED_MESSAGE: &str =
-    "Automation stopped retrying this step after repeated identical failures; a person must act";
+/// How long a stalled step is left alone between retries. AGTX is unattended, so
+/// a stalled step is never handed to a person and never abandoned: it is retried
+/// slowly until whatever broke it is fixed.
+const STALL_RETRY_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Shown in place of the step's own error while a stalled step waits for its
+/// next retry.
+const STALLED_MESSAGE: &str =
+    "Automation is retrying this step slowly after repeated identical failures";
 
 /// Consecutive identical failures per task: `(signature, count, first seen)`.
-/// Process-local on purpose: it only decides when to stop retrying, and a restart
-/// simply counts again. The durable record is the journal events written below.
+/// Process-local on purpose: it only decides when to slow down retrying, and a
+/// restart simply counts again. The durable record is the journal events written
+/// below.
 type FailureEntry = (String, u32, Instant);
 
 fn advance_failures() -> &'static Mutex<HashMap<String, FailureEntry>> {
@@ -104,41 +110,39 @@ fn clear_advance_failures(task_id: &str) {
     if let Ok(mut failures) = advance_failures().lock() {
         failures.remove(task_id);
     }
+    if let Ok(mut stalled) = stalled_steps().lock() {
+        stalled.remove(task_id);
+    }
 }
 
-/// When this process first ran an automation pass. An escalation journalled
-/// earlier belongs to a previous run, possibly an older build that escalated too
-/// eagerly, and must not keep a task stopped forever: a restart starts counting
-/// afresh, exactly like the in-memory failure counter.
-fn process_started_at() -> &'static str {
-    static STARTED: OnceLock<String> = OnceLock::new();
-    STARTED.get_or_init(|| chrono::Utc::now().to_rfc3339())
+/// Stalled steps per task: `(step key, do not retry before)`. Process-local like
+/// the failure counter.
+fn stalled_steps() -> &'static Mutex<HashMap<String, (String, Instant)>> {
+    static STALLED: OnceLock<Mutex<HashMap<String, (String, Instant)>>> = OnceLock::new();
+    STALLED.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Whether this exact step was already escalated by this process: same task,
-/// workflow attempt, state and action. A human reset or any transition changes
-/// the attempt or state, which lifts the stop.
-fn advance_escalated(
-    db: &Database,
-    task_id: &str,
-    state: &WorkflowTaskState,
-    action: &str,
-) -> bool {
-    db.has_task_execution_event(
-        task_id,
-        "workflow_advance_escalated",
-        Some(state.state_attempt),
-        Some(&state.state),
-        Some(action),
-        Some(process_started_at()),
-    )
-    .unwrap_or(false)
+/// Identifies one step of one workflow attempt: a transition or a reset changes
+/// the state or the attempt, which ends the stall.
+fn step_key(state: &WorkflowTaskState, action: &str) -> String {
+    format!("{}#{}:{action}", state.state, state.state_attempt)
+}
+
+/// Whether this exact step is stalled and its next retry is not yet due.
+fn step_stalled(task_id: &str, state: &WorkflowTaskState, action: &str) -> bool {
+    let key = step_key(state, action);
+    stalled_steps()
+        .lock()
+        .ok()
+        .and_then(|stalled| stalled.get(task_id).cloned())
+        .is_some_and(|(stalled_key, until)| stalled_key == key && Instant::now() < until)
 }
 
 /// Count one failure of a task's step. The first occurrence is journalled and
 /// logged; repeats stay quiet (the tick re-derives the same decision every pass,
 /// and one task once logged the same failure on every one of them); at the
-/// threshold the task is flagged for a person and automation stops retrying it.
+/// threshold the step is journaled as stalled once and retried only every
+/// [`STALL_RETRY_INTERVAL`]. Nobody is asked and nothing is abandoned.
 fn note_advance_failure(
     db: &Database,
     task_id: &str,
@@ -160,7 +164,7 @@ fn note_advance_failure(
         entry.1 += 1;
         (entry.1, entry.2)
     };
-    let escalate = count >= ESCALATE_AFTER_FAILURES && first_seen.elapsed() >= ESCALATE_AFTER;
+    let stall = count >= STALL_AFTER_FAILURES && first_seen.elapsed() >= STALL_AFTER;
     let journal = |event_type: &str, outcome: &str, message: String| {
         let mut event = TaskExecutionEvent::new(task_id, event_type);
         event.workflow_attempt = Some(state.state_attempt);
@@ -185,25 +189,27 @@ fn note_advance_failure(
             "retryable",
             format!("{action}: {error}"),
         );
-    } else if escalate {
-        tracing::warn!(
-            task_id = %task_id,
-            action = %action,
-            failures = count,
-            error = %error,
-            "workflow automation stopped retrying; escalated to a person"
-        );
-        // The message is the bare action so `advance_escalated` can match it.
-        journal(
-            "workflow_advance_escalated",
-            "escalated",
-            action.to_string(),
-        );
-        if let Ok(Some(mut task)) = db.get_task(task_id) {
-            task.escalation_note = Some(format!(
-                "Automation stopped after {count} identical failures of '{action}': {error}"
-            ));
-            let _ = db.update_task(&task);
+    }
+    if stall {
+        let key = step_key(state, action);
+        let first_stall = {
+            let Ok(mut stalled) = stalled_steps().lock() else {
+                return;
+            };
+            let first = stalled.get(task_id).map(|(k, _)| k != &key).unwrap_or(true);
+            stalled.insert(task_id.to_string(), (key, Instant::now() + STALL_RETRY_INTERVAL));
+            first
+        };
+        if first_stall {
+            tracing::warn!(
+                task_id = %task_id,
+                action = %action,
+                failures = count,
+                error = %error,
+                "workflow automation step stalled; retrying slowly"
+            );
+            // The message is the bare action, as the escalation event's was.
+            journal("workflow_advance_stalled", "stalled", action.to_string());
         }
     }
 }
@@ -328,12 +334,12 @@ pub fn run_automation_tick_for(
         if let AutomationDecision::Advance(action) = &decision {
             let action = action.clone();
             let task_id = task.id.clone();
-            if advance_escalated(db, &task_id, &state, &action) {
+            if step_stalled(&task_id, &state, &action) {
                 results.push(TaskAutomationResult {
                     task_id,
                     decision,
                     outcome: Some(WorkflowStepOutcome::Blocked {
-                        message: ESCALATED_MESSAGE.to_string(),
+                        message: STALLED_MESSAGE.to_string(),
                     }),
                 });
                 continue;
@@ -1278,11 +1284,12 @@ mod tests {
 
     /// A step that keeps failing identically used to be retried, and logged,
     /// on every tick for as long as the task sat there. After a few identical
-    /// failures it is journalled once, the task is flagged for a person, and
-    /// automation stops dispatching it. Here the approval is refused every pass
-    /// because the state carries no plan hash for the approve guard.
+    /// failures it is journalled once as stalled and retried only every
+    /// `STALL_RETRY_INTERVAL`; nobody is asked and the step is never abandoned.
+    /// Here the approval is refused every pass because the state carries no plan
+    /// hash for the approve guard.
     #[test]
-    fn repeated_identical_failures_escalate_and_stop_retrying() {
+    fn repeated_identical_failures_stall_and_retry_slowly_without_a_person() {
         let graph = full_workflow();
         let plugin_config = plugin(graph.clone());
         let project = project();
@@ -1325,25 +1332,21 @@ mod tests {
                 .filter(|event| event.event_type == event_type)
                 .count()
         };
-        let mut last_message = String::new();
-        let mut tick = |db: &mut Database| {
+        let last_message = std::cell::RefCell::new(String::new());
+        let tick = |db: &mut Database| {
             let results = run_automation_tick(db, &graph, &project, &plugin_config, &runtime);
             if let Some(WorkflowStepOutcome::Blocked { message }) = &results[0].outcome {
-                last_message = message.clone();
+                *last_message.borrow_mut() = message.clone();
             }
         };
         // Many identical failures in quick succession are not enough: a step may
-        // legitimately fail for minutes, so nothing is escalated yet.
-        for _ in 0..(ESCALATE_AFTER_FAILURES + 3) {
+        // legitimately fail for minutes, so nothing is stalled yet.
+        for _ in 0..(STALL_AFTER_FAILURES + 3) {
             tick(&mut db);
         }
-        assert_eq!(
-            count(&db, "workflow_advance_escalated"),
-            0,
-            "too soon to give up"
-        );
-        // Once the failures have persisted for the whole window, the step is escalated.
-        backdate_first_failure(&task.id, ESCALATE_AFTER + Duration::from_secs(1));
+        assert_eq!(count(&db, "workflow_advance_stalled"), 0, "too soon to slow down");
+        // Once the failures have persisted for the whole window, the step is stalled.
+        backdate_first_failure(&task.id, STALL_AFTER + Duration::from_secs(1));
         for _ in 0..3 {
             tick(&mut db);
         }
@@ -1358,63 +1361,66 @@ mod tests {
             "the first failure is journalled once"
         );
         assert_eq!(
-            count(&db, "workflow_advance_escalated"),
+            count(&db, "workflow_advance_stalled"),
             1,
-            "escalated exactly once"
+            "stalled exactly once"
         );
         assert_eq!(
             count(&db, "step_evidence_recorded"),
             0,
             "a refused approval journals no evidence"
         );
-        let flagged = db.get_task(&task.id).unwrap().unwrap();
         assert!(
-            flagged
+            db.get_task(&task.id)
+                .unwrap()
+                .unwrap()
                 .escalation_note
-                .as_deref()
-                .is_some_and(|note| note.contains("approve_plan")),
-            "the task is flagged for a person"
+                .is_none(),
+            "no person is asked"
         );
         assert_eq!(
-            last_message, ESCALATED_MESSAGE,
-            "later ticks no longer dispatch the step"
+            *last_message.borrow(), STALLED_MESSAGE,
+            "ticks inside the interval do not dispatch the step"
         );
+
+        // When the interval has passed the step is tried again, and stays stalled
+        // without journaling a second event.
+        expire_stall(&task.id);
+        tick(&mut db);
+        assert_ne!(*last_message.borrow(), STALLED_MESSAGE, "the retry is due and dispatched");
+        tick(&mut db);
+        assert_eq!(*last_message.borrow(), STALLED_MESSAGE, "a failed retry stalls it again");
+        assert_eq!(count(&db, "workflow_advance_stalled"), 1);
+    }
+
+    /// A stall belongs to one step of one attempt: any other step of the task is
+    /// dispatched at once, and a success lifts it.
+    #[test]
+    fn a_stall_ends_with_the_step_or_a_success() {
+        let task_id = "stall-task";
+        let mut state = WorkflowTaskState::new(task_id, "plan_review", "feature/poc");
+        stalled_steps().lock().unwrap().insert(
+            task_id.to_string(),
+            (step_key(&state, "approve_plan"), Instant::now() + STALL_RETRY_INTERVAL),
+        );
+        assert!(step_stalled(task_id, &state, "approve_plan"));
+        assert!(!step_stalled(task_id, &state, "reject_plan"));
+        state.state_attempt += 1;
+        assert!(!step_stalled(task_id, &state, "approve_plan"));
+        state.state_attempt -= 1;
+        clear_advance_failures(task_id);
+        assert!(!step_stalled(task_id, &state, "approve_plan"));
+    }
+
+    /// Make the task's stall look as if its retry interval had passed.
+    fn expire_stall(task_id: &str) {
+        let mut stalled = stalled_steps().lock().unwrap();
+        let entry = stalled.get_mut(task_id).expect("a stalled step exists");
+        entry.1 = Instant::now();
     }
 
     fn db_events(db: &Database, task_id: &str) -> Vec<crate::db::TaskExecutionEvent> {
         db.task_execution_events(task_id).unwrap()
-    }
-
-    /// An escalation from before this process started (an older build that gave
-    /// up too eagerly) must not keep the task stopped; one from this run must.
-    #[test]
-    fn an_escalation_from_an_earlier_run_does_not_stop_the_task() {
-        let db = Database::open_in_memory_project().unwrap();
-        let task = Task::new("Plan thing", "claude", "proj");
-        db.create_task(&task).unwrap();
-        let state = WorkflowTaskState::new(&task.id, "plan_review", "feature/poc");
-        let _ = process_started_at();
-
-        let journal = |created_at: chrono::DateTime<chrono::Utc>| {
-            let mut event = TaskExecutionEvent::new(&task.id, "workflow_advance_escalated");
-            event.workflow_attempt = Some(state.state_attempt);
-            event.state = Some(state.state.clone());
-            event.message = Some("approve_plan".into());
-            event.created_at = created_at;
-            db.record_task_execution_event(&event).unwrap();
-        };
-
-        journal(chrono::Utc::now() - chrono::Duration::hours(1));
-        assert!(
-            !advance_escalated(&db, &task.id, &state, "approve_plan"),
-            "an escalation journalled before this process started no longer stops the step"
-        );
-
-        journal(chrono::Utc::now() + chrono::Duration::seconds(5));
-        assert!(
-            advance_escalated(&db, &task.id, &state, "approve_plan"),
-            "an escalation from this run still does"
-        );
     }
 
     /// Make the task's current failure streak look `by` older than it is.
