@@ -1648,8 +1648,28 @@ pub fn submit_workflow_plan(
         &task.id,
         ".agent-flow/plan-review.yaml",
     );
+    // The reviewer is launched with a one-line prompt (a multi-line command takes another
+    // delivery path), so the task description -- which Heaves extends with the feature plan
+    // context the plan must align with -- is handed over as a file in the harness-owned
+    // `.agent-flow/<task>/` directory instead. Best effort: without it the review still runs.
+    let task_description_path = Path::new(&worktree)
+        .join(".agent-flow")
+        .join(&task.id)
+        .join("task.md");
+    let task_description_note = match task_description_path
+        .parent()
+        .map(std::fs::create_dir_all)
+        .transpose()
+        .and_then(|_| std::fs::write(&task_description_path, task.content_text()))
+    {
+        Ok(()) => format!(
+            " The task description is at .agent-flow/{}/task.md: read it first and judge the plan against it.",
+            task.id
+        ),
+        Err(_) => String::new(),
+    };
     let prompt = format!(
-        "You are the plan reviewer for task {}. Review only {} (AGTX revision {}, immutable artifact {}). Do not implement code. Review only the submitted revision and its stated acceptance criteria. Request changes only for a contradiction with the task, approved specification, repository rule, or API contract; a safety, data-integrity, tenancy, migration, or transaction-ownership defect; or an acceptance criterion that cannot be delivered or validated from the plan. Classify every finding as BLOCKING, REQUIRED-NONBLOCKING, or SUGGESTION. Every BLOCKING finding must cite the exact conflicting plan text and governing requirement. Do not request changes merely because a summary is less detailed than executable steps, an implied documentation update is not repeated elsewhere, an ordinary targeted test is not enumerated, or a resolved finding is phrased differently in non-normative text. On a revision, verify whether prior findings are resolved and do not reopen them or introduce adjacent scope unless the revised text creates a new material contradiction. Prefer one consolidated set of actionable findings. Use changes_requested only when at least one BLOCKING finding exists; otherwise use approved and record required-nonblocking items as implementation/checklist notes. Then write {} in this task worktree containing: verdict: approved or verdict: changes_requested (exactly one of these two strings), findings: a non-empty folded scalar with specific, concrete findings, and final_report: a concise reviewer handoff summary. AGTX owns all revision, attempt, and SHA-256 metadata; do not write any of them into the review artifact.",
+        "You are the plan reviewer for task {}. Review only {} (AGTX revision {}, immutable artifact {}). Do not implement code. Review only the submitted revision and its stated acceptance criteria. Request changes only for a contradiction with the task, approved specification, repository rule, or API contract; a safety, data-integrity, tenancy, migration, or transaction-ownership defect; or an acceptance criterion that cannot be delivered or validated from the plan. Drift from the feature plan is a contradiction with the task: when the task description carries a \"Feature plan context\" section, a plan that omits a task key listed under Tasks, plans work that belongs to another phase, or contradicts the feature plan's technical context or source structure without a recorded requirements gap is BLOCKING; a missing `## Plan alignment` section is REQUIRED-NONBLOCKING. Classify every finding as BLOCKING, REQUIRED-NONBLOCKING, or SUGGESTION. Every BLOCKING finding must cite the exact conflicting plan text and governing requirement. Do not request changes merely because a summary is less detailed than executable steps, an implied documentation update is not repeated elsewhere, an ordinary targeted test is not enumerated, or a resolved finding is phrased differently in non-normative text. On a revision, verify whether prior findings are resolved and do not reopen them or introduce adjacent scope unless the revised text creates a new material contradiction. Prefer one consolidated set of actionable findings. Use changes_requested only when at least one BLOCKING finding exists; otherwise use approved and record required-nonblocking items as implementation/checklist notes. Then write {} in this task worktree containing: verdict: approved or verdict: changes_requested (exactly one of these two strings), findings: a non-empty folded scalar with specific, concrete findings, and final_report: a concise reviewer handoff summary. AGTX owns all revision, attempt, and SHA-256 metadata; do not write any of them into the review artifact.{}",
         task.id,
         path.strip_prefix(&worktree).unwrap_or(&path).display(),
         revision,
@@ -1658,6 +1678,7 @@ pub fn submit_workflow_plan(
             .strip_prefix(&worktree)
             .unwrap_or(&review_artifact_path)
             .display(),
+        task_description_note,
     );
     let target = task
         .session_name
@@ -5534,6 +5555,7 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
         .unwrap();
 
         let mut task = crate::db::Task::new("Plan thing", "claude", "proj");
+        task.description = Some("Plan thing.\n\n## Feature plan context\nPhase 2 of 3.".into());
         task.worktree_path = Some(worktree.path().to_string_lossy().to_string());
         task.session_name = Some("proj:task-plan".into());
 
@@ -5625,6 +5647,19 @@ AGTX owns workflow-attempt and SHA-256 metadata; do not write it into your artif
         assert!(
             prompt.contains("Use changes_requested only when at least one BLOCKING finding exists"),
             "reviewer prompt must reserve rejection for blocking findings, got: {prompt}"
+        );
+        // The description (with Heaves' feature plan context) reaches the reviewer as a file,
+        // so the one-line prompt stays one line.
+        let description_path = format!(".agent-flow/{}/task.md", task.id);
+        assert!(
+            prompt.contains(&format!("The task description is at {description_path}")),
+            "reviewer prompt must point to the task description, got: {prompt}"
+        );
+        assert!(!prompt.contains('\n'), "reviewer prompt must stay one line");
+        assert!(prompt.contains("Drift from the feature plan is a contradiction with the task"));
+        assert_eq!(
+            std::fs::read_to_string(worktree.path().join(&description_path)).unwrap(),
+            "Plan thing.\n\n## Feature plan context\nPhase 2 of 3."
         );
     }
 
